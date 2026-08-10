@@ -130,9 +130,44 @@ Dos cosas que conviene tener claras antes de integrarla en una app:
   `ParcelFileDescriptor` de `ContentResolver` sirve directamente: se puede escribir y leer por
   MediaStore/SAF sin materializar un archivo intermedio en almacenamiento con scope.
 
-## Cómo consumirla hoy
+## Cómo añadirla a tu proyecto
 
-Mientras no haya una versión publicada, la vía es tu repositorio Maven local:
+### Opción A — desde JitPack
+
+JitPack compila la librería a partir de un **tag** de este repositorio, así que esta vía funciona en
+cuanto exista el primer tag. Añade el repositorio y la dependencia:
+
+```kotlin
+// settings.gradle.kts de tu proyecto — dónde buscar
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
+        maven("https://jitpack.io")
+    }
+}
+
+// build.gradle.kts — qué bajar
+dependencies {
+    implementation("com.github.bmontiel-28:Kotmpeg:1.0.0")
+}
+```
+
+Fíjate en que el artefacto se llama **`Kotmpeg`**, como el repositorio, y no `kotmpeg-core`, como el
+artefacto que produce el build. Es lo que despista: JitPack solo usa el formato multi-módulo
+`com.github.Usuario.Repo:Modulo:Tag` cuando el build deja **varios** artefactos, y aquí sale uno
+solo, así que se nombra por el repositorio. Escribir la forma multi-módulo —con punto antes de
+`Kotmpeg`— da un `Could not find` sin más explicación: esa ruta no existe.
+
+> **La versión de la coordenada es el nombre del tag**, no el `version` del `build.gradle.kts`:
+> JitPack construye a partir del tag y lo usa literalmente. La lista de las que hay disponibles, con
+> el estado del build de cada una, está en
+> [`jitpack.io/#bmontiel-28/Kotmpeg`](https://jitpack.io/#bmontiel-28/Kotmpeg); si alguna vez
+> difiere de lo de aquí, manda esa página.
+
+### Opción B — desde tu Maven local
+
+Útil para probar un cambio de la librería en tu app antes de publicar nada, y la única vía mientras
+no haya tag. En este proyecto:
 
 ```bash
 ./gradlew publishToMavenLocal
@@ -147,7 +182,9 @@ dependencyResolutionManagement { repositories { mavenLocal(); mavenCentral() } }
 dependencies { implementation("com.braymon:kotmpeg-core:1.0.0") }
 ```
 
-Publica el jar y un jar de fuentes, así que el IDE deja navegar el código y leer el KDoc.
+Las dos opciones publican el jar y un jar de fuentes, así que el IDE deja navegar el código y leer
+el KDoc. **No son intercambiables**: cada coordenada solo resuelve en el repositorio que le
+corresponde.
 
 ---
 
@@ -374,5 +411,6 @@ llanas:
   de código cerrado.
 - 📄 Lo que la licencia exige es **conservar el aviso de copyright y el texto de la MIT** en las
   copias o partes sustanciales del código. Eso es todo.
-- 🙏 Aparte de la licencia, se **agradece** —sin ser obligatorio— la mención ("Hecho con Kotmpeg")
-  en la documentación o los créditos.
+- 🙏 Aparte de la licencia, se **agradece** —sin ser obligatorio— la mención
+  ("Hecho con [Kotmpeg](https://github.com/bmontiel-28/Kotmpeg)") en la documentación o los
+  créditos.

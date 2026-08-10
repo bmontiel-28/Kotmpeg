@@ -10,9 +10,9 @@ Se da soporte a la última versión publicada de la serie mayor en curso.
 
 ## Cómo reportar una vulnerabilidad
 
-**No abras un issue público.** Usa el reporte privado de seguridad del repositorio —en GitHub,
-*Security → Advisories → Report a vulnerability*—, que no deja el detalle a la vista mientras se
-corrige.
+**No abras un issue público.** Usa
+[GitHub Security Advisories](https://github.com/bmontiel-28/Kotmpeg/security/advisories/new), que
+permite un reporte privado y no deja el detalle a la vista mientras se corrige.
 
 Incluye, si puedes, el archivo que lo reproduce (o cómo generarlo) y qué se observa: una excepción
 concreta, un consumo de memoria desbocado, un cuelgue.

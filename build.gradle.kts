@@ -62,6 +62,7 @@ publishing {
                     "Muxing y demuxing de MKV y MP4/fMP4 en Kotlin puro sobre cualquier JVM 17, " +
                         "sin dependencias de plataforma ni binarios externos.",
                 )
+                url.set("https://github.com/bmontiel-28/Kotmpeg")
                 licenses {
                     license {
                         name.set("MIT License")
@@ -76,9 +77,11 @@ publishing {
                         url.set("https://github.com/bmontiel-28")
                     }
                 }
-                // `url` y `scm` se rellenan cuando el repositorio tenga remoto. Un POM sin ellos es
-                // válido; uno que apunte a una dirección equivocada acompaña al artefacto para
-                // siempre.
+                scm {
+                    url.set("https://github.com/bmontiel-28/Kotmpeg")
+                    connection.set("scm:git:https://github.com/bmontiel-28/Kotmpeg.git")
+                    developerConnection.set("scm:git:ssh://git@github.com/bmontiel-28/Kotmpeg.git")
+                }
             }
         }
     }
