@@ -1,5 +1,11 @@
 # Kotmpeg Core
 
+[![CI](https://github.com/bmontiel-28/Kotmpeg/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bmontiel-28/Kotmpeg/actions/workflows/ci.yml)
+[![JitPack](https://jitpack.io/v/bmontiel-28/Kotmpeg.svg)](https://jitpack.io/#bmontiel-28/Kotmpeg)
+[![Licencia MIT](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
+[![JVM 17](https://img.shields.io/badge/JVM-17%2B-orange.svg)](#requisitos)
+[![Android API 34+](https://img.shields.io/badge/Android-API%2034%2B-3ddc84.svg)](#en-android)
+
 **Lee y escribe contenedores MKV y MP4/fMP4 en Kotlin puro, sobre cualquier JVM 17 — remux sin
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10, sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
