@@ -1,0 +1,14 @@
+[versions]
+kotlin = "2.4.10"
+junitJupiter = "6.1.2"
+
+[libraries]
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junitJupiter" }
+# Sin versión a propósito: `junit-jupiter` arrastra `org.junit:junit-bom`, que fija la del
+# launcher por ti. Escribirla a mano solo añade un número que hay que acordarse de subir a la vez,
+# y el emparejamiento no siempre fue evidente: hasta JUnit 5 el motor iba por 5.x y la plataforma
+# por 1.x (5.11.4 ↔ 1.11.4), y en JUnit 6 pasaron a compartir numeración.
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

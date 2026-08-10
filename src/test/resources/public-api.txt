@@ -1,0 +1,547 @@
+interface com.braymon.kotmpeg.Demuxer
+  fun getDurationUs(): long
+  fun getTracks(): List<TrackInfo>
+  fun readPacket(): MediaPacket
+  fun seekTo(long): long
+class com.braymon.kotmpeg.MkvKotlin
+  fun concat$default(MkvKotlin, List, File, ContainerFormat, boolean, boolean, Function1, Function1, int, Object): long
+  fun concat(List<? extends File>, File, ContainerFormat, boolean, boolean, Function1<? super Long, Unit>, Function1<? super String, Unit>): long
+  fun createMuxer$default(MkvKotlin, SeekableOutput, ContainerFormat, boolean, long, int, Object): Muxer
+  fun createMuxer$default(MkvKotlin, File, ContainerFormat, boolean, boolean, long, int, Object): Muxer
+  fun createMuxer(SeekableOutput, ContainerFormat, boolean, long): Muxer
+  fun createMuxer(File, ContainerFormat, boolean, boolean, long): Muxer
+  fun detectFormat(File): ContainerFormat
+  fun openDemuxer$default(MkvKotlin, SeekableInput, Function1, int, Object): Demuxer
+  fun openDemuxer$default(MkvKotlin, File, Function1, int, Object): Demuxer
+  fun openDemuxer(SeekableInput, Function1<? super String, Unit>): Demuxer
+  fun openDemuxer(File, Function1<? super String, Unit>): Demuxer
+  fun remux$default(MkvKotlin, File, File, ContainerFormat, boolean, boolean, Function1, Function1, Function1, int, Object): long
+  fun remux(File, File, ContainerFormat, boolean, boolean, Function1<? super Integer, Boolean>, Function1<? super Long, Unit>, Function1<? super String, Unit>): long
+  field INSTANCE: MkvKotlin
+interface com.braymon.kotmpeg.Muxer
+  fun addTrack(TrackInfo): int
+  fun start(): void
+  fun stop(): void
+  fun writePacket(MediaPacket): void
+class com.braymon.kotmpeg.audio.PcmMixer
+  fun convertChannels(short[], int, int): short[]
+  fun mix$default(PcmMixer, List, List, int, Object): short[]
+  fun mix(List<short[]>, List<Float>): short[]
+  fun monoToStereo(short[]): short[]
+  fun stereoToMono(short[]): short[]
+  fun toByteBuffer(short[]): ByteBuffer
+  fun toShortArray(ByteBuffer): short[]
+  field INSTANCE: PcmMixer
+class com.braymon.kotmpeg.audio.PcmResampler
+  constructor(int, int, int)
+  fun flush(): short[]
+  fun getChannels(): int
+  fun getInputRate(): int
+  fun getOutputRate(): int
+  fun isPassthrough(): boolean
+  fun resample(short[]): short[]
+class com.braymon.kotmpeg.codecconfig.AacConfig$Parsed
+  constructor(int, int, int, int, int)
+  fun getAudioObjectType(): int
+  fun getChannelCount(): int
+  fun getCoreChannelCount(): int
+  fun getCoreSampleRate(): int
+  fun getSampleRate(): int
+class com.braymon.kotmpeg.codecconfig.AacConfig
+  fun build$default(AacConfig, int, int, int, int, Object): byte[]
+  fun build(int, int, int): byte[]
+  fun getSAMPLE_RATES(): List<Integer>
+  fun parse(byte[]): AacConfig$Parsed
+  field AOT_AAC_LC: int
+  field AOT_PS: int
+  field AOT_SBR: int
+  field INSTANCE: AacConfig
+class com.braymon.kotmpeg.codecconfig.BitReader
+  constructor(byte[])
+  fun bits(int): int
+  fun ue(): int
+class com.braymon.kotmpeg.codecconfig.HevcSpsInfo$Companion
+  fun parse(byte[]): HevcSpsInfo
+class com.braymon.kotmpeg.codecconfig.HevcSpsInfo
+  constructor(int, boolean, int, long, long, int, int, int, int, int, boolean)
+  fun getBitDepthChroma(): int
+  fun getBitDepthLuma(): int
+  fun getChromaFormatIdc(): int
+  fun getConstraintFlags(): long
+  fun getLevelIdc(): int
+  fun getMaxSubLayers(): int
+  fun getProfileCompatFlags(): long
+  fun getProfileIdc(): int
+  fun getProfileSpace(): int
+  fun getTemporalIdNesting(): boolean
+  fun getTierFlag(): boolean
+  field Companion: HevcSpsInfo$Companion
+class com.braymon.kotmpeg.codecconfig.NalUnits
+  fun annexBToLengthPrefixed(byte[]): byte[]
+  fun buildAvcC(List<byte[]>, List<byte[]>): byte[]
+  fun buildHvcC(List<byte[]>, List<byte[]>, List<byte[]>): byte[]
+  fun h264NalType(byte[]): int
+  fun h265NalType(byte[]): int
+  fun isH265KeyFrameNal(int): boolean
+  fun joinAnnexB(List<byte[]>): byte[]
+  fun joinLengthPrefixed(List<byte[]>): byte[]
+  fun lengthPrefixedToAnnexB(byte[]): byte[]
+  fun parseAvcC(byte[]): Pair<List<byte[]>, List<byte[]>>
+  fun parseHvcC(byte[]): Map<Integer, List<byte[]>>
+  fun splitAnnexB(byte[]): List<byte[]>
+  fun splitLengthPrefixed(byte[]): List<byte[]>
+  fun unescapeRbsp(byte[]): byte[]
+  field H264_AUD: int
+  field H264_IDR: int
+  field H264_PPS: int
+  field H264_SEI: int
+  field H264_SPS: int
+  field H265_AUD: int
+  field H265_PPS: int
+  field H265_PREFIX_SEI: int
+  field H265_SPS: int
+  field H265_VPS: int
+  field INSTANCE: NalUnits
+class com.braymon.kotmpeg.codecconfig.OpusConfig$Parsed
+  constructor(int, int, int, int, int, byte[])
+  fun getChannelCount(): int
+  fun getChannelMapping(): byte[]
+  fun getCodecDelayUs(): long
+  fun getInputSampleRate(): int
+  fun getMappingFamily(): int
+  fun getOutputGain(): int
+  fun getPreSkip(): int
+class com.braymon.kotmpeg.codecconfig.OpusConfig
+  fun buildOpusHead$default(OpusConfig, int, int, int, int, int, byte[], int, Object): byte[]
+  fun buildOpusHead(int, int, int, int, int, byte[]): byte[]
+  fun dopsToOpusHead(byte[]): byte[]
+  fun opusHeadToDops(byte[]): byte[]
+  fun parseOpusHead(byte[]): OpusConfig$Parsed
+  field INSTANCE: OpusConfig
+class com.braymon.kotmpeg.ebml.EbmlElement
+  constructor(long, long, long)
+  fun getDataEnd(): long
+  fun getDataStart(): long
+  fun getId(): long
+  fun getSize(): long
+class com.braymon.kotmpeg.ebml.EbmlException
+  constructor(String)
+class com.braymon.kotmpeg.ebml.EbmlReader
+  constructor(SeekableInput)
+  fun getInput(): SeekableInput
+  fun readBinary(EbmlElement): byte[]
+  fun readElement(): EbmlElement
+  fun readFloat(EbmlElement): double
+  fun readId(): long
+  fun readSInt(EbmlElement): long
+  fun readString(EbmlElement): String
+  fun readUInt(EbmlElement): long
+  fun readVintSize(): long
+  fun skip(EbmlElement): void
+class com.braymon.kotmpeg.ebml.EbmlWriter$Companion
+  fun encodeUInt(long): byte[]
+  fun encodeVintSize(long, int): byte[]
+  fun encodeVoid(int): byte[]
+  fun vintSizeLength(long): int
+class com.braymon.kotmpeg.ebml.EbmlWriter
+  constructor(SeekableOutput)
+  fun beginMaster(long): long
+  fun endMaster(long): void
+  fun getOut(): SeekableOutput
+  fun writeElement(long, byte[]): void
+  fun writeFloat(long, double): void
+  fun writeId(long): void
+  fun writeString(long, String): void
+  fun writeUInt(long, long): void
+  fun writeUnknownSize$default(EbmlWriter, int, int, Object): void
+  fun writeUnknownSize(int): void
+  fun writeVintSize(long): void
+  fun writeVintSize(long, int): void
+  fun writeVoid(int): void
+  field Companion: EbmlWriter$Companion
+class com.braymon.kotmpeg.ebml.MatroskaIds
+  field ATTACHMENTS: long
+  field AUDIO: long
+  field BIT_DEPTH: long
+  field BLOCK: long
+  field BLOCK_DURATION: long
+  field BLOCK_GROUP: long
+  field CHANNELS: long
+  field CHAPTERS: long
+  field CLUSTER: long
+  field CLUSTER_TIMESTAMP: long
+  field CODEC_DELAY: long
+  field CODEC_ID: long
+  field CODEC_NAME: long
+  field CODEC_PRIVATE: long
+  field COLOUR: long
+  field COLOUR_PRIMARIES: long
+  field COLOUR_RANGE: long
+  field CRC32: long
+  field CUES: long
+  field CUE_CLUSTER_POSITION: long
+  field CUE_POINT: long
+  field CUE_RELATIVE_POSITION: long
+  field CUE_TIME: long
+  field CUE_TRACK: long
+  field CUE_TRACK_POSITIONS: long
+  field DATE_UTC: long
+  field DEFAULT_DURATION: long
+  field DISPLAY_HEIGHT: long
+  field DISPLAY_UNIT: long
+  field DISPLAY_WIDTH: long
+  field DOCTYPE: long
+  field DOCTYPE_READ_VERSION: long
+  field DOCTYPE_VERSION: long
+  field DURATION: long
+  field EBML: long
+  field EBML_MAX_ID_LENGTH: long
+  field EBML_MAX_SIZE_LENGTH: long
+  field EBML_READ_VERSION: long
+  field EBML_VERSION: long
+  field FLAG_DEFAULT: long
+  field FLAG_ENABLED: long
+  field FLAG_FORCED: long
+  field FLAG_INTERLACED: long
+  field FLAG_LACING: long
+  field INFO: long
+  field INSTANCE: MatroskaIds
+  field LANGUAGE: long
+  field LUMINANCE_MAX: long
+  field LUMINANCE_MIN: long
+  field MASTERING_METADATA: long
+  field MATRIX_COEFFICIENTS: long
+  field MAX_CLL: long
+  field MAX_FALL: long
+  field MUXING_APP: long
+  field NAME: long
+  field OUTPUT_SAMPLING_FREQUENCY: long
+  field PIXEL_HEIGHT: long
+  field PIXEL_WIDTH: long
+  field PRIMARY_B_X: long
+  field PRIMARY_B_Y: long
+  field PRIMARY_G_X: long
+  field PRIMARY_G_Y: long
+  field PRIMARY_R_X: long
+  field PRIMARY_R_Y: long
+  field PROJECTION: long
+  field PROJECTION_POSE_PITCH: long
+  field PROJECTION_POSE_ROLL: long
+  field PROJECTION_POSE_YAW: long
+  field PROJECTION_TYPE: long
+  field REFERENCE_BLOCK: long
+  field SAMPLING_FREQUENCY: long
+  field SEEK: long
+  field SEEK_HEAD: long
+  field SEEK_ID: long
+  field SEEK_POSITION: long
+  field SEEK_PRE_ROLL: long
+  field SEGMENT: long
+  field SEGMENT_UID: long
+  field SIMPLE_BLOCK: long
+  field TAGS: long
+  field TIMESTAMP_SCALE: long
+  field TITLE: long
+  field TRACKS: long
+  field TRACK_ENTRY: long
+  field TRACK_NUMBER: long
+  field TRACK_TIMESTAMP_SCALE: long
+  field TRACK_TYPE: long
+  field TRACK_TYPE_AUDIO: long
+  field TRACK_TYPE_SUBTITLE: long
+  field TRACK_TYPE_VIDEO: long
+  field TRACK_UID: long
+  field TRANSFER_CHARACTERISTICS: long
+  field VIDEO: long
+  field VOID: long
+  field WHITE_POINT_X: long
+  field WHITE_POINT_Y: long
+  field WRITING_APP: long
+class com.braymon.kotmpeg.io.SeekableInput
+  constructor(File)
+  constructor(FileDescriptor)
+  constructor(RandomAccessFile)
+  constructor(FileChannel)
+  fun close(): void
+  fun getLength(): long
+  fun getPosition(): long
+  fun getRemaining(): long
+  fun readBits(int): long
+  fun readByte(): int
+  fun readBytes(int): byte[]
+  fun readFully$default(SeekableInput, byte[], int, int, int, Object): void
+  fun readFully(byte[], int, int): void
+  fun readInt32(): int
+  fun readInt64(): long
+  fun setPosition(long): void
+  fun skip(long): void
+class com.braymon.kotmpeg.io.SeekableOutput
+  constructor(File)
+  constructor(FileDescriptor)
+  constructor(RandomAccessFile)
+  constructor(FileChannel)
+  fun close(): void
+  fun flush(): void
+  fun getPosition(): long
+  fun patch(long, byte[]): void
+  fun write$default(SeekableOutput, byte[], int, int, int, Object): void
+  fun writeBits(long, int): void
+  fun writeByte(int): void
+  fun writeInt32(int): void
+  fun writeInt64(long): void
+  fun write(byte[], int, int): void
+class com.braymon.kotmpeg.mkv.MkvDemuxer
+  constructor(SeekableInput, Function1<? super String, Unit>)
+  constructor(File, Function1<? super String, Unit>)
+  fun close(): void
+  fun getDurationUs(): long
+  fun getTracks(): List<TrackInfo>
+  fun readPacket(): MediaPacket
+  fun seekTo(long): long
+class com.braymon.kotmpeg.mkv.MkvMuxer
+  constructor(SeekableOutput, long, String)
+  constructor(File, long)
+  fun addTrack(TrackInfo): int
+  fun close(): void
+  fun start(): void
+  fun stop(): void
+  fun writePacket(MediaPacket): void
+  field SEEK_HEAD_RESERVED: int
+  field TIMESTAMP_SCALE_NS: long
+class com.braymon.kotmpeg.model.AudioCodec$Companion
+  fun fromMatroskaId(String): AudioCodec
+  fun fromMimeType(String): AudioCodec
+enum com.braymon.kotmpeg.model.AudioCodec
+  fun getEntries(): EnumEntries<AudioCodec>
+  fun getMatroskaId(): String
+  fun getMimeType(): String
+  fun getMp4SampleEntry(): String
+  fun valueOf(String): AudioCodec
+  fun values(): AudioCodec[]
+  field AAC: AudioCodec
+  field Companion: AudioCodec$Companion
+  field OPUS: AudioCodec
+class com.braymon.kotmpeg.model.ColorInfo$Companion
+  fun bt709(): ColorInfo
+  fun hdr10$default(ColorInfo$Companion, HdrStaticInfo, int, Object): ColorInfo
+  fun hdr10(HdrStaticInfo): ColorInfo
+class com.braymon.kotmpeg.model.ColorInfo
+  constructor()
+  constructor(int, int, int, boolean, HdrStaticInfo)
+  fun component1(): int
+  fun component2(): int
+  fun component3(): int
+  fun component4(): boolean
+  fun component5(): HdrStaticInfo
+  fun copy$default(ColorInfo, int, int, int, boolean, HdrStaticInfo, int, Object): ColorInfo
+  fun copy(int, int, int, boolean, HdrStaticInfo): ColorInfo
+  fun equals(Object): boolean
+  fun getFullRange(): boolean
+  fun getHdr(): HdrStaticInfo
+  fun getMatrix(): int
+  fun getPrimaries(): int
+  fun getTransfer(): int
+  fun hashCode(): int
+  fun toString(): String
+  field Companion: ColorInfo$Companion
+  field MATRIX_BT2020_NCL: int
+  field MATRIX_BT709: int
+  field PRIMARIES_BT2020: int
+  field PRIMARIES_BT709: int
+  field TRANSFER_BT709: int
+  field TRANSFER_HLG: int
+  field TRANSFER_PQ: int
+  field UNSPECIFIED: int
+class com.braymon.kotmpeg.model.ContainerFormat$Companion
+  fun fromFileName(String): ContainerFormat
+enum com.braymon.kotmpeg.model.ContainerFormat
+  fun getEntries(): EnumEntries<ContainerFormat>
+  fun valueOf(String): ContainerFormat
+  fun values(): ContainerFormat[]
+  field Companion: ContainerFormat$Companion
+  field MKV: ContainerFormat
+  field MP4: ContainerFormat
+class com.braymon.kotmpeg.model.HdrStaticInfo$Companion
+class com.braymon.kotmpeg.model.HdrStaticInfo
+  constructor(double, double, double, double, double, double, double, double, double, double, int, int)
+  fun component1(): double
+  fun component10(): double
+  fun component11(): int
+  fun component12(): int
+  fun component2(): double
+  fun component3(): double
+  fun component4(): double
+  fun component5(): double
+  fun component6(): double
+  fun component7(): double
+  fun component8(): double
+  fun component9(): double
+  fun copy$default(HdrStaticInfo, double, double, double, double, double, double, double, double, double, double, int, int, int, Object): HdrStaticInfo
+  fun copy(double, double, double, double, double, double, double, double, double, double, int, int): HdrStaticInfo
+  fun equals(Object): boolean
+  fun getBlueX(): double
+  fun getBlueY(): double
+  fun getGreenX(): double
+  fun getGreenY(): double
+  fun getMaxContentLightLevel(): int
+  fun getMaxFrameAverageLightLevel(): int
+  fun getMaxMasteringLuminance(): double
+  fun getMinMasteringLuminance(): double
+  fun getRedX(): double
+  fun getRedY(): double
+  fun getWhiteX(): double
+  fun getWhiteY(): double
+  fun hashCode(): int
+  fun toStaticMetadataDescriptor(): byte[]
+  fun toString(): String
+  field CTA861_MAX_MASTERING_LUMINANCE: double
+  field CTA861_MIN_MASTERING_LUMINANCE: double
+  field Companion: HdrStaticInfo$Companion
+  field MAX_MASTERING_LUMINANCE: double
+class com.braymon.kotmpeg.model.MediaPacket
+  constructor(int, byte[], long, long, boolean, long)
+  fun getData(): byte[]
+  fun getDtsUs(): long
+  fun getDurationUs(): long
+  fun getPtsUs(): long
+  fun getSize(): int
+  fun getTrackId(): int
+  fun isKeyFrame(): boolean
+  fun toString(): String
+class com.braymon.kotmpeg.model.TrackInfo$Audio
+  constructor(int, AudioCodec, int, int, int, long, byte[], String, String)
+  fun component1(): int
+  fun component2(): AudioCodec
+  fun component3(): int
+  fun component4(): int
+  fun component5(): int
+  fun component6(): long
+  fun component7(): byte[]
+  fun component8(): String
+  fun component9(): String
+  fun copy$default(TrackInfo$Audio, int, AudioCodec, int, int, int, long, byte[], String, String, int, Object): TrackInfo$Audio
+  fun copy(int, AudioCodec, int, int, int, long, byte[], String, String): TrackInfo$Audio
+  fun equals(Object): boolean
+  fun getBitDepth(): int
+  fun getChannelCount(): int
+  fun getCodec(): AudioCodec
+  fun getCodecDelayUs(): long
+  fun getCodecPrivate(): byte[]
+  fun getDefaultDurationUs(): long
+  fun getId(): int
+  fun getLanguage(): String
+  fun getName(): String
+  fun getSampleRate(): int
+  fun hashCode(): int
+  fun toString(): String
+class com.braymon.kotmpeg.model.TrackInfo$Video
+  constructor(int, VideoCodec, int, int, int, int, double, int, ColorInfo, byte[], String, String)
+  fun component1(): int
+  fun component10(): byte[]
+  fun component11(): String
+  fun component12(): String
+  fun component2(): VideoCodec
+  fun component3(): int
+  fun component4(): int
+  fun component5(): int
+  fun component6(): int
+  fun component7(): double
+  fun component8(): int
+  fun component9(): ColorInfo
+  fun copy$default(TrackInfo$Video, int, VideoCodec, int, int, int, int, double, int, ColorInfo, byte[], String, String, int, Object): TrackInfo$Video
+  fun copy(int, VideoCodec, int, int, int, int, double, int, ColorInfo, byte[], String, String): TrackInfo$Video
+  fun equals(Object): boolean
+  fun getCodec(): VideoCodec
+  fun getCodecPrivate(): byte[]
+  fun getColor(): ColorInfo
+  fun getDefaultDurationUs(): long
+  fun getDisplayHeight(): int
+  fun getDisplayWidth(): int
+  fun getFrameRate(): double
+  fun getHeight(): int
+  fun getId(): int
+  fun getLanguage(): String
+  fun getName(): String
+  fun getRotationDegrees(): int
+  fun getWidth(): int
+  fun hashCode(): int
+  fun toString(): String
+class com.braymon.kotmpeg.model.TrackInfo
+  fun getCodecPrivate(): byte[]
+  fun getDefaultDurationUs(): long
+  fun getId(): int
+  fun getLanguage(): String
+  fun getName(): String
+  fun withId(int): TrackInfo
+class com.braymon.kotmpeg.model.VideoCodec$Companion
+  fun fromMatroskaId(String): VideoCodec
+  fun fromMimeType(String): VideoCodec
+enum com.braymon.kotmpeg.model.VideoCodec
+  fun getEntries(): EnumEntries<VideoCodec>
+  fun getMatroskaId(): String
+  fun getMimeType(): String
+  fun getMp4SampleEntry(): String
+  fun valueOf(String): VideoCodec
+  fun values(): VideoCodec[]
+  field Companion: VideoCodec$Companion
+  field H264: VideoCodec
+  field H265: VideoCodec
+class com.braymon.kotmpeg.mp4.BoxBuilder
+  constructor()
+  fun box(String, Function1<? super BoxBuilder, Unit>): void
+  fun bytes(byte[]): void
+  fun fourcc(String): void
+  fun fullBox(String, int, int, Function1<? super BoxBuilder, Unit>): void
+  fun getSize(): int
+  fun s16(int): void
+  fun toByteArray(): byte[]
+  fun u16(int): void
+  fun u24(int): void
+  fun u32(int): void
+  fun u32(long): void
+  fun u64(long): void
+  fun u8(int): void
+  fun zeros(int): void
+class com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
+  constructor(SeekableOutput, long, long, long)
+  constructor(File, long)
+  fun addTrack(TrackInfo): int
+  fun close(): void
+  fun start(): void
+  fun stop(): void
+  fun writePacket(MediaPacket): void
+  field MOVIE_TIMESCALE: long
+  field NON_SYNC_SAMPLE_FLAGS: long
+  field SYNC_SAMPLE_FLAGS: long
+  field VIDEO_TIMESCALE: long
+class com.braymon.kotmpeg.mp4.Mp4Demuxer
+  constructor(SeekableInput, Function1<? super String, Unit>)
+  constructor(File, Function1<? super String, Unit>)
+  fun close(): void
+  fun getDurationUs(): long
+  fun getTracks(): List<TrackInfo>
+  fun readPacket(): MediaPacket
+  fun seekTo(long): long
+class com.braymon.kotmpeg.mp4.Mp4Muxer
+  constructor(SeekableOutput)
+  constructor(File, boolean)
+  fun addTrack(TrackInfo): int
+  fun close(): void
+  fun start(): void
+  fun stop(): void
+  fun writePacket(MediaPacket): void
+  field MOVIE_TIMESCALE: long
+  field UINT32_MAX: long
+  field VIDEO_TIMESCALE: long
+class com.braymon.kotmpeg.mp4.SampleEntries
+  fun writeAudio(BoxBuilder, TrackInfo$Audio): void
+  fun writeDisplayMatrix(BoxBuilder, int, int, int): void
+  fun writeVisual(BoxBuilder, TrackInfo$Video): void
+  field INSTANCE: SampleEntries
+  field MAX_SAMPLE_ENTRY_RATE: long
+class com.braymon.kotmpeg.pipeline.Remuxer
+  fun concat$default(Remuxer, List, Muxer, Function1, int, Object): long
+  fun concat(List<? extends Demuxer>, Muxer, Function1<? super Long, Unit>): long
+  fun remux$default(Remuxer, Demuxer, Muxer, Function1, Function1, int, Object): long
+  fun remux(Demuxer, Muxer, Function1<? super Integer, Boolean>, Function1<? super Long, Unit>): long
+  field INSTANCE: Remuxer

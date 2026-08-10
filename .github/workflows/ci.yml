@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  # Disparador manual desde la pestaña Actions. No cuesta nada tenerlo y evita el commit vacío de
+  # turno cuando hay que comprobar si el workflow corre siquiera — que es exactamente el caso en el
+  # que un push no genera ninguna ejecución y no se sabe si el problema es el archivo o los
+  # permisos del repositorio.
+  workflow_dispatch:
+
+# Un push nuevo sobre la misma rama cancela el build anterior: no tiene sentido pagar dos
+# ejecuciones por un commit que ya está superado.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  jvm:
+    name: Tests y publicación
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `actions/checkout` restaura los permisos tal y como están en el índice de git, y todos los
+      # pasos de abajo invocan `./gradlew` directamente. Si el archivo pierde su bit de ejecución,
+      # el primero de ellos muere con `Permission denied` (salida 126): un síntoma que no se parece
+      # en nada a la causa, en un cambio que además es invisible en el diff — `git` lo registra
+      # como `1 file changed, 0 insertions(+), 0 deletions(-)`.
+      #
+      # No es hipotético: un wrapper añadido en modo 100644 deja el workflow sin poder terminar ni
+      # una vez, y no es solo el CI — `jitpack.yml` invoca el wrapper igual, así que la publicación
+      # del primer tag falla también.
+      #
+      # Se comprueba en vez de hacer `chmod +x` a ciegas a propósito: un `chmod` deja el CI en
+      # verde y el repositorio roto para todo lo demás, que es la forma de que esto vuelva sin que
+      # nadie se entere. Aquí el fallo dice qué pasó y cómo se arregla.
+      - name: Bit de ejecución de gradlew
+        run: |
+          modo=$(git ls-files -s gradlew | cut -d' ' -f1)
+          if [ "$modo" != "100755" ]; then
+            echo "::error file=gradlew::gradlew está en modo $modo y hace falta 100755."
+            echo "Sin el bit de ejecución, './gradlew' falla con 'Permission denied' en este"
+            echo "runner y en el constructor de JitPack. Se arregla con:"
+            echo "    git update-index --chmod=+x gradlew"
+            echo "    git commit -m 'Restaurar el bit de ejecución de gradlew'"
+            exit 1
+          fi
+          test -x gradlew || { echo "::error::gradlew no es ejecutable en el working tree"; exit 1; }
+          echo "gradlew: modo $modo, ejecutable. OK"
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Sin ffmpeg los tests de integración end-to-end se omiten en silencio (assumeTrue), así que
+      # el CI pasaría sin ejecutar justo la cobertura que valida la salida real contra un
+      # decodificador de verdad. Los tres que leen /proc/self/fd sí corren aquí, y solo aquí: en
+      # Windows y macOS no hay dónde mirar.
+      - name: FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # La compatibilidad de API la vigila `PublicApiTest`, que ya va dentro de `test`: compara la
+      # superficie pública contra un volcado versionado y falla si cambia.
+      - name: Tests
+        run: ./gradlew test
+
+      # Comprueba que el artefacto se puede publicar de verdad, que es lo que consume JitPack.
+      - name: Publicación a Maven local
+        run: ./gradlew publishToMavenLocal
+
+      - name: Informes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: informes
+          path: |
+            build/reports/
+            build/test-results/
+          if-no-files-found: ignore

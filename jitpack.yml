@@ -1,0 +1,13 @@
+# JitPack construye la librería a partir de un tag de GitHub y la sirve como dependencia.
+#
+# Los tests se saltan aquí a propósito: los de integración necesitan FFmpeg en el PATH, así que
+# ejecutarlos en el constructor de JitPack daría una señal engañosa —pasarían omitiéndose—. La
+# suite se corre en local y en el CI (.github/workflows/ci.yml), que sí instala FFmpeg.
+#
+# `./gradlew` se invoca aquí sin `chmod` previo, igual que en el CI: depende del bit de ejecución
+# que git guarda en el índice para este archivo. Si se pierde, esta línea falla con un
+# `Permission denied` que el log de JitPack no explica. Lo vigila el primer paso del CI.
+jdk:
+  - openjdk17
+install:
+  - ./gradlew publishToMavenLocal -x test
