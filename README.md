@@ -4,10 +4,9 @@
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10, sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
 
-**Versión: 1.0.0 — sin publicar todavía.** A partir de esta versión la API pública queda
-congelada: lo que se publique aquí se mantiene, y romperlo exige una `2.0.0`. No depende de que
-nadie se acuerde — `PublicApiTest` compara la superficie pública contra un volcado versionado y
-falla si se mueve.
+**Versión: 1.0.0 — estable.** A partir de esta versión la API pública queda congelada: lo que se
+publica aquí se mantiene, y romperlo exige una `2.0.0`. No depende de que nadie se acuerde —
+`PublicApiTest` compara la superficie pública contra un volcado versionado y falla si se mueve.
 
 La librería **no codifica ni decodifica**: empaqueta y desempaqueta streams que ya vienen
 comprimidos. Todo el alcance, con lo que queda fuera y por qué, está en
@@ -134,8 +133,8 @@ Dos cosas que conviene tener claras antes de integrarla en una app:
 
 ### Opción A — desde JitPack
 
-JitPack compila la librería a partir de un **tag** de este repositorio, así que esta vía funciona en
-cuanto exista el primer tag. Añade el repositorio y la dependencia:
+JitPack compila la librería a partir de un **tag** de este repositorio. Añade el repositorio y la
+dependencia:
 
 ```kotlin
 // settings.gradle.kts de tu proyecto — dónde buscar
@@ -166,8 +165,7 @@ solo, así que se nombra por el repositorio. Escribir la forma multi-módulo —
 
 ### Opción B — desde tu Maven local
 
-Útil para probar un cambio de la librería en tu app antes de publicar nada, y la única vía mientras
-no haya tag. En este proyecto:
+Útil para probar un cambio de la librería en tu app antes de publicar nada. En este proyecto:
 
 ```bash
 ./gradlew publishToMavenLocal

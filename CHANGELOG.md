@@ -7,13 +7,11 @@ Desde la 1.0.0 la API pública es estable: **romperla exige subir la versión ma
 declarado como `Cambios incompatibles` en su entrada. No depende de que nadie se acuerde —
 `PublicApiTest` compara la superficie pública contra un volcado versionado y falla si se mueve.
 
-## [1.0.0] — sin publicar
+## [1.0.0] — 2026-08-10
 
 Primera versión: el motor de contenedores completo, en Kotlin puro y sobre cualquier JVM 17. Esta
 entrada es la línea base del proyecto — describe **qué hay**, no qué cambió, porque no hay ninguna
 versión anterior contra la que comparar. A partir de aquí cada entrada recoge solo el delta.
-
-La fecha se escribe en el commit que cree el tag, que es cuando la versión pasa a estar publicada.
 
 ### Añadido
 
