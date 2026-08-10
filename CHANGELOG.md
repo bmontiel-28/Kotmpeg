@@ -7,6 +7,30 @@ Desde la 1.0.0 la API pública es estable: **romperla exige subir la versión ma
 declarado como `Cambios incompatibles` en su entrada. No depende de que nadie se acuerde —
 `PublicApiTest` compara la superficie pública contra un volcado versionado y falla si se mueve.
 
+## [1.0.1] — 2026-08-10
+
+Release de compatibilidad: **el código de la librería es idéntico al de la `1.0.0`**, y su API
+pública también —el volcado de `public-api.txt` no se movió—. Lo que cambia es con qué compilador
+se construye el artefacto.
+
+### Corregido
+
+- **La `1.0.0` no se puede consumir desde un proyecto Android.** Se publicó compilada con Kotlin
+  **2.4.10**, y una app que herede el Kotlin integrado de AGP —que va por 2.2.10— no puede leer esa
+  metadata. El síntoma no se parece a la causa: falla la compilación **entera** con
+  `was compiled with an incompatible version of Kotlin`, señalando incluso llamadas a la propia
+  biblioteca estándar como `firstOrNull` o `with`, porque al resolver a la versión más alta
+  `kotlin-stdlib` sube a 2.4.10 en todo el classpath de la app.
+
+  El core pasa a compilarse con **Kotlin 2.2.10** y el POM declara `kotlin-stdlib:2.2.10`. Quien
+  ya hubiera puesto la `1.0.0` en un proyecto Android tiene que subir a esta: no hay forma de
+  rodearlo desde el lado de la app salvo forzar la versión de la stdlib a mano.
+
+> **Antes de subir la versión de Kotlin de este proyecto**, comprueba qué `kotlin-gradle-plugin`
+> arrastra el AGP de las apps que lo consumen. El compilador de la app es el techo, no el de aquí:
+> publicar con una versión más nueva de la que ese AGP sabe leer deja el artefacto inservible sin
+> que ningún test de este repositorio se entere.
+
 ## [1.0.0] — 2026-08-10
 
 Primera versión: el motor de contenedores completo, en Kotlin puro y sobre cualquier JVM 17. Esta

@@ -10,7 +10,7 @@
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10, sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
 
-**Versión: 1.0.0 — estable.** A partir de esta versión la API pública queda congelada: lo que se
+**Versión: 1.0.1 — estable.** Desde la `1.0.0` la API pública queda congelada: lo que se
 publica aquí se mantiene, y romperlo exige una `2.0.0`. No depende de que nadie se acuerde —
 `PublicApiTest` compara la superficie pública contra un volcado versionado y falla si se mueve.
 
@@ -153,7 +153,7 @@ dependencyResolutionManagement {
 
 // build.gradle.kts — qué bajar
 dependencies {
-    implementation("com.github.bmontiel-28:Kotmpeg:1.0.0")
+    implementation("com.github.bmontiel-28:Kotmpeg:1.0.1")
 }
 ```
 
@@ -183,7 +183,7 @@ Y en el proyecto que la consume:
 // settings.gradle.kts
 dependencyResolutionManagement { repositories { mavenLocal(); mavenCentral() } }
 // build.gradle.kts
-dependencies { implementation("com.braymon:kotmpeg-core:1.0.0") }
+dependencies { implementation("com.braymon:kotmpeg-core:1.0.1") }
 ```
 
 Las dos opciones publican el jar y un jar de fuentes, así que el IDE deja navegar el código y leer
