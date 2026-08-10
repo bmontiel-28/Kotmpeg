@@ -217,7 +217,8 @@ public object MkvKotlin {
     }
 
     /**
-     * Rechaza que el destino sea también una de las entradas.
+     * Rechaza que el destino sea también una de las entradas, lanzando `IllegalArgumentException`
+     * con un mensaje que dice qué hacer.
      *
      * El muxer trunca el archivo de salida a cero nada más abrirlo, así que `remux(f, f)` o
      * `concat(listOf(a, b), a)` se ejecutaban sin error aparente mientras leían un archivo
@@ -227,8 +228,17 @@ public object MkvKotlin {
      * Se compara por ruta canónica para que un enlace simbólico o una ruta relativa distinta
      * al mismo archivo tampoco se cuelen; si el sistema de archivos no puede canonizarla se
      * cae a la ruta absoluta, que es lo mejor disponible.
+     *
+     * [remux] y [concat] ya la aplican por su cuenta, así que **no hace falta llamarla** para
+     * usarlas. Está expuesta para quien arme su propia canalización con [openDemuxer] y
+     * [createMuxer], donde no hay ningún punto central que pueda hacer esta comprobación: es la
+     * misma validación que la fachada, en vez de una versión propia que se olvide de los enlaces
+     * simbólicos.
+     *
+     * @param inputs archivos que se van a leer.
+     * @param output archivo que se va a escribir, y que se truncará al abrirlo.
      */
-    internal fun requireDistinct(inputs: List<File>, output: File) {
+    public fun requireDistinct(inputs: List<File>, output: File) {
         fun key(f: File): File = runCatching { f.canonicalFile }.getOrDefault(f.absoluteFile)
         val out = key(output)
         require(inputs.none { key(it) == out }) {

@@ -5,7 +5,7 @@ plugins {
 
 // La versión vive aquí y no como texto suelto en el README: es la que acaba en el POM y en el
 // nombre del jar, así que cualquier otra copia acabaría desincronizándose.
-version = "1.0.1"
+version = "1.1.0"
 group = "com.braymon"
 
 // El nombre del jar sigue al del artefacto publicado, no al de la carpeta del repositorio.

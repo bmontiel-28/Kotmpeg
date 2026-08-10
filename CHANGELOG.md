@@ -7,6 +7,24 @@ Desde la 1.0.0 la API pública es estable: **romperla exige subir la versión ma
 declarado como `Cambios incompatibles` en su entrada. No depende de que nadie se acuerde —
 `PublicApiTest` compara la superficie pública contra un volcado versionado y falla si se mueve.
 
+## [1.1.0] — 2026-08-10
+
+### Añadido
+
+- **`MkvKotlin.requireDistinct(inputs, output)`** pasa a ser pública. Rechaza que el archivo de
+  salida sea también una de las entradas, que es un fallo silencioso y no un error: el muxer trunca
+  el destino al abrirlo, así que la operación lee un archivo que se está reescribiendo por debajo y
+  el resultado depende de que el escritor no adelante al lector. Compara por ruta canónica, de modo
+  que un enlace simbólico o una ruta relativa distinta al mismo archivo tampoco se cuelan.
+
+  `remux()` y `concat()` ya la aplicaban por dentro y **siguen haciéndolo**: no hay que llamarla
+  para usarlas. Se expone para quien arme su propia canalización con `openDemuxer` y `createMuxer`,
+  donde no existe ningún punto central que pueda hacer esa comprobación, y así use la misma
+  validación que la fachada en vez de una propia que se olvide de los enlaces simbólicos.
+
+  Es la única línea que se mueve en `public-api.txt`, y solo se añade: **ninguna firma existente
+  cambia**, así que actualizar desde la `1.0.1` no exige tocar nada.
+
 ## [1.0.1] — 2026-08-10
 
 Release de compatibilidad: **el código de la librería es idéntico al de la `1.0.0`**, y su API

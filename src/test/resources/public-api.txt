@@ -17,6 +17,7 @@ class com.braymon.kotmpeg.MkvKotlin
   fun openDemuxer(File, Function1<? super String, Unit>): Demuxer
   fun remux$default(MkvKotlin, File, File, ContainerFormat, boolean, boolean, Function1, Function1, Function1, int, Object): long
   fun remux(File, File, ContainerFormat, boolean, boolean, Function1<? super Integer, Boolean>, Function1<? super Long, Unit>, Function1<? super String, Unit>): long
+  fun requireDistinct(List<? extends File>, File): void
   field INSTANCE: MkvKotlin
 interface com.braymon.kotmpeg.Muxer
   fun addTrack(TrackInfo): int
