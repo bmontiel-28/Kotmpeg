@@ -159,8 +159,12 @@ public sealed class TrackInfo {
         val channelCount: Int,
         val bitDepth: Int = 0,
         /**
-         * Solo Opus: duración del cebado que el decodificador debe descartar, **en
-         * microsegundos** (como indica el sufijo `Us`), no en muestras.
+         * Duración del cebado que el decodificador debe descartar, **en microsegundos** (como
+         * indica el sufijo `Us`), no en muestras.
+         *
+         * Vale para **cualquier códec con retardo de arranque**, no solo para Opus: un AAC-LC a
+         * 48 kHz ronda los 21 ms, y sin declararlo el audio queda por detrás del vídeo. En Opus,
+         * si hay `codecPrivate`, el `preSkip` de su `OpusHead` tiene preferencia sobre este campo.
          *
          * Si partes del `preSkip` crudo de una cabecera OpusHead (que sí va en muestras a
          * 48 kHz), conviértelo antes: `codecDelayUs = preSkip * 1_000_000L / 48_000`. Con

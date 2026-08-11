@@ -152,6 +152,20 @@ public class MkvMuxer(
         ebml.endMaster(sizePos)
     }
 
+    /**
+     * Escribe un `TrackEntry`.
+     *
+     * Dos elementos de audio que parecen ir juntos y no van: **`CodecDelay` vale para cualquier
+     * códec con retardo de arranque** —Matroska lo define así— mientras que el `SeekPreRoll` de
+     * 80 ms sí es propio de Opus. Estuvieron los dos dentro del mismo condicional, y la
+     * consecuencia era que un `codecDelayUs` puesto en una pista AAC se aceptaba y se descartaba
+     * en silencio: el archivo salía sin el elemento y el audio quedaba por detrás del vídeo los
+     * ~21 ms que tarda en arrancar un codificador AAC-LC a 48 kHz.
+     *
+     * Para Opus el `OpusHead` sigue mandando sobre el campo, porque es el dato que de verdad
+     * describe el bitstream; el `takeIf` es lo que mantiene esa preferencia sin extenderla a los
+     * demás códecs, que no tienen ninguna cabecera de la que deducirlo.
+     */
     private fun writeTrackEntry(track: TrackInfo) {
         val entryPos = ebml.beginMaster(MatroskaIds.TRACK_ENTRY)
         ebml.writeUInt(MatroskaIds.TRACK_NUMBER, track.id.toLong())
@@ -217,11 +231,12 @@ public class MkvMuxer(
                 ebml.writeUInt(MatroskaIds.TRACK_TYPE, MatroskaIds.TRACK_TYPE_AUDIO)
                 ebml.writeString(MatroskaIds.CODEC_ID, track.codec.matroskaId)
                 track.codecPrivate?.let { ebml.writeElement(MatroskaIds.CODEC_PRIVATE, it) }
+                val delayNs = track.codecPrivate
+                    ?.takeIf { track.codec == AudioCodec.OPUS }
+                    ?.let { runCatching { OpusConfig.parseOpusHead(it).codecDelayUs * 1000 }.getOrNull() }
+                    ?: (track.codecDelayUs * 1000)
+                if (delayNs > 0) ebml.writeUInt(MatroskaIds.CODEC_DELAY, delayNs)
                 if (track.codec == AudioCodec.OPUS) {
-                    val delayNs = track.codecPrivate
-                        ?.let { runCatching { OpusConfig.parseOpusHead(it).codecDelayUs * 1000 }.getOrNull() }
-                        ?: (track.codecDelayUs * 1000)
-                    if (delayNs > 0) ebml.writeUInt(MatroskaIds.CODEC_DELAY, delayNs)
                     ebml.writeUInt(MatroskaIds.SEEK_PRE_ROLL, 80_000_000)
                 }
                 val aPos = ebml.beginMaster(MatroskaIds.AUDIO)

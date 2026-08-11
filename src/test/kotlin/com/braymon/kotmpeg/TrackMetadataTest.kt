@@ -2,6 +2,7 @@ package com.braymon.kotmpeg
 
 import com.braymon.kotmpeg.codecconfig.AacConfig
 import com.braymon.kotmpeg.codecconfig.NalUnits
+import com.braymon.kotmpeg.codecconfig.OpusConfig
 import com.braymon.kotmpeg.ebml.EbmlReader
 import com.braymon.kotmpeg.ebml.MatroskaIds
 import com.braymon.kotmpeg.io.SeekableInput
@@ -19,8 +20,8 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * **Los tres metadatos de `TrackEntry` e `Info` que un análisis forense encontró ausentes o
- * imprecisos** en un archivo real de 107 s con vídeo a 60 fps y tres pistas de audio.
+ * **Los metadatos de `TrackEntry` e `Info` que un análisis forense encontró ausentes o
+ * imprecisos** en archivos reales producidos por esta librería.
  *
  * Ninguno corrompía nada —el archivo decodificaba entero y sin un solo error—, y por eso vale la
  * pena dejar escrito qué se rompía en la práctica, que es lo que un test de "el archivo es válido"
@@ -35,6 +36,11 @@ import kotlin.test.assertTrue
  *    la línea de tiempo de un editor.
  *  - **`DateUTC` no se escribía.** La fecha de grabación solo sobrevivía en el nombre del archivo,
  *    que es justo lo que se pierde al renombrar o reimportar.
+ *  - **`CodecDelay` solo se escribía para Opus.** Compartía condicional con el `SeekPreRoll`, que
+ *    sí es propio de Opus, así que un `codecDelayUs` puesto en una pista AAC se aceptaba y se
+ *    descartaba en silencio: el audio quedaba por detrás del vídeo los ~21 ms que tarda en
+ *    arrancar un AAC-LC a 48 kHz. El demuxer, en cambio, siempre supo leerlo para cualquier
+ *    códec, así que la asimetría estaba solo en la escritura.
  *
  * La comprobación se hace **sobre los bytes del contenedor**, no sobre el modelo: el fallo estaba
  * en lo que se escribía, así que releerlo con nuestro propio demuxer y darlo por bueno sería
@@ -225,5 +231,68 @@ class TrackMetadataTest {
             infoValues(file, MatroskaIds.DATE_UTC, signed = true).isEmpty(),
             "sin fecha no debe escribirse el elemento",
         )
+    }
+
+    /** El cebado real de un AAC-LC a 48 kHz: 1024 muestras, que son 21 333 µs. */
+    private fun aacWithDelay(delayUs: Long) = TrackInfo.Audio(
+        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2,
+        codecDelayUs = delayUs, codecPrivate = AacConfig.build(48000, 2),
+    )
+
+    @Test
+    fun `CodecDelay is written for AAC and not only for Opus`() {
+        val file = mux(aacWithDelay(21_333))
+        assertEquals(
+            listOf(21_333_000L), trackValues(file, MatroskaIds.CODEC_DELAY),
+            "el retardo de arranque de un AAC se aceptaba y se descartaba en silencio",
+        )
+    }
+
+    /**
+     * El `SeekPreRoll` de 80 ms **sí** es propio de Opus, y compartía condicional con el retardo.
+     * Que no se cuele en una pista AAC es la otra mitad del arreglo.
+     */
+    @Test
+    fun `SeekPreRoll stays out of non Opus tracks`() {
+        val file = mux(aacWithDelay(21_333))
+        assertTrue(
+            trackValues(file, MatroskaIds.SEEK_PRE_ROLL).isEmpty(),
+            "SeekPreRoll es de Opus y no debe aparecer en una pista AAC",
+        )
+    }
+
+    @Test
+    fun `no CodecDelay is written when the track declares no delay`() {
+        val file = mux(aacWithDelay(0))
+        assertTrue(
+            trackValues(file, MatroskaIds.CODEC_DELAY).isEmpty(),
+            "sin retardo declarado no debe escribirse el elemento",
+        )
+    }
+
+    /**
+     * Opus no cambia: su `OpusHead` describe el bitstream de verdad, así que su `preSkip` sigue
+     * ganando al campo del modelo. Con el `preSkip` por defecto de 312 muestras a 48 kHz el
+     * retardo son 6500 µs, y el 99 999 que se pasa aquí debe quedar ignorado.
+     */
+    @Test
+    fun `Opus still takes its delay from the OpusHead and keeps SeekPreRoll`() {
+        val opus = TrackInfo.Audio(
+            codec = AudioCodec.OPUS, sampleRate = 48000, channelCount = 2,
+            codecDelayUs = 99_999, codecPrivate = OpusConfig.buildOpusHead(channelCount = 2),
+        )
+        val file = mux(opus)
+        assertEquals(listOf(6_500_000L), trackValues(file, MatroskaIds.CODEC_DELAY))
+        assertEquals(listOf(80_000_000L), trackValues(file, MatroskaIds.SEEK_PRE_ROLL))
+    }
+
+    /** Y que el valor sobreviva a la relectura, que es lo que usa un `remux()`. */
+    @Test
+    fun `the demuxer reads back the AAC delay`() {
+        val file = mux(aacWithDelay(21_333))
+        MkvDemuxer(SeekableInput(file)).use { demuxer ->
+            val audio = demuxer.tracks.filterIsInstance<TrackInfo.Audio>().single()
+            assertEquals(21_333L, audio.codecDelayUs)
+        }
     }
 }

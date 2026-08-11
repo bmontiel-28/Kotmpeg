@@ -54,6 +54,31 @@ primero se refiere a tu código, lo segundo a lo ya compilado.
 
 ---
 
+## [2.0.1] — 2026-08-11
+
+### Corregido
+
+- **`CodecDelay` solo se escribía en las pistas Opus**, así que en AAC el audio quedaba por detrás
+  del vídeo. `TrackInfo.Audio.codecDelayUs` es parte de la API pública y cualquiera puede
+  rellenarlo, pero la escritura vivía dentro del condicional de Opus: con AAC el valor se aceptaba
+  y **se descartaba en silencio**, el archivo salía sin el elemento y el reproductor no compensaba
+  el retardo de arranque del codificador — unos 21 ms con AAC-LC a 48 kHz, que es el caso normal.
+
+  Matroska define `CodecDelay` para cualquier códec con retardo de arranque, así que ahora se
+  escribe siempre que `codecDelayUs` sea mayor que cero. Lo que sí es propio de Opus, y sigue
+  dentro del condicional, es el `SeekPreRoll` de 80 ms.
+
+  En Opus no cambia nada: si hay `codecPrivate`, el `preSkip` de su `OpusHead` mantiene la
+  preferencia sobre el campo del modelo, porque es el dato que describe el bitstream de verdad.
+
+  El demuxer ya leía el elemento para cualquier códec, así que la asimetría estaba solo en la
+  escritura: se podía releer un `CodecDelay` ajeno que nosotros mismos no sabíamos emitir.
+
+### Documentación
+
+- El KDoc de `TrackInfo.Audio.codecDelayUs` empezaba por «Solo Opus», que es justo la creencia que
+  produjo el fallo. Ahora dice para qué sirve en cualquier códec y cuándo manda el `OpusHead`.
+
 ## [2.0.0] — 2026-08-10
 
 Tres correcciones de metadatos en el muxer Matroska, salidas de un análisis forense de un archivo
