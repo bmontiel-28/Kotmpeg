@@ -1,5 +1,7 @@
 package com.braymon.kotmpeg.model
 
+import kotlin.math.roundToLong
+
 /**
  * Descripción de una pista dentro de un contenedor.
  *
@@ -27,6 +29,33 @@ public sealed class TrackInfo {
     /** Duración por defecto de fotograma/paquete en microsegundos, 0 si es variable/desconocida. */
     public abstract val defaultDurationUs: Long
 
+    /**
+     * Duración nominal por muestra en **nanosegundos**, que es la unidad en la que Matroska
+     * define `DefaultDuration`.
+     *
+     * Existe aparte de [defaultDurationUs] porque el microsegundo no alcanza para las cadencias
+     * más comunes: 1/60 s son 16 666,67 µs, y cualquier redondeo a µs deja el valor a cientos de
+     * nanosegundos del real. Un reproductor que se fíe de ahí deriva unos 4 ms por minuto de
+     * línea de tiempo, y un archivo a 60 fps se anuncia como 60,0024.
+     *
+     * La implementación por defecto deriva de [defaultDurationUs]; quien conozca la cadencia
+     * exacta debería sobrescribirla, como hace [Video].
+     */
+    public open val defaultDurationNs: Long get() = defaultDurationUs * 1_000
+
+    /**
+     * Si el reproductor debe elegir esta pista cuando el usuario no ha elegido ninguna.
+     *
+     * **Con varias pistas del mismo tipo, exactamente una debería llevarlo a `true`.** Si todas
+     * lo llevan —que es lo que ocurre si no se toca— cada reproductor elige una distinta, así que
+     * una grabación con mezcla, micrófono y audio de sistema suena diferente según el programa
+     * con que se abra.
+     *
+     * Se escribe como `FlagDefault` en Matroska. **MP4 no tiene equivalente**, así que este dato
+     * no sobrevive a una conversión a MP4 y vuelta.
+     */
+    public abstract val default: Boolean
+
     public data class Video(
         override val id: Int = 0,
         val codec: VideoCodec,
@@ -47,6 +76,7 @@ public sealed class TrackInfo {
         override val codecPrivate: ByteArray? = null,
         override val language: String = "und",
         override val name: String? = null,
+        override val default: Boolean = true,
     ) : TrackInfo() {
         init {
             require(rotationDegrees in intArrayOf(0, 90, 180, 270)) {
@@ -59,8 +89,15 @@ public sealed class TrackInfo {
             require(frameRate >= 0 && frameRate.isFinite()) { "frameRate inválido: $frameRate" }
         }
 
+        /**
+         * Se calcula desde [frameRate] y **se redondea**, no se trunca: truncar 16 666,67 daba
+         * 16 666 µs para 60 fps, y de ahí salía el `DefaultDuration` que anunciaba 60,0024 fps.
+         */
+        override val defaultDurationNs: Long
+            get() = if (frameRate > 0) (1_000_000_000.0 / frameRate).roundToLong() else 0L
+
         override val defaultDurationUs: Long
-            get() = if (frameRate > 0) (1_000_000.0 / frameRate).toLong() else 0L
+            get() = if (frameRate > 0) (1_000_000.0 / frameRate).roundToLong() else 0L
 
         /**
          * A mano y no los generados por `data class`: esos comparan [codecPrivate] por
@@ -82,7 +119,8 @@ public sealed class TrackInfo {
                 color == other.color &&
                 codecPrivate.contentEquals(other.codecPrivate) &&
                 language == other.language &&
-                name == other.name
+                name == other.name &&
+                default == other.default
         }
 
         override fun hashCode(): Int {
@@ -98,6 +136,7 @@ public sealed class TrackInfo {
             result = 31 * result + (codecPrivate?.contentHashCode() ?: 0)
             result = 31 * result + language.hashCode()
             result = 31 * result + (name?.hashCode() ?: 0)
+            result = 31 * result + default.hashCode()
             return result
         }
     }
@@ -136,6 +175,7 @@ public sealed class TrackInfo {
         override val codecPrivate: ByteArray? = null,
         override val language: String = "und",
         override val name: String? = null,
+        override val default: Boolean = true,
     ) : TrackInfo() {
         init {
             require(sampleRate > 0) { "sampleRate inválido: $sampleRate" }
@@ -158,7 +198,8 @@ public sealed class TrackInfo {
                 codecDelayUs == other.codecDelayUs &&
                 codecPrivate.contentEquals(other.codecPrivate) &&
                 language == other.language &&
-                name == other.name
+                name == other.name &&
+                default == other.default
         }
 
         override fun hashCode(): Int {
@@ -171,6 +212,7 @@ public sealed class TrackInfo {
             result = 31 * result + (codecPrivate?.contentHashCode() ?: 0)
             result = 31 * result + language.hashCode()
             result = 31 * result + (name?.hashCode() ?: 0)
+            result = 31 * result + default.hashCode()
             return result
         }
     }

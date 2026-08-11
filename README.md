@@ -10,9 +10,10 @@
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10, sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
 
-**Versión: 1.1.0 — estable.** Desde la `1.0.0` la API pública queda congelada: lo que se
-publica aquí se mantiene, y romperlo exige una `2.0.0`. No depende de que nadie se acuerde —
-`PublicApiTest` compara la superficie pública contra un volcado versionado y falla si se mueve.
+**Versión: 2.0.0 — estable.** La API pública está congelada: lo que se publica aquí se mantiene, y
+romperlo exige subir la mayor. No depende de que nadie se acuerde — `PublicApiTest` compara la
+superficie pública contra un volcado versionado y falla si se mueve. Si vienes de la `1.x`, el
+[CHANGELOG](CHANGELOG.md) lista los tres cambios incompatibles: los tres se resuelven recompilando.
 
 La librería **no codifica ni decodifica**: empaqueta y desempaqueta streams que ya vienen
 comprimidos. Todo el alcance, con lo que queda fuera y por qué, está en
@@ -153,7 +154,7 @@ dependencyResolutionManagement {
 
 // build.gradle.kts — qué bajar
 dependencies {
-    implementation("com.github.bmontiel-28:Kotmpeg:1.1.0")
+    implementation("com.github.bmontiel-28:Kotmpeg:2.0.0")
 }
 ```
 
@@ -183,7 +184,7 @@ Y en el proyecto que la consume:
 // settings.gradle.kts
 dependencyResolutionManagement { repositories { mavenLocal(); mavenCentral() } }
 // build.gradle.kts
-dependencies { implementation("com.braymon:kotmpeg-core:1.1.0") }
+dependencies { implementation("com.braymon:kotmpeg-core:2.0.0") }
 ```
 
 Las dos opciones publican el jar y un jar de fuentes, así que el IDE deja navegar el código y leer

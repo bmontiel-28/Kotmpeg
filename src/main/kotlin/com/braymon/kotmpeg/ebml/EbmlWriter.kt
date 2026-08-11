@@ -50,6 +50,19 @@ public class EbmlWriter(public val out: SeekableOutput) {
         writeElement(id, encodeUInt(value))
     }
 
+    /**
+     * Entero **con signo**, en complemento a dos y con carga fija de 8 bytes.
+     *
+     * Los 8 bytes son deliberados: la forma mínima con signo depende del bit alto del primer
+     * byte —un 0x80 de un byte es −128, no 128— y elegirla mal produce un valor con el signo
+     * cambiado que ninguna herramienta señala como error. Con anchura fija no hay ambigüedad, y
+     * el único elemento que hoy la usa (`DateUTC`) declara 8 bytes de todas formas.
+     */
+    public fun writeSInt(id: Long, value: Long) {
+        val payload = ByteArray(8) { i -> (value shr (56 - 8 * i)).toByte() }
+        writeElement(id, payload)
+    }
+
     public fun writeFloat(id: Long, value: Double) {
         writeId(id)
         writeVintSize(8)

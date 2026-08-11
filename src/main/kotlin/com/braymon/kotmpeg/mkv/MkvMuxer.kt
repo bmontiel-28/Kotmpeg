@@ -33,6 +33,15 @@ public class MkvMuxer(
     /** Duración máxima de cluster antes de forzar uno nuevo, en ms. */
     private val maxClusterDurationMs: Long = 5_000,
     private val writingApp: String = "Kotmpeg",
+    /**
+     * Fecha de grabación que se escribe como `DateUTC`, en milisegundos desde la época de Unix.
+     * `null` no escribe el elemento.
+     *
+     * Es un parámetro y no una lectura del reloj dentro del muxer para que un test pueda fijarla:
+     * sin eso, dos ejecuciones sobre la misma entrada dan archivos distintos y cualquier
+     * comparación byte a byte se vuelve imposible de escribir.
+     */
+    private val dateUtcMillis: Long? = System.currentTimeMillis(),
 ) : Muxer {
 
     public constructor(file: File, maxClusterDurationMs: Long = 5_000) :
@@ -69,6 +78,12 @@ public class MkvMuxer(
         const val SEEK_HEAD_RESERVED = 120
         /** TimestampScale de Matroska: 1_000_000 ns = ticks de 1 ms. */
         const val TIMESTAMP_SCALE_NS = 1_000_000L
+
+        /**
+         * `DateUTC` cuenta desde 2001-01-01T00:00:00 UTC y no desde la época de Unix, así que
+         * cualquier fecha anterior a 2001 es negativa. De ahí que se escriba con signo.
+         */
+        const val MATROSKA_EPOCH_MILLIS = 978_307_200_000L
     }
 
     override fun addTrack(track: TrackInfo): Int {
@@ -120,6 +135,9 @@ public class MkvMuxer(
         ebml.writeUInt(MatroskaIds.TIMESTAMP_SCALE, TIMESTAMP_SCALE_NS)
         ebml.writeString(MatroskaIds.MUXING_APP, writingApp)
         ebml.writeString(MatroskaIds.WRITING_APP, writingApp)
+        dateUtcMillis?.let {
+            ebml.writeSInt(MatroskaIds.DATE_UTC, (it - MATROSKA_EPOCH_MILLIS) * 1_000_000L)
+        }
         ebml.writeId(MatroskaIds.DURATION)
         ebml.writeVintSize(8)
         durationValuePos = out.position
@@ -141,13 +159,14 @@ public class MkvMuxer(
         ebml.writeUInt(MatroskaIds.FLAG_LACING, 0)
         ebml.writeString(MatroskaIds.LANGUAGE, track.language)
         track.name?.let { ebml.writeString(MatroskaIds.NAME, it) }
+        if (!track.default) ebml.writeUInt(MatroskaIds.FLAG_DEFAULT, 0)
         when (track) {
             is TrackInfo.Video -> {
                 ebml.writeUInt(MatroskaIds.TRACK_TYPE, MatroskaIds.TRACK_TYPE_VIDEO)
                 ebml.writeString(MatroskaIds.CODEC_ID, track.codec.matroskaId)
                 track.codecPrivate?.let { ebml.writeElement(MatroskaIds.CODEC_PRIVATE, it) }
-                if (track.defaultDurationUs > 0) {
-                    ebml.writeUInt(MatroskaIds.DEFAULT_DURATION, track.defaultDurationUs * 1000)
+                if (track.defaultDurationNs > 0) {
+                    ebml.writeUInt(MatroskaIds.DEFAULT_DURATION, track.defaultDurationNs)
                 }
                 val vPos = ebml.beginMaster(MatroskaIds.VIDEO)
                 ebml.writeUInt(MatroskaIds.PIXEL_WIDTH, track.width.toLong())

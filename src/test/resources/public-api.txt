@@ -152,6 +152,7 @@ class com.braymon.kotmpeg.ebml.EbmlWriter
   fun writeElement(long, byte[]): void
   fun writeFloat(long, double): void
   fun writeId(long): void
+  fun writeSInt(long, long): void
   fun writeString(long, String): void
   fun writeUInt(long, long): void
   fun writeUnknownSize$default(EbmlWriter, int, int, Object): void
@@ -300,13 +301,14 @@ class com.braymon.kotmpeg.mkv.MkvDemuxer
   fun readPacket(): MediaPacket
   fun seekTo(long): long
 class com.braymon.kotmpeg.mkv.MkvMuxer
-  constructor(SeekableOutput, long, String)
+  constructor(SeekableOutput, long, String, Long)
   constructor(File, long)
   fun addTrack(TrackInfo): int
   fun close(): void
   fun start(): void
   fun stop(): void
   fun writePacket(MediaPacket): void
+  field MATROSKA_EPOCH_MILLIS: long
   field SEEK_HEAD_RESERVED: int
   field TIMESTAMP_SCALE_NS: long
 class com.braymon.kotmpeg.model.AudioCodec$Companion
@@ -410,8 +412,9 @@ class com.braymon.kotmpeg.model.MediaPacket
   fun isKeyFrame(): boolean
   fun toString(): String
 class com.braymon.kotmpeg.model.TrackInfo$Audio
-  constructor(int, AudioCodec, int, int, int, long, byte[], String, String)
+  constructor(int, AudioCodec, int, int, int, long, byte[], String, String, boolean)
   fun component1(): int
+  fun component10(): boolean
   fun component2(): AudioCodec
   fun component3(): int
   fun component4(): int
@@ -420,14 +423,15 @@ class com.braymon.kotmpeg.model.TrackInfo$Audio
   fun component7(): byte[]
   fun component8(): String
   fun component9(): String
-  fun copy$default(TrackInfo$Audio, int, AudioCodec, int, int, int, long, byte[], String, String, int, Object): TrackInfo$Audio
-  fun copy(int, AudioCodec, int, int, int, long, byte[], String, String): TrackInfo$Audio
+  fun copy$default(TrackInfo$Audio, int, AudioCodec, int, int, int, long, byte[], String, String, boolean, int, Object): TrackInfo$Audio
+  fun copy(int, AudioCodec, int, int, int, long, byte[], String, String, boolean): TrackInfo$Audio
   fun equals(Object): boolean
   fun getBitDepth(): int
   fun getChannelCount(): int
   fun getCodec(): AudioCodec
   fun getCodecDelayUs(): long
   fun getCodecPrivate(): byte[]
+  fun getDefault(): boolean
   fun getDefaultDurationUs(): long
   fun getId(): int
   fun getLanguage(): String
@@ -436,11 +440,12 @@ class com.braymon.kotmpeg.model.TrackInfo$Audio
   fun hashCode(): int
   fun toString(): String
 class com.braymon.kotmpeg.model.TrackInfo$Video
-  constructor(int, VideoCodec, int, int, int, int, double, int, ColorInfo, byte[], String, String)
+  constructor(int, VideoCodec, int, int, int, int, double, int, ColorInfo, byte[], String, String, boolean)
   fun component1(): int
   fun component10(): byte[]
   fun component11(): String
   fun component12(): String
+  fun component13(): boolean
   fun component2(): VideoCodec
   fun component3(): int
   fun component4(): int
@@ -449,12 +454,14 @@ class com.braymon.kotmpeg.model.TrackInfo$Video
   fun component7(): double
   fun component8(): int
   fun component9(): ColorInfo
-  fun copy$default(TrackInfo$Video, int, VideoCodec, int, int, int, int, double, int, ColorInfo, byte[], String, String, int, Object): TrackInfo$Video
-  fun copy(int, VideoCodec, int, int, int, int, double, int, ColorInfo, byte[], String, String): TrackInfo$Video
+  fun copy$default(TrackInfo$Video, int, VideoCodec, int, int, int, int, double, int, ColorInfo, byte[], String, String, boolean, int, Object): TrackInfo$Video
+  fun copy(int, VideoCodec, int, int, int, int, double, int, ColorInfo, byte[], String, String, boolean): TrackInfo$Video
   fun equals(Object): boolean
   fun getCodec(): VideoCodec
   fun getCodecPrivate(): byte[]
   fun getColor(): ColorInfo
+  fun getDefault(): boolean
+  fun getDefaultDurationNs(): long
   fun getDefaultDurationUs(): long
   fun getDisplayHeight(): int
   fun getDisplayWidth(): int
@@ -469,6 +476,8 @@ class com.braymon.kotmpeg.model.TrackInfo$Video
   fun toString(): String
 class com.braymon.kotmpeg.model.TrackInfo
   fun getCodecPrivate(): byte[]
+  fun getDefault(): boolean
+  fun getDefaultDurationNs(): long
   fun getDefaultDurationUs(): long
   fun getId(): int
   fun getLanguage(): String

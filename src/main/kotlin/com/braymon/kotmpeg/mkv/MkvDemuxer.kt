@@ -248,6 +248,8 @@ public class MkvDemuxer(
         var bitDepth = 0
         var rotationDegrees = 0
         var color: ColorInfo? = null
+        /** El valor por omisión de `FlagDefault` en la especificación es 1: ausente = predeterminada. */
+        var default = true
 
         while (input.position < entry.dataEnd) {
             val el = reader.readElement()
@@ -260,6 +262,7 @@ public class MkvDemuxer(
                 MatroskaIds.CODEC_PRIVATE -> codecPrivate = reader.readBinary(el)
                 MatroskaIds.LANGUAGE -> language = reader.readString(el)
                 MatroskaIds.NAME -> name = reader.readString(el)
+                MatroskaIds.FLAG_DEFAULT -> default = reader.readUInt(el) != 0L
                 MatroskaIds.DEFAULT_DURATION -> defaultDurNs = reader.readUInt(el)
                 MatroskaIds.CODEC_DELAY -> codecDelayNs = reader.readUInt(el)
                 MatroskaIds.VIDEO -> while (input.position < requireSized(el).dataEnd) {
@@ -312,7 +315,7 @@ public class MkvDemuxer(
         val track: TrackInfo? = runCatching { buildTrack(
             type, number, codecId, codecPrivate, language, name, defaultDurNs, codecDelayNs,
             width, height, displayWidth, displayHeight, sampleRate, channels, bitDepth,
-            rotationDegrees, color,
+            rotationDegrees, color, default,
         ) }.getOrNull()
         if (track != null) {
             trackMap[number] = track
@@ -354,6 +357,7 @@ public class MkvDemuxer(
         bitDepth: Int,
         rotationDegrees: Int,
         color: ColorInfo?,
+        default: Boolean,
     ): TrackInfo? {
         return when (type) {
             MatroskaIds.TRACK_TYPE_VIDEO -> VideoCodec.fromMatroskaId(codecId)?.let { codec ->
@@ -365,6 +369,7 @@ public class MkvDemuxer(
                     rotationDegrees = rotationDegrees,
                     color = color,
                     codecPrivate = codecPrivate, language = language, name = name,
+                    default = default,
                 )
             }
             MatroskaIds.TRACK_TYPE_AUDIO -> AudioCodec.fromMatroskaId(codecId)?.let { codec ->
@@ -376,6 +381,7 @@ public class MkvDemuxer(
                     sampleRate = sampleRate.toInt(), channelCount = channels, bitDepth = bitDepth,
                     codecDelayUs = codecDelayNs / 1000,
                     codecPrivate = codecPrivate, language = language, name = name,
+                    default = default,
                 )
             }
             else -> null
