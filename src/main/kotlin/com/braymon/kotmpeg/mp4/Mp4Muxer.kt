@@ -48,12 +48,37 @@ public class Mp4Muxer private constructor(
     public constructor(file: File, fastStart: Boolean = false) :
         this(SeekableOutput(file), file, fastStart)
 
+    /**
+     * Fecha de creación que se escribe en `mvhd`, `tkhd` y `mdhd`, en milisegundos desde la época
+     * de Unix. `null` deja los campos a cero, que es lo que hacían siempre.
+     *
+     * **Hay que asignarla antes de [start]**, que es cuando se congelan las cabeceras. Es una
+     * propiedad y no un parámetro del constructor para que añadirla no cambiara la firma de los
+     * constructores públicos, que habría obligado a recompilar a todo el mundo por un metadato.
+     */
+    public var creationTimeMillis: Long? = System.currentTimeMillis()
+
     private companion object {
         const val MOVIE_TIMESCALE = 1000L
         const val VIDEO_TIMESCALE = 90000L
         /** Mayor offset que puede expresar una entrada stco (32 bits sin signo). */
         const val UINT32_MAX = 0xFFFFFFFFL
+
+        /**
+         * El origen de tiempos de MP4 es 1904-01-01 UTC y no 1970, así que hay que sumar estos
+         * segundos a una marca de Unix. Con `version = 0` el campo es de 32 bits sin signo, que
+         * alcanza hasta 2040.
+         */
+        const val MP4_EPOCH_OFFSET_S = 2_082_844_800L
+
+        /** Flags de `tkhd`: `track_enabled` (0x1) y `track_in_movie` (0x2). */
+        const val TKHD_ENABLED_IN_MOVIE = 3
+        const val TKHD_IN_MOVIE_ONLY = 2
     }
+
+    /** La fecha en la escala de MP4, o 0 si no hay ninguna que escribir. */
+    private fun mp4Time(): Long =
+        creationTimeMillis?.let { (Math.floorDiv(it, 1000L) + MP4_EPOCH_OFFSET_S).coerceAtLeast(0L) } ?: 0L
 
     private class Sample(
         val offset: Long,
@@ -325,13 +350,14 @@ public class Mp4Muxer private constructor(
 
         val moov = BoxBuilder()
         moov.box("moov") {
+            val created = mp4Time()
             fullBox("mvhd", mvhdVersion, 0) {
                 if (mvhdVersion == 1) {
-                    u64(0); u64(0)                   // tiempos de creación/modificación
+                    u64(created); u64(created)       // tiempos de creación/modificación
                     u32(MOVIE_TIMESCALE)
                     u64(movieDurationMs)
                 } else {
-                    u32(0); u32(0)
+                    u32(created); u32(created)
                     u32(MOVIE_TIMESCALE)
                     u32(movieDurationMs)
                 }
@@ -359,15 +385,17 @@ public class Mp4Muxer private constructor(
         val info = t.info
         val trackDurationMs = toMovieTicks(tab.startOffsetUs + tab.presentationDurationUs)
         val tkhdVersion = versionFor(trackDurationMs)
+        val created = mp4Time()
+        val tkhdFlags = if (info.default) TKHD_ENABLED_IN_MOVIE else TKHD_IN_MOVIE_ONLY
         parent.box("trak") {
-            fullBox("tkhd", tkhdVersion, 3) {        // habilitada | en la película
+            fullBox("tkhd", tkhdVersion, tkhdFlags) {
                 if (tkhdVersion == 1) {
-                    u64(0); u64(0)                   // tiempos de creación/modificación
+                    u64(created); u64(created)       // tiempos de creación/modificación
                     u32(info.id)
                     u32(0)                           // reservado
                     u64(trackDurationMs)
                 } else {
-                    u32(0); u32(0)                   // tiempos de creación/modificación
+                    u32(created); u32(created)       // tiempos de creación/modificación
                     u32(info.id)
                     u32(0)                           // reservado
                     u32(trackDurationMs)
@@ -391,11 +419,11 @@ public class Mp4Muxer private constructor(
                 val mdhdVersion = versionFor(tab.mediaDuration)
                 fullBox("mdhd", mdhdVersion, 0) {
                     if (mdhdVersion == 1) {
-                        u64(0); u64(0)
+                        u64(created); u64(created)   // tiempos de creación/modificación
                         u32(t.timescale)
                         u64(tab.mediaDuration)
                     } else {
-                        u32(0); u32(0)
+                        u32(created); u32(created)   // tiempos de creación/modificación
                         u32(t.timescale)
                         u32(tab.mediaDuration)
                     }
@@ -423,20 +451,55 @@ public class Mp4Muxer private constructor(
                     writeStbl(this, t, tab, offsetDelta)
                 }
             }
+            writeTrackName(this, info)
         }
     }
 
+    /**
+     * Nombre legible de la pista, en `udta` > `name` dentro del `trak`.
+     *
+     * No vale el texto del `hdlr`: ese es el nombre del *manejador* —sale «Kotmpeg» en todas las
+     * pistas— y ningún reproductor lo usa para distinguirlas. Con varias pistas del mismo tipo,
+     * esto es lo único que permite saber cuál es cuál.
+     */
+    private fun writeTrackName(parent: BoxBuilder, info: TrackInfo) {
+        val name = info.name ?: return
+        parent.box("udta") {
+            box("name") {
+                bytes(name.toByteArray(Charsets.UTF_8))
+            }
+        }
+    }
+
+    /**
+     * Lista de edición de la pista, que resuelve **dos cosas distintas** que es fácil confundir.
+     *
+     *  - La **entrada vacía** (`media_time = -1`) coloca el desfase de arranque de la pista
+     *    respecto al inicio de la película: la pista simplemente empieza más tarde.
+     *  - La **entrada real** dice desde qué punto del medio se presenta. Ahí es donde se compensa
+     *    el **cebado del codificador**: un códec con solapamiento de ventanas no emite su primer
+     *    paquete hasta haber consumido más muestras de las que ese paquete representa, así que sin
+     *    saltarlas el audio se reproduce adelantado respecto al vídeo — unos 21 ms con AAC-LC a
+     *    48 kHz. Es lo que un reproductor lee como `initial_padding`.
+     *
+     * Estaba resuelta solo la primera, y la segunda arrancaba en la primera muestra sin saltar
+     * nada. El cebado se suma a `media_time` en ticks **del medio** (no de la película) y se resta
+     * de la duración del segmento, para que la edición no se salga del final del medio.
+     */
     private fun writeEdts(parent: BoxBuilder, t: TrackState, tab: TrackTables) {
+        val primingTicks = primingTicks(t)
+        val primingUs = if (primingTicks > 0) (t.info as TrackInfo.Audio).codecDelayUs else 0L
         val needsShift = tab.earliestPts > 0
         val needsDelay = tab.startOffsetUs > 0
-        if (!needsShift && !needsDelay) return
+        if (!needsShift && !needsDelay && primingTicks <= 0) return
 
+        val mediaTime = tab.earliestPts + primingTicks
         val delayTicks = toMovieTicks(tab.startOffsetUs)
-        val durationTicks = toMovieTicks(tab.presentationDurationUs)
+        val durationTicks = toMovieTicks((tab.presentationDurationUs - primingUs).coerceAtLeast(0L))
         val version = if (
             versionFor(durationTicks) == 1 ||
             (needsDelay && versionFor(delayTicks) == 1) ||
-            tab.earliestPts > Int.MAX_VALUE
+            mediaTime > Int.MAX_VALUE
         ) 1 else 0
 
         parent.box("edts") {
@@ -451,13 +514,23 @@ public class Mp4Muxer private constructor(
                     u16(1); u16(0)
                 }
                 if (version == 1) {
-                    u64(durationTicks); u64(tab.earliestPts)
+                    u64(durationTicks); u64(mediaTime)
                 } else {
-                    u32(durationTicks); u32(tab.earliestPts)
+                    u32(durationTicks); u32(mediaTime)
                 }
                 u16(1); u16(0)                       // media_rate 1.0
             }
         }
+    }
+
+    /**
+     * Cebado de la pista en ticks de su propia escala, redondeando: a 48 kHz los 21 333 µs de un
+     * AAC-LC son 1023,98 muestras, y truncar dejaría el `initial_padding` una muestra corto.
+     */
+    private fun primingTicks(t: TrackState): Long {
+        val info = t.info
+        if (info !is TrackInfo.Audio || info.codecDelayUs <= 0) return 0L
+        return Math.floorDiv(info.codecDelayUs * t.timescale + 500_000, 1_000_000)
     }
 
     private fun writeStbl(parent: BoxBuilder, t: TrackState, tab: TrackTables, offsetDelta: Long) {

@@ -54,6 +54,68 @@ primero se refiere a tu código, lo segundo a lo ya compilado.
 
 ---
 
+## [2.1.0] — 2026-08-11
+
+Cinco metadatos que `TrackInfo` ya exponía, que `MkvMuxer` escribía y que los dos muxers MP4
+descartaban. Los archivos que producían eran válidos —decodifican enteros, DTS monótonos, marcas
+correctas—, así que ningún control de integridad los delataba: lo que faltaba era información
+*sobre* el contenido.
+
+Los dos muxers construyen sus cajas de pista por separado, así que los cuatro primeros cambios van
+en ambos.
+
+### Corregido
+
+- **El nombre de pista no llegaba al archivo.** `TrackInfo.name` se aceptaba y se descartaba sin
+  aviso. Con varias pistas del mismo tipo es lo único que permite distinguirlas al reproducir. Se
+  escribe ahora en `udta` > `name` dentro del `trak`; el texto del `hdlr` no servía porque es el
+  nombre del manejador y salía igual en todas.
+- **El cebado del codificador se ignoraba**, así que el audio se reproducía adelantado respecto al
+  vídeo — unos 21 ms con AAC-LC a 48 kHz. `codecDelayUs` pasa a compensarse en la lista de edición.
+  Es fácil confundirlo con lo que el `elst` ya hacía: aquello colocaba el **desfase de arranque de
+  la pista** con una edición vacía, y son dos cosas distintas. El cebado va en el `media_time` de
+  la entrada real, en ticks del medio, y se descuenta de la duración del segmento para que la
+  edición no se salga del final. El fMP4 no tenía ninguna lista de edición y ahora la escribe para
+  las pistas que declaren retardo.
+- **No se podía expresar qué pista es la predeterminada.** El `tkhd` salía con flags fijos a 3, así
+  que las tres pistas de audio de una grabación se anunciaban todas como reproducibles y cada
+  reproductor elegía una. MP4 no tiene un `FlagDefault` como Matroska, pero su equivalente
+  reconocido es el bit `track_enabled` (0x1): ahora `TrackInfo.default` decide entre 3 y 2, con lo
+  que se conserva `track_in_movie` en los dos casos.
+- **Los archivos no llevaban fecha.** `creation_time` y `modification_time` salían a cero en
+  `mvhd`, `tkhd` y `mdhd`, así que la fecha solo sobrevivía en el nombre del archivo. Es el
+  equivalente del `DateUTC` que Matroska ya escribía. El origen de tiempos de MP4 es 1904-01-01,
+  no 1970, y el ancho del campo sigue a la versión de la caja.
+- **El fMP4 no declaraba su duración.** La de `mvhd` es cero —correcto mientras se graba, porque
+  aún no se conoce— pero al cerrar tampoco se emitía `mehd`, así que el archivo nunca decía cuánto
+  duraba y un reproductor tenía que recorrerse todos los fragmentos para averiguarlo.
+
+> **Nota para quien mida esto con ffprobe.** Dos de los cinco no se ven donde parecería:
+> `stream_tags=title` no muestra el nombre de pista de un MP4 e `initial_padding` sale 0 en las
+> pistas de audio. **No es que no estén**: un MP4 producido por el propio ffmpeg, con
+> `-metadata:s:a:0 title=...` y AAC, se comporta exactamente igual —escribe el nombre en
+> `trak/udta/name`, la misma caja que escribimos aquí, y ffprobe tampoco lo enseña; y su
+> `initial_padding` también es 0, porque ese campo se alimenta del `CodecDelay` de Matroska y no
+> de la lista de edición de MP4—. Para comprobarlos hay que mirar las cajas: `trak/udta/name` y el
+> `media_time` del `elst`, que a 48 kHz debe valer 1024.
+
+### Añadido
+
+- **`Mp4Muxer.creationTimeMillis` y `FragmentedMp4Muxer.creationTimeMillis`**, la fecha que se
+  escribe en las cabeceras. `null` deja los campos a cero. Hay que asignarla **antes de `start()`**.
+
+  Es una propiedad y no un parámetro del constructor a propósito: así el cambio es puramente
+  aditivo y esta versión es una menor. Como parámetro habría cambiado la firma de dos constructores
+  públicos y habría obligado a recompilar a todo el mundo por un metadato.
+
+### Cambiado
+
+- El fMP4 deja de ser **estrictamente** solo-añadir: al cerrar vuelve atrás a rellenar los 8 bytes
+  del `mehd`. Es el único punto en el que lo hace, y el archivo es válido con o sin ese parche — si
+  el proceso muere antes, el `mehd` se queda a cero, que es exactamente la información que había
+  cuando no existía. La garantía que importa, que lo grabado hasta el último fragmento completo se
+  reproduce, no cambia.
+
 ## [2.0.1] — 2026-08-11
 
 ### Corregido

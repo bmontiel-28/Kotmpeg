@@ -517,12 +517,17 @@ class com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
   constructor(File, long)
   fun addTrack(TrackInfo): int
   fun close(): void
+  fun getCreationTimeMillis(): Long
+  fun setCreationTimeMillis(Long): void
   fun start(): void
   fun stop(): void
   fun writePacket(MediaPacket): void
   field MOVIE_TIMESCALE: long
+  field MP4_EPOCH_OFFSET_S: long
   field NON_SYNC_SAMPLE_FLAGS: long
   field SYNC_SAMPLE_FLAGS: long
+  field TKHD_ENABLED_IN_MOVIE: int
+  field TKHD_IN_MOVIE_ONLY: int
   field VIDEO_TIMESCALE: long
 class com.braymon.kotmpeg.mp4.Mp4Demuxer
   constructor(SeekableInput, Function1<? super String, Unit>)
@@ -537,10 +542,15 @@ class com.braymon.kotmpeg.mp4.Mp4Muxer
   constructor(File, boolean)
   fun addTrack(TrackInfo): int
   fun close(): void
+  fun getCreationTimeMillis(): Long
+  fun setCreationTimeMillis(Long): void
   fun start(): void
   fun stop(): void
   fun writePacket(MediaPacket): void
   field MOVIE_TIMESCALE: long
+  field MP4_EPOCH_OFFSET_S: long
+  field TKHD_ENABLED_IN_MOVIE: int
+  field TKHD_IN_MOVIE_ONLY: int
   field UINT32_MAX: long
   field VIDEO_TIMESCALE: long
 class com.braymon.kotmpeg.mp4.SampleEntries

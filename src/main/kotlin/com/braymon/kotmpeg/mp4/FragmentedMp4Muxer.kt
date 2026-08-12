@@ -42,11 +42,41 @@ public class FragmentedMp4Muxer(
     public constructor(file: File, fragmentDurationUs: Long = 2_000_000) :
         this(SeekableOutput(file), fragmentDurationUs)
 
+    /**
+     * Fecha de creación que se escribe en `mvhd`, `tkhd` y `mdhd`, en milisegundos desde la época
+     * de Unix. `null` deja los campos a cero.
+     *
+     * **Hay que asignarla antes de [start]**, que es cuando se escribe el `moov`. Es una propiedad
+     * y no un parámetro del constructor para no cambiar la firma de uno público por un metadato.
+     */
+    public var creationTimeMillis: Long? = System.currentTimeMillis()
+
     private companion object {
         const val MOVIE_TIMESCALE = 1000L
         const val VIDEO_TIMESCALE = 90000L
         const val SYNC_SAMPLE_FLAGS = 0x02000000L      // depends_on = 2 (I-frame)
         const val NON_SYNC_SAMPLE_FLAGS = 0x01010000L  // depends_on = 1, no-sync
+
+        /** El origen de tiempos de MP4 es 1904-01-01 UTC y no 1970. */
+        const val MP4_EPOCH_OFFSET_S = 2_082_844_800L
+
+        /** Flags de `tkhd`: `track_enabled` (0x1) y `track_in_movie` (0x2). */
+        const val TKHD_ENABLED_IN_MOVIE = 3
+        const val TKHD_IN_MOVIE_ONLY = 2
+    }
+
+    /** La fecha en la escala de MP4, o 0 si no hay ninguna que escribir. */
+    private fun mp4Time(): Long =
+        creationTimeMillis?.let { (Math.floorDiv(it, 1000L) + MP4_EPOCH_OFFSET_S).coerceAtLeast(0L) } ?: 0L
+
+    /**
+     * Cebado de la pista en ticks de su propia escala, redondeando: a 48 kHz los 21 333 µs de un
+     * AAC-LC son 1023,98 muestras.
+     */
+    private fun primingTicks(t: TrackState): Long {
+        val info = t.info
+        if (info !is TrackInfo.Audio || info.codecDelayUs <= 0) return 0L
+        return Math.floorDiv(info.codecDelayUs * t.timescale + 500_000, 1_000_000)
     }
 
     private class PendingSample(
@@ -96,6 +126,7 @@ public class FragmentedMp4Muxer(
     private var fragmentStartUs = 0L
     private var fragmentHasSamples = false
     private var fragmentBytes = 0L
+    private var mehdDurationPos: Long? = null
 
     override fun addTrack(track: TrackInfo): Int {
         check(!started) { "no se pueden añadir pistas después de start()" }
@@ -121,7 +152,9 @@ public class FragmentedMp4Muxer(
             fourcc("iso5"); fourcc("iso6"); fourcc("mp41")
         }
         writeEmptyMoov(header)
-        out.write(header.toByteArray())
+        val bytes = header.toByteArray()
+        mehdDurationPos = findMehdDurationPos(bytes, out.position)
+        out.write(bytes)
         out.flush()
     }
 
@@ -160,6 +193,7 @@ public class FragmentedMp4Muxer(
         try {
             if (fragmentHasSamples) flushFragment()
             writeMfra()
+            patchMehd()
         } finally {
             out.close()
         }
@@ -317,10 +351,20 @@ public class FragmentedMp4Muxer(
         return builder.toByteArray()
     }
 
+    /**
+     * `moov` de cabecera, con las duraciones a cero porque en vivo todavía no se conocen.
+     *
+     * El `mehd` es la excepción: se emite con un hueco de 8 bytes que [stop] rellena con la
+     * duración total. Es el **único** sitio en el que este muxer vuelve atrás a escribir, y se
+     * puede permitir porque el archivo es válido con o sin ese parche — si el proceso muere antes,
+     * el `mehd` se queda a cero, que es exactamente la información que había antes de existir.
+     * Sin él, un reproductor tiene que recorrerse todos los fragmentos para saber cuánto dura.
+     */
     private fun writeEmptyMoov(builder: BoxBuilder) {
+        val created = mp4Time()
         builder.box("moov") {
             fullBox("mvhd", 0, 0) {
-                u32(0); u32(0)
+                u32(created); u32(created)           // tiempos de creación/modificación
                 u32(MOVIE_TIMESCALE)
                 u32(0)
                 u32(0x00010000); u16(0x0100)
@@ -331,6 +375,9 @@ public class FragmentedMp4Muxer(
             }
             for (track in tracks) writeEmptyTrak(this, track)
             box("mvex") {
+                fullBox("mehd", 1, 0) {
+                    u64(0)                           // fragment_duration, parcheado en stop()
+                }
                 for (track in tracks) {
                     fullBox("trex", 0, 0) {
                         u32(track.info.id)
@@ -342,6 +389,48 @@ public class FragmentedMp4Muxer(
         }
     }
 
+    /**
+     * Rellena el `mehd` con la duración total, ya conocida al cerrar.
+     *
+     * Se toma el máximo de lo volcado por cada pista, que es el final real de la película, y se
+     * pasa a la escala del `mvhd`. Si por lo que sea no se localizó el hueco, no se escribe nada:
+     * un `mehd` a cero es lo mismo que no tenerlo, y desde luego mejor que parchear a ciegas.
+     */
+    private fun patchMehd() {
+        val pos = mehdDurationPos ?: return
+        val totalUs = tracks.maxOfOrNull { it.decodeCumUs } ?: 0L
+        val ticks = Math.floorDiv(totalUs * MOVIE_TIMESCALE + 500_000, 1_000_000)
+        val bytes = ByteArray(8) { i -> (ticks shr (56 - 8 * i)).toByte() }
+        out.patch(pos, bytes)
+    }
+
+    /**
+     * Posición absoluta del `fragment_duration` del `mehd` dentro de [header], recorriendo las
+     * cajas en vez de buscar la firma por el array: `mehd` son cuatro bytes que podrían aparecer
+     * dentro de un `codecPrivate` cualquiera, y una coincidencia haría que [stop] parcheara datos
+     * de vídeo.
+     */
+    private fun findMehdDurationPos(header: ByteArray, base: Long): Long? {
+        fun buscar(desde: Int, hasta: Int, ruta: List<String>): Int? {
+            var p = desde
+            while (p + 8 <= hasta) {
+                val size = ((header[p].toInt() and 0xFF) shl 24) or
+                    ((header[p + 1].toInt() and 0xFF) shl 16) or
+                    ((header[p + 2].toInt() and 0xFF) shl 8) or
+                    (header[p + 3].toInt() and 0xFF)
+                if (size < 8 || p + size > hasta) return null
+                val tipo = String(header, p + 4, 4, Charsets.US_ASCII)
+                if (tipo == ruta.first()) {
+                    return if (ruta.size == 1) p else buscar(p + 8, p + size, ruta.drop(1))
+                }
+                p += size
+            }
+            return null
+        }
+        val pos = buscar(0, header.size, listOf("moov", "mvex", "mehd")) ?: return null
+        return base + pos + 12
+    }
+
     private fun BoxBuilder.identityMatrix() {
         u32(0x00010000); u32(0); u32(0)
         u32(0); u32(0x00010000); u32(0)
@@ -350,9 +439,11 @@ public class FragmentedMp4Muxer(
 
     private fun writeEmptyTrak(parent: BoxBuilder, t: TrackState) {
         val info = t.info
+        val created = mp4Time()
+        val tkhdFlags = if (info.default) TKHD_ENABLED_IN_MOVIE else TKHD_IN_MOVIE_ONLY
         parent.box("trak") {
-            fullBox("tkhd", 0, 3) {
-                u32(0); u32(0)
+            fullBox("tkhd", 0, tkhdFlags) {
+                u32(created); u32(created)           // tiempos de creación/modificación
                 u32(info.id)
                 u32(0)
                 u32(0)                               // duración desconocida
@@ -369,9 +460,10 @@ public class FragmentedMp4Muxer(
                     u32(0); u32(0)
                 }
             }
+            writeEdts(this, t)
             box("mdia") {
                 fullBox("mdhd", 0, 0) {
-                    u32(0); u32(0)
+                    u32(created); u32(created)       // tiempos de creación/modificación
                     u32(t.timescale)
                     u32(0)                           // duración desconocida (en vivo)
                     u16(0x55C4); u16(0)
@@ -408,6 +500,43 @@ public class FragmentedMp4Muxer(
                         fullBox("stco", 0, 0) { u32(0) }
                     }
                 }
+            }
+            writeTrackName(this, info)
+        }
+    }
+
+    /**
+     * Lista de edición que compensa el **cebado del codificador**: un códec con solapamiento de
+     * ventanas no emite su primer paquete hasta haber consumido más muestras de las que ese
+     * paquete representa, y sin saltarlas el audio se reproduce adelantado respecto al vídeo —
+     * unos 21 ms con AAC-LC a 48 kHz.
+     *
+     * `segment_duration` va a cero porque en vivo la duración no se conoce al escribir el `moov`;
+     * es la misma convención que el `mvhd` de este muxer, y quien quiera la duración total la tiene
+     * en el `mehd` que [stop] rellena.
+     */
+    private fun writeEdts(parent: BoxBuilder, t: TrackState) {
+        val priming = primingTicks(t)
+        if (priming <= 0) return
+        parent.box("edts") {
+            fullBox("elst", 0, 0) {
+                u32(1)                               // entry_count
+                u32(0)                               // segment_duration: desconocida en vivo
+                u32(priming)                         // media_time: el cebado que hay que saltar
+                u16(1); u16(0)                       // media_rate 1.0
+            }
+        }
+    }
+
+    /**
+     * Nombre legible de la pista, en `udta` > `name`. El texto del `hdlr` no vale: es el nombre
+     * del manejador, sale igual en todas las pistas y ningún reproductor lo usa para distinguirlas.
+     */
+    private fun writeTrackName(parent: BoxBuilder, info: TrackInfo) {
+        val name = info.name ?: return
+        parent.box("udta") {
+            box("name") {
+                bytes(name.toByteArray(Charsets.UTF_8))
             }
         }
     }
