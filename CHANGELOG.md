@@ -54,6 +54,43 @@ primero se refiere a tu código, lo segundo a lo ya compilado.
 
 ---
 
+## [2.1.1] — 2026-08-13
+
+La 2.1.0 hizo que el fMP4 declarase su duración en `mehd`, que es el campo que le corresponde a un
+archivo fragmentado. Resulta que declararla ahí no basta.
+
+### Corregido
+
+- **El fMP4 seguía durando cero para media plataforma.** El `mehd` es correcto, pero hay
+  consumidores muy extendidos que **solo miran `tkhd.duration`** y ni leen el `mehd` ni recorren los
+  fragmentos: para ellos el archivo dura cero, no muestran duración y una barra de reproducción
+  construida sobre ese valor sale vacía. El extractor MP4 de Android es uno de ellos, y es el que
+  alimenta el índice de medios del sistema.
+
+  Al cerrar, el total ya se conoce, así que se rellenan también `tkhd.duration` en cada pista y
+  `mvhd.duration`, los dos en la escala del `mvhd` — `tkhd.duration` no va en la escala del medio
+  (ISO/IEC 14496-12 §8.3.2.3), y confundirlas no rompe nada visible: escribe una cifra plausible
+  48 veces más larga. Las versiones de caja no cambian (`mvhd` v0, `tkhd` v0, `mehd` v1).
+
+  No es una licencia sobre el formato: libavformat escribe las duraciones reales en el `tkhd` de una
+  salida fragmentada siempre que cierra el `moov` conociendo el total. Un archivo ya cerrado en
+  disco sabe cuánto dura, y lo dice.
+- **La lista de edición contradecía al `tkhd`.** El `segment_duration` del `elst` salía a cero, que
+  era la respuesta honesta mientras se grababa. Con el `tkhd` ya relleno pasaba a ser una
+  contradicción: la duración de una pista es la suma de sus ediciones (§8.6.6), así que un lector
+  que hiciera esa suma volvía a ver una pista de duración cero por el otro camino. Se rellena en el
+  mismo paso, descontándole el cebado igual que hace el muxer plano.
+
+### Cambiado
+
+- La escritura hacia atrás del fMP4 al cerrar pasa de 8 bytes a unos pocos campos más de la
+  cabecera. La garantía no se mueve: se reservan a cero, se rellenan al cerrar y, si el proceso
+  muere antes, se quedan como estaban —que es la información que había cuando no existían— y lo
+  grabado hasta el último fragmento completo se reproduce igual.
+
+Los muxers MP4 no fragmentados no estaban afectados: ya declaraban las tres cosas. Los tests nuevos
+comparan las dos salidas campo por campo, que es la comprobación que faltaba.
+
 ## [2.1.0] — 2026-08-11
 
 Cinco metadatos que `TrackInfo` ya exponía, que `MkvMuxer` escribía y que los dos muxers MP4

@@ -30,8 +30,9 @@ import kotlin.test.assertTrue
  *  - **Cuál es la pista predeterminada** no se podía expresar: el `tkhd` salía con flags fijos a 3,
  *    así que las tres pistas de audio se anunciaban como reproducibles y cada reproductor elegía.
  *  - **La fecha** salía a cero en las tres cabeceras que la llevan.
- *  - **El fMP4 no declaraba su duración**: ni en `mvhd` (correcto en vivo) ni en `mehd` al cerrar,
- *    así que un reproductor tenía que recorrerse todos los fragmentos para saber cuánto duraba.
+ *  - **El fMP4 no declaraba su duración** en ninguno de los campos que la llevan, así que un
+ *    reproductor tenía que recorrerse todos los fragmentos para saber cuánto duraba — y el que no
+ *    los recorre veía un archivo de duración cero.
  *
  * Se comprueba **sobre las cajas del archivo**, recorriendo su estructura: el fallo estaba en lo
  * que se escribía, y releerlo con nuestro propio demuxer daría por bueno cualquier par de errores
@@ -254,5 +255,67 @@ class Mp4MetadataTest {
         val mehd = cajas(file, "moov/mvex/mehd").single()
         assertEquals(1L, mehd.u32(0) ushr 24, "version 1: hueco fijo de 8 bytes, siempre parcheable")
         assertEquals(400L, mehd.u64(4), "cuatro paquetes de 100 ms en la escala de 1000 del mvhd")
+    }
+
+    /**
+     * El `mehd` por sí solo no basta: hay consumidores muy extendidos —el extractor MP4 de Android
+     * entre ellos— que solo miran `tkhd.duration`, y con ese campo a cero el archivo dura cero.
+     */
+    @Test
+    fun `the fragmented MP4 declares its duration where a simple player looks for it`() {
+        val file = fmp4(video(), audio())
+        assertEquals(400L, cajas(file, "moov/mvhd").single().u32(16), "mvhd")
+        assertEquals(listOf(400L, 400L), cajas(file, "moov/trak/tkhd").map { it.u32(20) }, "tkhd")
+    }
+
+    /**
+     * `tkhd.duration` va en la escala del `mvhd` y no en la del medio (ISO/IEC 14496-12 §8.3.2.3).
+     * Confundirlas no rompe nada visible: escribe una cifra plausible que sale 48 veces larga.
+     */
+    @Test
+    fun `the track duration goes in the movie timescale and not the media one`() {
+        val file = fmp4(audio())
+        assertEquals(1000L, cajas(file, "moov/mvhd").single().u32(12), "escala del mvhd")
+        assertEquals(48000L, cajas(file, "moov/trak/mdia/mdhd").single().u32(12), "escala del medio")
+        assertEquals(
+            400L, cajas(file, "moov/trak/tkhd").single().u32(20),
+            "0,4 s son 400 ticks del mvhd; en la escala del medio serían 19200",
+        )
+    }
+
+    /**
+     * La duración de una pista es la suma de sus ediciones (ISO/IEC 14496-12 §8.6.6), así que un
+     * `segment_duration` a cero devuelve a cero la duración de la pista por otro camino, diga lo
+     * que diga el `tkhd`. Los 400 ms menos el cebado son los 379 que declara el muxer plano.
+     */
+    @Test
+    fun `the edit list of the fragmented MP4 stops contradicting the track duration`() {
+        val file = fmp4(audio(delayUs = PRIMING_US))
+        val elst = cajas(file, "moov/trak/edts/elst").single()
+        assertEquals(379L, elst.u32(8), "segment_duration")
+        assertEquals(PRIMING_MUESTRAS, elst.u32(12), "el media_time no se toca")
+    }
+
+    /** Los dos muxers describen el mismo material, así que tienen que declarar lo mismo. */
+    @Test
+    fun `both MP4 muxers agree on the declared duration`() {
+        val pistas = arrayOf(video(), audio(delayUs = PRIMING_US))
+        val plano = mp4(*pistas)
+        val fragmentado = fmp4(*pistas)
+        assertEquals(
+            cajas(plano, "moov/mvhd").single().u32(16),
+            cajas(fragmentado, "moov/mvhd").single().u32(16),
+            "mvhd",
+        )
+        assertEquals(
+            cajas(plano, "moov/trak/tkhd").map { it.u32(20) },
+            cajas(fragmentado, "moov/trak/tkhd").map { it.u32(20) },
+            "tkhd",
+        )
+        assertEquals(
+            cajas(plano, "moov/trak/edts/elst").map { it.u32(8) },
+            cajas(fragmentado, "moov/trak/edts/elst").map { it.u32(8) },
+            "elst",
+        )
     }
 }

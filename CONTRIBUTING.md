@@ -114,7 +114,7 @@ no se puede arreglar sin publicar de nuevo.
 | `CHANGELOG.md` | La entrada nueva, con su fecha |
 | `README.md` | La cabecera «Versión: …» y las dos coordenadas de ejemplo |
 
-`SECURITY.md` lleva la serie soportada (`1.x`), no una versión exacta, así que solo se toca al
+`SECURITY.md` lleva la serie soportada (`2.x`), no una versión exacta, así que solo se toca al
 subir la mayor.
 
 Y al publicar, el **tag de git tiene que llamarse exactamente igual que la versión**: JitPack usa el

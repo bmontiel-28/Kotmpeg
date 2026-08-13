@@ -4,7 +4,7 @@
 
 | Versión | Soporte |
 |---|---|
-| `1.x` | ✅ |
+| `2.x` | ✅ |
 
 Se da soporte a la última versión publicada de la serie mayor en curso.
 

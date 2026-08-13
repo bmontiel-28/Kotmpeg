@@ -10,7 +10,7 @@
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10, sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
 
-**Versión: 2.1.0 — estable.** La API pública está congelada: lo que se publica aquí se mantiene, y
+**Versión: 2.1.1 — estable.** La API pública está congelada: lo que se publica aquí se mantiene, y
 romperlo exige subir la mayor. No depende de que nadie se acuerde — `PublicApiTest` compara la
 superficie pública contra un volcado versionado y falla si se mueve. Si vienes de la `1.x`, el
 [CHANGELOG](CHANGELOG.md) lista los tres cambios incompatibles: los tres se resuelven recompilando.
@@ -154,7 +154,7 @@ dependencyResolutionManagement {
 
 // build.gradle.kts — qué bajar
 dependencies {
-    implementation("com.github.bmontiel-28:Kotmpeg:2.1.0")
+    implementation("com.github.bmontiel-28:Kotmpeg:2.1.1")
 }
 ```
 
@@ -184,7 +184,7 @@ Y en el proyecto que la consume:
 // settings.gradle.kts
 dependencyResolutionManagement { repositories { mavenLocal(); mavenCentral() } }
 // build.gradle.kts
-dependencies { implementation("com.braymon:kotmpeg-core:2.1.0") }
+dependencies { implementation("com.braymon:kotmpeg-core:2.1.1") }
 ```
 
 Las dos opciones publican el jar y un jar de fuentes, así que el IDE deja navegar el código y leer
@@ -309,8 +309,9 @@ nunca un cuelgue ni un consumo de memoria sin control. Hay tres suites dedicadas
 o por duración configurable si solo hay audio— y cierra con un índice `mfra`. Los datos se escriben
 **solo hacia delante**: durante toda la grabación no se retrocede ni una vez, que es lo que hace
 que sirva igual para grabación a prueba de cortes y para empujar fragmentos a un empaquetador
-HLS/DASH. La única escritura hacia atrás son los 8 bytes del `mehd` al cerrar, con la duración
-total; si el proceso muere antes, ese campo se queda a cero —igual que si no existiera— y lo
+HLS/DASH. Lo único que se reescribe hacia atrás son los campos de duración de la cabecera —`mvhd`,
+`tkhd`, `mehd` y la lista de edición—, que se reservan a cero y se rellenan al cerrar, cuando el
+total ya se conoce; si el proceso muere antes, se quedan a cero —igual que si no existieran— y lo
 grabado hasta el último fragmento completo se reproduce sin más. Los B-frames van por
 `trun` v1 con offsets de composición firmados y `tfdt` acumulado sin deriva. El demuxer lee fMP4
 tanto propio como de FFmpeg: `tfhd`/`tfdt`/`trun` con defaults de `trex`, `default-base-is-moof` y

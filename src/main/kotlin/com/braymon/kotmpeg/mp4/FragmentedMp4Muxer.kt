@@ -69,14 +69,23 @@ public class FragmentedMp4Muxer(
     private fun mp4Time(): Long =
         creationTimeMillis?.let { (Math.floorDiv(it, 1000L) + MP4_EPOCH_OFFSET_S).coerceAtLeast(0L) } ?: 0L
 
+    /** Microsegundos a ticks de la escala del `mvhd`, redondeando. */
+    private fun toMovieTicks(us: Long): Long = Math.floorDiv(us * MOVIE_TIMESCALE + 500_000, 1_000_000)
+
+    /** Cebado declarado por la pista, en µs; 0 si no es audio o no lo declara. */
+    private fun primingUs(t: TrackState): Long {
+        val info = t.info
+        return if (info is TrackInfo.Audio && info.codecDelayUs > 0) info.codecDelayUs else 0L
+    }
+
     /**
      * Cebado de la pista en ticks de su propia escala, redondeando: a 48 kHz los 21 333 µs de un
      * AAC-LC son 1023,98 muestras.
      */
     private fun primingTicks(t: TrackState): Long {
-        val info = t.info
-        if (info !is TrackInfo.Audio || info.codecDelayUs <= 0) return 0L
-        return Math.floorDiv(info.codecDelayUs * t.timescale + 500_000, 1_000_000)
+        val us = primingUs(t)
+        if (us <= 0) return 0L
+        return Math.floorDiv(us * t.timescale + 500_000, 1_000_000)
     }
 
     private class PendingSample(
@@ -126,7 +135,18 @@ public class FragmentedMp4Muxer(
     private var fragmentStartUs = 0L
     private var fragmentHasSamples = false
     private var fragmentBytes = 0L
+
+    /**
+     * Posiciones absolutas de los tres campos de duración reservados en la cabecera, que solo se
+     * pueden rellenar al cerrar. `null` (o la lista vacía) significa que no se localizaron y que se
+     * quedarán a cero, que es lo que había antes de existir este parche.
+     */
     private var mehdDurationPos: Long? = null
+    private var mvhdDurationPos: Long? = null
+    private var tkhdDurationPos: List<Long> = emptyList()
+
+    /** Paralela a [tracks]: `null` en las pistas que no llevan lista de edición. */
+    private var elstDurationPos: List<Long?> = emptyList()
 
     override fun addTrack(track: TrackInfo): Int {
         check(!started) { "no se pueden añadir pistas después de start()" }
@@ -153,7 +173,7 @@ public class FragmentedMp4Muxer(
         }
         writeEmptyMoov(header)
         val bytes = header.toByteArray()
-        mehdDurationPos = findMehdDurationPos(bytes, out.position)
+        locateDurationFields(bytes, out.position)
         out.write(bytes)
         out.flush()
     }
@@ -193,7 +213,7 @@ public class FragmentedMp4Muxer(
         try {
             if (fragmentHasSamples) flushFragment()
             writeMfra()
-            patchMehd()
+            patchDurations()
         } finally {
             out.close()
         }
@@ -354,11 +374,11 @@ public class FragmentedMp4Muxer(
     /**
      * `moov` de cabecera, con las duraciones a cero porque en vivo todavía no se conocen.
      *
-     * El `mehd` es la excepción: se emite con un hueco de 8 bytes que [stop] rellena con la
-     * duración total. Es el **único** sitio en el que este muxer vuelve atrás a escribir, y se
-     * puede permitir porque el archivo es válido con o sin ese parche — si el proceso muere antes,
-     * el `mehd` se queda a cero, que es exactamente la información que había antes de existir.
-     * Sin él, un reproductor tiene que recorrerse todos los fragmentos para saber cuánto dura.
+     * Los campos de duración de `mvhd`, `tkhd` y `mehd` son la excepción: se emiten a cero pero
+     * [stop] los rellena con el total, ya conocido al cerrar. Es el **único** sitio en el que este
+     * muxer vuelve atrás a escribir, y se puede permitir porque el archivo es válido con o sin ese
+     * parche — si el proceso muere antes, se quedan a cero, que es exactamente la información que
+     * había antes de existir esto.
      */
     private fun writeEmptyMoov(builder: BoxBuilder) {
         val created = mp4Time()
@@ -390,45 +410,103 @@ public class FragmentedMp4Muxer(
     }
 
     /**
-     * Rellena el `mehd` con la duración total, ya conocida al cerrar.
+     * Rellena con la duración total los tres campos que se reservaron en la cabecera.
      *
-     * Se toma el máximo de lo volcado por cada pista, que es el final real de la película, y se
-     * pasa a la escala del `mvhd`. Si por lo que sea no se localizó el hueco, no se escribe nada:
-     * un `mehd` a cero es lo mismo que no tenerlo, y desde luego mejor que parchear a ciegas.
+     * `mehd` es el que corresponde a un archivo fragmentado, y basta para quien lea la
+     * especificación entera. Pero hay consumidores muy extendidos —el extractor MP4 de Android
+     * entre ellos, que es el que alimenta el índice de medios del sistema— que solo miran
+     * `tkhd.duration` y ni leen el `mehd` ni recorren los fragmentos: para ellos un archivo con ese
+     * campo a cero **dura cero**, no muestran duración y la barra de reproducción sale vacía. El
+     * `mvhd` va por coherencia, que es donde otros la buscan.
+     *
+     * Cada `tkhd` lleva la duración de su pista y el `mvhd` el máximo, igual que en [Mp4Muxer]. Van
+     * en la escala del `mvhd`, también los de las pistas: `tkhd.duration` no usa la escala del
+     * medio (ISO/IEC 14496-12 §8.3.2.3). El `segment_duration` de la lista de edición va detrás por
+     * el mismo motivo, descontándole el cebado igual que hace el muxer plano.
+     *
+     * Si algún hueco no se localizó, ese campo se queda a cero en lugar de parchearse a ciegas.
      */
-    private fun patchMehd() {
-        val pos = mehdDurationPos ?: return
-        val totalUs = tracks.maxOfOrNull { it.decodeCumUs } ?: 0L
-        val ticks = Math.floorDiv(totalUs * MOVIE_TIMESCALE + 500_000, 1_000_000)
-        val bytes = ByteArray(8) { i -> (ticks shr (56 - 8 * i)).toByte() }
-        out.patch(pos, bytes)
+    private fun patchDurations() {
+        val trackTicks = tracks.map { toMovieTicks(it.decodeCumUs) }
+        val movieTicks = trackTicks.maxOrNull() ?: 0L
+
+        mehdDurationPos?.let { out.patch(it, bigEndian(movieTicks, 8)) }
+        mvhdDurationPos?.let { out.patch(it, bigEndian(clampToU32(movieTicks), 4)) }
+        for ((i, pos) in tkhdDurationPos.withIndex()) {
+            out.patch(pos, bigEndian(clampToU32(trackTicks[i]), 4))
+        }
+        for ((i, pos) in elstDurationPos.withIndex()) {
+            if (pos == null) continue
+            val presentation = toMovieTicks((tracks[i].decodeCumUs - primingUs(tracks[i])).coerceAtLeast(0L))
+            out.patch(pos, bigEndian(clampToU32(presentation), 4))
+        }
     }
 
     /**
-     * Posición absoluta del `fragment_duration` del `mehd` dentro de [header], recorriendo las
-     * cajas en vez de buscar la firma por el array: `mehd` son cuatro bytes que podrían aparecer
-     * dentro de un `codecPrivate` cualquiera, y una coincidencia haría que [stop] parcheara datos
-     * de vídeo.
+     * `mvhd` y `tkhd` se emitieron en versión 0, con un hueco de 32 bits, y a estas alturas ya
+     * están en disco: no se les puede cambiar la versión al cerrar. El tope son 49,7 días de
+     * grabación continua; pasado eso vale más un campo saturado que uno truncado por arriba, que
+     * daría una duración absurdamente corta.
      */
-    private fun findMehdDurationPos(header: ByteArray, base: Long): Long? {
-        fun buscar(desde: Int, hasta: Int, ruta: List<String>): Int? {
-            var p = desde
-            while (p + 8 <= hasta) {
+    private fun clampToU32(ticks: Long): Long = ticks.coerceIn(0L, 0xFFFFFFFFL)
+
+    private fun bigEndian(value: Long, count: Int): ByteArray =
+        ByteArray(count) { i -> (value shr (8 * (count - 1 - i))).toByte() }
+
+    /**
+     * Localiza dentro de [header] los campos de duración que [patchDurations] rellenará al cerrar,
+     * en posiciones absolutas del archivo ([base] es dónde empieza la cabecera).
+     *
+     * Los `tkhd` salen en el mismo orden en que se escribieron los `trak`, que es el de [tracks];
+     * si por lo que sea no cuadra el número, se descartan todos en vez de emparejar duraciones con
+     * la pista equivocada.
+     */
+    private fun locateDurationFields(header: ByteArray, base: Long) {
+        mehdDurationPos = boxPositions(header, listOf("moov", "mvex", "mehd"))
+            .singleOrNull()?.let { base + it + 12 }
+        mvhdDurationPos = boxPositions(header, listOf("moov", "mvhd"))
+            .singleOrNull()?.let { base + it + 24 }
+        val tkhds = boxPositions(header, listOf("moov", "trak", "tkhd"))
+        tkhdDurationPos = if (tkhds.size == tracks.size) tkhds.map { base + it + 28 } else emptyList()
+
+        val elsts = boxPositions(header, listOf("moov", "trak", "edts", "elst"))
+        val hasEdit = tracks.map { primingTicks(it) > 0 }
+        elstDurationPos = if (elsts.size == hasEdit.count { it }) {
+            var next = 0
+            hasEdit.map { if (it) base + elsts[next++] + 16 else null }
+        } else {
+            List(tracks.size) { null }
+        }
+    }
+
+    /**
+     * Desplazamientos dentro de [header] de todas las cajas que encajan en [path], recorriendo el
+     * árbol en vez de buscar la firma de cuatro letras por el array: `mehd` o `tkhd` son cuatro
+     * bytes que pueden aparecer dentro de un `codecPrivate` cualquiera, y una coincidencia haría
+     * que [stop] parcheara datos de vídeo.
+     *
+     * No contempla la forma `largesize` porque no hace falta: aquí solo entra el `ftyp` + `moov`
+     * que construye [BoxBuilder], que rechaza cualquier caja de más de 4 GiB.
+     */
+    private fun boxPositions(header: ByteArray, path: List<String>): List<Int> {
+        val found = ArrayList<Int>()
+
+        fun walk(from: Int, to: Int, level: Int) {
+            var p = from
+            while (p + 8 <= to) {
                 val size = ((header[p].toInt() and 0xFF) shl 24) or
                     ((header[p + 1].toInt() and 0xFF) shl 16) or
                     ((header[p + 2].toInt() and 0xFF) shl 8) or
                     (header[p + 3].toInt() and 0xFF)
-                if (size < 8 || p + size > hasta) return null
-                val tipo = String(header, p + 4, 4, Charsets.US_ASCII)
-                if (tipo == ruta.first()) {
-                    return if (ruta.size == 1) p else buscar(p + 8, p + size, ruta.drop(1))
+                if (size < 8 || p + size > to) return
+                if (String(header, p + 4, 4, Charsets.US_ASCII) == path[level]) {
+                    if (level == path.lastIndex) found += p else walk(p + 8, p + size, level + 1)
                 }
                 p += size
             }
-            return null
         }
-        val pos = buscar(0, header.size, listOf("moov", "mvex", "mehd")) ?: return null
-        return base + pos + 12
+        walk(0, header.size, 0)
+        return found
     }
 
     private fun BoxBuilder.identityMatrix() {
@@ -511,9 +589,11 @@ public class FragmentedMp4Muxer(
      * paquete representa, y sin saltarlas el audio se reproduce adelantado respecto al vídeo —
      * unos 21 ms con AAC-LC a 48 kHz.
      *
-     * `segment_duration` va a cero porque en vivo la duración no se conoce al escribir el `moov`;
-     * es la misma convención que el `mvhd` de este muxer, y quien quiera la duración total la tiene
-     * en el `mehd` que [stop] rellena.
+     * `segment_duration` sale a cero porque en vivo la duración no se conoce al escribir el `moov`,
+     * y lo rellena [patchDurations] al cerrar. Dejarlo a cero contradiría al `tkhd`: la duración de
+     * una pista es la suma de sus ediciones (ISO/IEC 14496-12 §8.6.6), así que un lector que
+     * hiciera esa suma volvería a ver una pista de duración cero por mucho que el `tkhd` diga otra
+     * cosa.
      */
     private fun writeEdts(parent: BoxBuilder, t: TrackState) {
         val priming = primingTicks(t)
