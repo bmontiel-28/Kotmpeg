@@ -6,6 +6,10 @@ interface com.braymon.kotmpeg.Demuxer
 class com.braymon.kotmpeg.MkvKotlin
   fun concat$default(MkvKotlin, List, File, ContainerFormat, boolean, boolean, Function1, Function1, int, Object): long
   fun concat(List<? extends File>, File, ContainerFormat, boolean, boolean, Function1<? super Long, Unit>, Function1<? super String, Unit>): long
+  fun createFragmentedMp4Muxer$default(MkvKotlin, SeekableOutput, long, long, long, int, Object): Muxer
+  fun createFragmentedMp4Muxer$default(MkvKotlin, File, long, long, long, int, Object): Muxer
+  fun createFragmentedMp4Muxer(SeekableOutput, long, long, long): Muxer
+  fun createFragmentedMp4Muxer(File, long, long, long): Muxer
   fun createMuxer$default(MkvKotlin, SeekableOutput, ContainerFormat, boolean, long, int, Object): Muxer
   fun createMuxer$default(MkvKotlin, File, ContainerFormat, boolean, boolean, long, int, Object): Muxer
   fun createMuxer(SeekableOutput, ContainerFormat, boolean, long): Muxer
@@ -18,12 +22,18 @@ class com.braymon.kotmpeg.MkvKotlin
   fun remux$default(MkvKotlin, File, File, ContainerFormat, boolean, boolean, Function1, Function1, Function1, int, Object): long
   fun remux(File, File, ContainerFormat, boolean, boolean, Function1<? super Integer, Boolean>, Function1<? super Long, Unit>, Function1<? super String, Unit>): long
   fun requireDistinct(List<? extends File>, File): void
+  fun synchronizedMuxer(Muxer): Muxer
   field INSTANCE: MkvKotlin
 interface com.braymon.kotmpeg.Muxer
   fun addTrack(TrackInfo): int
   fun start(): void
   fun stop(): void
   fun writePacket(MediaPacket): void
+class com.braymon.kotmpeg.TimelineGate
+  constructor(int, long, long)
+  fun getEarliestPtsUs(): Long
+  fun hold(MediaPacket, int): boolean
+  fun release(): List<MediaPacket>
 class com.braymon.kotmpeg.audio.PcmMixer
   fun convertChannels(short[], int, int): short[]
   fun mix$default(PcmMixer, List, List, int, Object): short[]
@@ -61,6 +71,9 @@ class com.braymon.kotmpeg.codecconfig.BitReader
   constructor(byte[])
   fun bits(int): int
   fun ue(): int
+class com.braymon.kotmpeg.codecconfig.DefaultCodecPrivate
+  fun forAudio(TrackInfo$Audio): byte[]
+  field INSTANCE: DefaultCodecPrivate
 class com.braymon.kotmpeg.codecconfig.HevcSpsInfo$Companion
   fun parse(byte[]): HevcSpsInfo
 class com.braymon.kotmpeg.codecconfig.HevcSpsInfo
@@ -179,6 +192,15 @@ class com.braymon.kotmpeg.ebml.MatroskaIds
   field COLOUR: long
   field COLOUR_PRIMARIES: long
   field COLOUR_RANGE: long
+  field CONTENT_COMPRESSION: long
+  field CONTENT_COMP_ALGO: long
+  field CONTENT_COMP_SETTINGS: long
+  field CONTENT_ENCODING: long
+  field CONTENT_ENCODINGS: long
+  field CONTENT_ENCODING_ORDER: long
+  field CONTENT_ENCODING_SCOPE: long
+  field CONTENT_ENCODING_TYPE: long
+  field CONTENT_ENCRYPTION: long
   field CRC32: long
   field CUES: long
   field CUE_CLUSTER_POSITION: long
@@ -286,6 +308,7 @@ class com.braymon.kotmpeg.io.SeekableOutput
   fun flush(): void
   fun getPosition(): long
   fun patch(long, byte[]): void
+  fun sync(): void
   fun write$default(SeekableOutput, byte[], int, int, int, Object): void
   fun writeBits(long, int): void
   fun writeByte(int): void
@@ -310,6 +333,8 @@ class com.braymon.kotmpeg.mkv.MkvMuxer
   fun writePacket(MediaPacket): void
   field MATROSKA_EPOCH_MILLIS: long
   field SEEK_HEAD_RESERVED: int
+  field START_HELD_BYTES: long
+  field START_WAIT_US: long
   field TIMESTAMP_SCALE_NS: long
 class com.braymon.kotmpeg.model.AudioCodec$Companion
   fun fromMatroskaId(String): AudioCodec
@@ -411,6 +436,10 @@ class com.braymon.kotmpeg.model.MediaPacket
   fun getTrackId(): int
   fun isKeyFrame(): boolean
   fun toString(): String
+class com.braymon.kotmpeg.model.Timestamps
+  fun rescaleFloor(long, long, long): long
+  fun rescaleRounded(long, long, long): long
+  field INSTANCE: Timestamps
 class com.braymon.kotmpeg.model.TrackInfo$Audio
   constructor(int, AudioCodec, int, int, int, long, byte[], String, String, boolean)
   fun component1(): int
@@ -515,6 +544,7 @@ class com.braymon.kotmpeg.mp4.BoxBuilder
 class com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
   constructor(SeekableOutput, long, long, long)
   constructor(File, long)
+  constructor(File, long, long, long)
   fun addTrack(TrackInfo): int
   fun close(): void
   fun getCreationTimeMillis(): Long
@@ -559,6 +589,20 @@ class com.braymon.kotmpeg.mp4.SampleEntries
   fun writeVisual(BoxBuilder, TrackInfo$Video): void
   field INSTANCE: SampleEntries
   field MAX_SAMPLE_ENTRY_RATE: long
+class com.braymon.kotmpeg.mp4.SampleTable
+  constructor()
+  fun add(long, int, long, long, boolean, long): void
+  fun dtsIsMonotonic(): boolean
+  fun dtsUs(int): long
+  fun durationUs(int): long
+  fun firstIndexWithDtsAbove(long): int
+  fun firstIndexWithDtsAtLeast(long): int
+  fun getSize(): int
+  fun isEmpty(): boolean
+  fun isKey(int): boolean
+  fun offset(int): long
+  fun ptsUs(int): long
+  fun size(int): int
 class com.braymon.kotmpeg.pipeline.Remuxer
   fun concat$default(Remuxer, List, Muxer, Function1, int, Object): long
   fun concat(List<? extends Demuxer>, Muxer, Function1<? super Long, Unit>): long

@@ -30,13 +30,11 @@ import java.nio.channels.FileChannel
  *
  * **No es seguro entre hilos**: igual que los muxers que lo usan, asume un único hilo
  * escritor. Con varias pistas produciendo a la vez, serializar las escrituras es
- * responsabilidad de quien integra.
+ * responsabilidad de quien integra (o de `MkvKotlin.synchronizedMuxer`).
  */
 public class SeekableOutput(private val channel: FileChannel) : Closeable {
 
-    public constructor(file: File) : this(
-        RandomAccessFile(file, "rw").channel.also { it.truncate(0) },
-    )
+    public constructor(file: File) : this(openTruncated(file))
 
     public constructor(file: RandomAccessFile) : this(file.channel)
 
@@ -50,9 +48,10 @@ public class SeekableOutput(private val channel: FileChannel) : Closeable {
      */
     public constructor(fd: FileDescriptor) : this(FileOutputStream(fd).channel)
 
-    private val buffer = ByteArray(1 shl 16)
+    private val buffer = ByteArray(BUFFER_SIZE)
     private var bufferUsed = 0
     private var flushedPosition = 0L
+    private var closed = false
 
     /** Posición lógica de escritura actual. */
     public val position: Long get() = flushedPosition + bufferUsed
@@ -76,7 +75,9 @@ public class SeekableOutput(private val channel: FileChannel) : Closeable {
 
     /** Escribe los [count] bytes menos significativos de [value], big-endian. */
     public fun writeBits(value: Long, count: Int) {
-        for (i in count - 1 downTo 0) writeByte(((value ushr (8 * i)) and 0xFF).toInt())
+        require(count in 0..8) { "solo se pueden escribir de 0 a 8 bytes como entero: $count" }
+        if (bufferUsed + count > buffer.size) flush()
+        for (i in count - 1 downTo 0) buffer[bufferUsed++] = (value ushr (8 * i)).toByte()
     }
 
     public fun writeInt32(value: Int): Unit = writeBits(value.toLong() and 0xFFFFFFFFL, 4)
@@ -84,7 +85,7 @@ public class SeekableOutput(private val channel: FileChannel) : Closeable {
 
     /** Reescribe [data] en la posición absoluta [at] sin mover la posición de escritura. */
     public fun patch(at: Long, data: ByteArray) {
-        require(at + data.size <= position) { "patch fuera de la zona escrita" }
+        require(at >= 0 && at + data.size <= position) { "patch fuera de la zona escrita" }
         flush()
         writeAt(at, data, 0, data.size)
     }
@@ -95,6 +96,19 @@ public class SeekableOutput(private val channel: FileChannel) : Closeable {
             flushedPosition += bufferUsed
             bufferUsed = 0
         }
+    }
+
+    /**
+     * Vacía el buffer y obliga al sistema a llevar los datos al almacenamiento físico.
+     *
+     * Sin esto, lo escrito puede vivir solo en la caché del kernel: sobrevive a que muera el
+     * proceso, pero no a un corte de batería. Es caro (en un móvil, decenas o cientos de
+     * milisegundos), así que los muxers no lo llaman por su cuenta; quien necesite durabilidad
+     * lo invoca en los puntos que elija.
+     */
+    public fun sync() {
+        flush()
+        channel.force(false)
     }
 
     /**
@@ -118,8 +132,37 @@ public class SeekableOutput(private val channel: FileChannel) : Closeable {
         }
     }
 
+    /**
+     * El canal se cierra **aunque falle el vaciado del buffer**: sin el `finally`, un disco
+     * lleno en el último `flush` dejaba el descriptor abierto para siempre, y en Android eso
+     * acaba agotando el límite de descriptores del proceso. Llamarlo dos veces no hace nada.
+     */
     override fun close() {
-        flush()
-        channel.close()
+        if (closed) return
+        closed = true
+        try {
+            flush()
+        } finally {
+            channel.close()
+        }
+    }
+
+    private companion object {
+        private const val BUFFER_SIZE = 1 shl 16
+
+        /**
+         * Abre y trunca; si el truncado falla, cierra lo abierto antes de propagar el error para
+         * no dejar el descriptor huérfano.
+         */
+        private fun openTruncated(file: File): FileChannel {
+            val channel = RandomAccessFile(file, "rw").channel
+            try {
+                channel.truncate(0)
+            } catch (t: Throwable) {
+                runCatching { channel.close() }
+                throw t
+            }
+            return channel
+        }
     }
 }

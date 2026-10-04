@@ -4,11 +4,11 @@ import com.braymon.kotmpeg.Muxer
 import com.braymon.kotmpeg.io.SeekableOutput
 import com.braymon.kotmpeg.model.AudioCodec
 import com.braymon.kotmpeg.model.MediaPacket
+import com.braymon.kotmpeg.model.Timestamps
 import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.model.VideoCodec
 import java.io.EOFException
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.file.AtomicMoveNotSupportedException
@@ -80,17 +80,8 @@ public class Mp4Muxer private constructor(
     private fun mp4Time(): Long =
         creationTimeMillis?.let { (Math.floorDiv(it, 1000L) + MP4_EPOCH_OFFSET_S).coerceAtLeast(0L) } ?: 0L
 
-    private class Sample(
-        val offset: Long,
-        val size: Int,
-        val ptsUs: Long,
-        val dtsUs: Long,
-        val key: Boolean,
-        val durationUs: Long,
-    )
-
     private class TrackState(val info: TrackInfo) {
-        val samples = ArrayList<Sample>()
+        val samples = SampleTable()
         val timescale: Long = when (info) {
             is TrackInfo.Video -> VIDEO_TIMESCALE
             is TrackInfo.Audio -> info.sampleRate.toLong()
@@ -141,6 +132,12 @@ public class Mp4Muxer private constructor(
         out.writeInt64(0)
     }
 
+    /**
+     * Toda muestra de audio se registra como muestra de sincronización, la marque o no quien
+     * llama. En AAC y Opus cada paquete se decodifica por sí solo, y `MediaPacket.isKeyFrame`
+     * vale `false` por defecto: con el audio marcado tal cual llegaba, la pista salía con un
+     * `stss` sin una sola entrada, y los reproductores la tomaban por imposible de buscar.
+     */
     override fun writePacket(packet: MediaPacket) {
         check(started) { "start() no llamado" }
         check(!stopped) { "muxer ya detenido" }
@@ -148,9 +145,8 @@ public class Mp4Muxer private constructor(
             ?: throw IllegalArgumentException("pista desconocida ${packet.trackId}")
         val offset = out.position
         out.write(packet.data)
-        track.samples.add(
-            Sample(offset, packet.data.size, packet.ptsUs, packet.dtsUs, packet.isKeyFrame, packet.durationUs),
-        )
+        val key = packet.isKeyFrame || track.info is TrackInfo.Audio
+        track.samples.add(offset, packet.data.size, packet.ptsUs, packet.dtsUs, key, packet.durationUs)
     }
 
     /**
@@ -164,8 +160,9 @@ public class Mp4Muxer private constructor(
      * dentro y ningún índice, que es irreproducible.
      *
      * Ese mismo `moov` de cola se reutiliza para conocer su tamaño en vez de construirlo otra
-     * vez: cada construcción recorre todas las muestras de todas las pistas y serializa varios
-     * MB, y en una grabación larga se nota en lo que tarda este método.
+     * vez, y las tablas de tiempos se calculan una sola vez para las dos construcciones: cada
+     * una recorre todas las muestras de todas las pistas, y en una grabación larga se nota en lo
+     * que tarda este método.
      */
     override fun stop() {
         if (stopped) return
@@ -182,10 +179,16 @@ public class Mp4Muxer private constructor(
             for (i in 0 until 8) sizeBytes[i] = ((mdatSize ushr (8 * (7 - i))) and 0xFF).toByte()
             out.patch(mdatStart + 8, sizeBytes)
 
-            val maxOffset = tracks.maxOfOrNull { t -> t.samples.maxOfOrNull { it.offset } ?: 0L } ?: 0L
+            val maxOffset = tracks.maxOfOrNull { t ->
+                var max = 0L
+                for (i in 0 until t.samples.size) max = maxOf(max, t.samples.offset(i))
+                max
+            } ?: 0L
             useCo64 = maxOffset > UINT32_MAX
 
-            val tailMoov = buildMoov(0)
+            val globalStartUs = globalStartUs()
+            val tables = tracks.map { computeTables(it, globalStartUs) }
+            val tailMoov = buildMoov(tables, 0)
             out.write(tailMoov)
             out.close()
             closed = true
@@ -194,10 +197,10 @@ public class Mp4Muxer private constructor(
                 var moovSize = tailMoov.size.toLong()
                 if (!useCo64 && maxOffset + moovSize > UINT32_MAX) {
                     useCo64 = true
-                    moovSize = buildMoov(0).size.toLong()
+                    moovSize = buildMoov(tables, 0).size.toLong()
                 }
                 try {
-                    rewriteFastStart(file, buildMoov(moovSize), mdatSize)
+                    rewriteFastStart(file, buildMoov(tables, moovSize), mdatSize)
                 } catch (t: Throwable) {
                     throw IOException(
                         "no se pudo recolocar el moov al principio de ${file.name} " +
@@ -234,26 +237,32 @@ public class Mp4Muxer private constructor(
      * El borrado del temporal en el `finally` es incondicional **y seguro**: si el movimiento
      * salió bien, el temporal ya no existe con ese nombre; si lanzó, el destino no se ha tocado
      * y lo que se borra es una copia desechable. Nunca es la única copia.
+     *
+     * La copia va de canal a canal con `transferTo`, que el sistema puede resolver sin pasar los
+     * datos por el heap, y el temporal se fuerza al disco **antes** de sustituir el original. Sin
+     * ese `force`, un corte de batería justo después del movimiento podía dejar en el sitio del
+     * archivo bueno uno con el nombre correcto y el contenido aún sin escribir.
      */
     private fun rewriteFastStart(target: File, moov: ByteArray, mdatSize: Long) {
         val temp = File(target.parentFile, target.name + ".faststart.tmp")
         try {
             RandomAccessFile(target, "r").use { source ->
-                FileOutputStream(temp).use { sink ->
-                    val buffer = ByteArray(1 shl 16)
-                    fun copy(from: Long, count: Long) {
-                        source.seek(from)
-                        var left = count
-                        while (left > 0) {
-                            val n = source.read(buffer, 0, minOf(left, buffer.size.toLong()).toInt())
+                RandomAccessFile(temp, "rw").use { sink ->
+                    sink.setLength(0)
+                    val from = source.channel
+                    val to = sink.channel
+                    fun copy(start: Long, count: Long) {
+                        var done = 0L
+                        while (done < count) {
+                            val n = from.transferTo(start + done, count - done, to)
                             if (n <= 0) throw EOFException("mp4 truncado durante la reescritura faststart")
-                            sink.write(buffer, 0, n)
-                            left -= n
+                            done += n
                         }
                     }
                     copy(0, mdatStart)          // ftyp (todo lo anterior al mdat)
                     sink.write(moov)
                     copy(mdatStart, mdatSize)   // mdat
+                    to.force(true)
                 }
             }
             try {
@@ -282,10 +291,18 @@ public class Mp4Muxer private constructor(
         val presentationDurationUs: Long,
     )
 
+    /** Inicio de presentación de la película: el menor PTS entre todas las pistas. */
+    private fun globalStartUs(): Long {
+        var start = Long.MAX_VALUE
+        for (t in tracks) for (i in 0 until t.samples.size) start = minOf(start, t.samples.ptsUs(i))
+        return if (start == Long.MAX_VALUE) 0L else start
+    }
+
     private fun computeTables(t: TrackState, globalStartUs: Long): TrackTables {
-        val n = t.samples.size
-        val pts = LongArray(n) { t.samples[it].ptsUs - globalStartUs }
-        var dts = LongArray(n) { t.samples[it].dtsUs - globalStartUs }
+        val samples = t.samples
+        val n = samples.size
+        val pts = LongArray(n) { samples.ptsUs(it) - globalStartUs }
+        var dts = LongArray(n) { samples.dtsUs(it) - globalStartUs }
 
         var dtsValid = true
         for (i in 0 until n) {
@@ -299,7 +316,7 @@ public class Mp4Muxer private constructor(
         }
 
         val ts = t.timescale
-        fun toTicks(us: Long): Long = Math.floorDiv(us * ts + 500_000, 1_000_000)
+        fun toTicks(us: Long): Long = Timestamps.rescaleRounded(us, ts, 1_000_000)
 
         val dts0 = if (n > 0) dts[0] else 0L
         val dtsTicks = LongArray(n) { toTicks(dts[it] - dts0) }
@@ -309,9 +326,9 @@ public class Mp4Muxer private constructor(
         val stts = LongArray(n)
         for (i in 0 until n - 1) stts[i] = dtsTicks[i + 1] - dtsTicks[i]
         if (n > 0) {
-            val last = t.samples[n - 1]
+            val lastDurationUs = samples.durationUs(n - 1)
             stts[n - 1] = when {
-                last.durationUs > 0 -> toTicks(last.durationUs)
+                lastDurationUs > 0 -> toTicks(lastDurationUs)
                 n > 1 -> stts[n - 2]
                 else -> toTicks(defaultSampleDurationUs(t.info))
             }
@@ -320,7 +337,7 @@ public class Mp4Muxer private constructor(
         val mediaDuration = if (n > 0) dtsTicks[n - 1] + stts[n - 1] else 0
         val earliestPts = ptsTicks.minOrNull() ?: 0L
         val startOffsetUs = maxOf(0L, (pts.minOrNull() ?: 0L))
-        val lastEndUs = if (n > 0) (pts.maxOrNull() ?: 0L) + Math.floorDiv(stts[n - 1] * 1_000_000, ts) else 0L
+        val lastEndUs = if (n > 0) (pts.maxOrNull() ?: 0L) + Timestamps.rescaleFloor(stts[n - 1], 1_000_000, ts) else 0L
         return TrackTables(dtsTicks, ctts, stts, mediaDuration, earliestPts, startOffsetUs, lastEndUs - startOffsetUs)
     }
 
@@ -335,14 +352,12 @@ public class Mp4Muxer private constructor(
     }
 
     /** Microsegundos -> ticks de la escala de la película, con el mismo redondeo que el resto. */
-    private fun toMovieTicks(us: Long): Long = Math.floorDiv(us * MOVIE_TIMESCALE + 500_000, 1_000_000)
+    private fun toMovieTicks(us: Long): Long = Timestamps.rescaleRounded(us, MOVIE_TIMESCALE, 1_000_000)
 
     /** Una duración solo cabe en las cajas versión 0 si entra en 32 bits sin signo. */
     private fun versionFor(duration: Long): Int = if (duration > 0xFFFFFFFFL) 1 else 0
 
-    private fun buildMoov(offsetDelta: Long): ByteArray {
-        val globalStartUs = tracks.mapNotNull { t -> t.samples.minOfOrNull { it.ptsUs } }.minOrNull() ?: 0L
-        val tables = tracks.map { computeTables(it, globalStartUs) }
+    private fun buildMoov(tables: List<TrackTables>, offsetDelta: Long): ByteArray {
         val movieDurationMs = tracks.indices.maxOfOrNull { i ->
             toMovieTicks(tables[i].startOffsetUs + tables[i].presentationDurationUs)
         } ?: 0L
@@ -427,7 +442,7 @@ public class Mp4Muxer private constructor(
                         u32(t.timescale)
                         u32(tab.mediaDuration)
                     }
-                    u16(0x55C4)                      // idioma: und
+                    u16(SampleEntries.packLanguage(info.language)) // idioma ISO 639-2/T
                     u16(0)
                 }
                 fullBox("hdlr", 0, 0) {
@@ -530,7 +545,7 @@ public class Mp4Muxer private constructor(
     private fun primingTicks(t: TrackState): Long {
         val info = t.info
         if (info !is TrackInfo.Audio || info.codecDelayUs <= 0) return 0L
-        return Math.floorDiv(info.codecDelayUs * t.timescale + 500_000, 1_000_000)
+        return Timestamps.rescaleRounded(info.codecDelayUs, t.timescale, 1_000_000)
     }
 
     private fun writeStbl(parent: BoxBuilder, t: TrackState, tab: TrackTables, offsetDelta: Long) {
@@ -544,87 +559,98 @@ public class Mp4Muxer private constructor(
                 }
             }
 
-            val sttsRuns = ArrayList<Pair<Long, Long>>() // count, delta
-            for (d in tab.sttsDeltas) {
-                val lastRun = sttsRuns.lastOrNull()
-                if (lastRun != null && lastRun.second == d) {
-                    sttsRuns[sttsRuns.size - 1] = lastRun.first + 1 to d
-                } else {
-                    sttsRuns.add(1L to d)
-                }
-            }
+            val sttsRuns = runLengths(tab.sttsDeltas)
             fullBox("stts", 0, 0) {
                 u32(sttsRuns.size)
-                for ((count, delta) in sttsRuns) { u32(count); u32(delta) }
+                for (r in 0 until sttsRuns.size) { u32(sttsRuns.count(r)); u32(sttsRuns.value(r)) }
             }
 
             if (tab.cttsTicks.any { it != 0L }) {
-                val cttsRuns = ArrayList<Pair<Long, Long>>()
-                for (c in tab.cttsTicks) {
-                    val lastRun = cttsRuns.lastOrNull()
-                    if (lastRun != null && lastRun.second == c) {
-                        cttsRuns[cttsRuns.size - 1] = lastRun.first + 1 to c
-                    } else {
-                        cttsRuns.add(1L to c)
-                    }
-                }
+                val cttsRuns = runLengths(tab.cttsTicks)
                 fullBox("ctts", 0, 0) {
                     u32(cttsRuns.size)
-                    for ((count, offset) in cttsRuns) { u32(count); u32(offset) }
+                    for (r in 0 until cttsRuns.size) { u32(cttsRuns.count(r)); u32(cttsRuns.value(r)) }
                 }
             }
 
-            if (samples.any { !it.key }) {
-                val keys = samples.indices.filter { samples[it].key }
+            var keyCount = 0
+            for (s in 0 until samples.size) if (samples.isKey(s)) keyCount++
+            if (keyCount < samples.size) {
                 fullBox("stss", 0, 0) {
-                    u32(keys.size)
-                    for (k in keys) u32(k + 1)
+                    u32(keyCount)
+                    for (s in 0 until samples.size) if (samples.isKey(s)) u32(s + 1)
                 }
             }
 
-            val chunkFirstSample = ArrayList<Int>()
-            val chunkSampleCount = ArrayList<Int>()
+            val chunkFirstSample = IntArray(samples.size)
+            val chunkSampleCount = IntArray(samples.size)
+            var chunkCount = 0
             var i = 0
             while (i < samples.size) {
                 var j = i
-                var end = samples[j].offset + samples[j].size
-                while (j + 1 < samples.size && samples[j + 1].offset == end) {
+                var end = samples.offset(j) + samples.size(j)
+                while (j + 1 < samples.size && samples.offset(j + 1) == end) {
                     j++
-                    end = samples[j].offset + samples[j].size
+                    end = samples.offset(j) + samples.size(j)
                 }
-                chunkFirstSample.add(i)
-                chunkSampleCount.add(j - i + 1)
+                chunkFirstSample[chunkCount] = i
+                chunkSampleCount[chunkCount] = j - i + 1
+                chunkCount++
                 i = j + 1
             }
 
             fullBox("stsc", 0, 0) {
-                val entries = ArrayList<Pair<Int, Int>>() // firstChunk (1-based), samplesPerChunk
-                for (c in chunkSampleCount.indices) {
-                    if (entries.isEmpty() || entries.last().second != chunkSampleCount[c]) {
-                        entries.add(c + 1 to chunkSampleCount[c])
+                var entries = 0
+                for (c in 0 until chunkCount) {
+                    if (c == 0 || chunkSampleCount[c] != chunkSampleCount[c - 1]) entries++
+                }
+                u32(entries)
+                for (c in 0 until chunkCount) {
+                    if (c == 0 || chunkSampleCount[c] != chunkSampleCount[c - 1]) {
+                        u32(c + 1); u32(chunkSampleCount[c]); u32(1) // first_chunk, samples_per_chunk, sample_description_index
                     }
                 }
-                u32(entries.size)
-                for ((first, count) in entries) { u32(first); u32(count); u32(1) }
             }
 
             fullBox("stsz", 0, 0) {
                 u32(0)                               // sample_size: no constante
                 u32(samples.size)
-                for (s in samples) u32(s.size)
+                for (s in 0 until samples.size) u32(samples.size(s))
             }
 
             if (useCo64) {
                 fullBox("co64", 0, 0) {
-                    u32(chunkFirstSample.size)
-                    for (first in chunkFirstSample) u64(samples[first].offset + offsetDelta)
+                    u32(chunkCount)
+                    for (c in 0 until chunkCount) u64(samples.offset(chunkFirstSample[c]) + offsetDelta)
                 }
             } else {
                 fullBox("stco", 0, 0) {
-                    u32(chunkFirstSample.size)
-                    for (first in chunkFirstSample) u32(samples[first].offset + offsetDelta)
+                    u32(chunkCount)
+                    for (c in 0 until chunkCount) u32(samples.offset(chunkFirstSample[c]) + offsetDelta)
                 }
             }
         }
+    }
+
+    /** Series de valores repetidos consecutivos, en arrays primitivos y sin un `Pair` por serie. */
+    private class Runs(private val counts: LongArray, private val values: LongArray, val size: Int) {
+        fun count(i: Int): Long = counts[i]
+        fun value(i: Int): Long = values[i]
+    }
+
+    private fun runLengths(values: LongArray): Runs {
+        val counts = LongArray(values.size)
+        val runValues = LongArray(values.size)
+        var runs = 0
+        for (v in values) {
+            if (runs > 0 && runValues[runs - 1] == v) {
+                counts[runs - 1]++
+            } else {
+                runValues[runs] = v
+                counts[runs] = 1
+                runs++
+            }
+        }
+        return Runs(counts, runValues, runs)
     }
 }

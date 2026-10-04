@@ -2,6 +2,20 @@
 
 Gracias por el interés. Esto es lo que conviene saber antes de abrir un PR.
 
+## La regla de audio, que no se toca
+
+**El audio del sistema y el del micrófono se pueden grabar combinados en una pista, cada uno en la
+suya, o cualquiera de los dos solo, y la mezcla junto a las dos sueltas.** Es lo que distingue a
+esta librería para móviles y forma parte de su contrato público, así que ningún cambio puede
+romperla:
+
+- `PcmMixer` y `PcmResampler` se quedan, con su API tal cual. Se pueden optimizar por dentro, pero
+  sin cambiar lo que devuelven: `PcmFastPathEquivalenceTest` los compara contra una copia literal de
+  la implementación anterior.
+- Los muxers tienen que admitir cualquier número de pistas de audio con nombre, idioma y una sola
+  predeterminada, en MKV, MP4 y fMP4, y conservarlas al convertir.
+- `RecordingAudioLayoutsTest` comprueba los cinco montajes. Si falla, el cambio está mal, no el test.
+
 ## Antes de empezar
 
 - **Abre un issue primero** si el cambio es de alcance (un códec nuevo, un contenedor nuevo, un
@@ -26,10 +40,11 @@ integración end-to-end**, que son los que validan la salida contra binarios rea
 omiten en silencio, así que merece la pena instalarlo (`winget install Gyan.FFmpeg`,
 `brew install ffmpeg` o `apt install ffmpeg`).
 
-Se omiten siempre tres: los que cuentan descriptores de archivo abiertos leyendo `/proc/self/fd`,
-que solo existe en Linux. En Windows y macOS se saltan solos; el CI sí los ejecuta. El build
-imprime todos los `SKIPPED` a propósito, para que un verde con media suite sin ejecutar no pase por
-cobertura.
+Tres tests comprueban que una operación fallida no deja archivos abiertos (`OpenFiles`): en Linux
+leyendo `/proc/self/fd` y en Windows comprobando que el archivo se deja renombrar, que Windows impide
+mientras está abierto. En macOS no hay forma fiable de medirlo y se saltan solos; el CI, en Linux,
+sí los ejecuta. El build imprime todos los `SKIPPED` a propósito, para que un verde con media suite
+sin ejecutar no pase por cobertura.
 
 El [CI](.github/workflows/ci.yml) corre en cada push la suite con FFmpeg instalado —para que los de
 integración no se omitan en silencio— y comprueba además que el artefacto se puede publicar de
@@ -93,6 +108,17 @@ Cuando el cambio es intencionado, regenera el volcado y **revisa el diff**:
   explícitos. Piensa dos veces antes de ampliar la superficie pública.
 - **Cero imports de `android.*` o `androidx.*`.** No es una preferencia: el build no tiene el SDK
   de Android, así que el primero que aparezca no compila.
+- **No subas el nivel de Kotlin del artefacto sin mirar a las apps.** `languageVersion`/`apiVersion`
+  (2.0) y `coreLibrariesVersion` (2.0.21) en `build.gradle.kts` deciden qué Kotlin necesita la app
+  que consume la librería, no el compilador de aquí. El CI compila `compat/kotlin-1.9` contra cada
+  artefacto; si ese paso falla, la librería se volvería inservible para esas apps, como pasó con la
+  1.0.0. Ese proyecto lleva su propio wrapper fijado en Gradle 8, porque el plugin de Kotlin 1.9 no
+  funciona con Gradle 9: el Gradle de aquí se puede subir, el suyo no.
+- **Solo API del JDK que exista en Android 8.0 (API 26).** Compilar contra JDK 17 no avisa de nada,
+  así que lo vigila `AndroidApiCompatibilityTest` contra la firma oficial de la API 26. Ojo con las
+  sobrecargas covariantes de JDK 9+ (`ByteBuffer.position(int)`, `flip()`, `limit(int)`…): en
+  Android antiguo no existen, y la alternativa es un acceso absoluto (`getShort(10)`) o llamarlas
+  sobre `java.nio.Buffer`. `Math.multiplyHigh` tampoco (API 31).
 
 ## Cambios de API
 
@@ -112,9 +138,9 @@ no se puede arreglar sin publicar de nuevo.
 |---|---|
 | `build.gradle.kts` | `version = "..."` — la fuente de verdad |
 | `CHANGELOG.md` | La entrada nueva, con su fecha |
-| `README.md` | La cabecera «Versión: …» y las dos coordenadas de ejemplo |
+| `README.md` | La cabecera «Versión: …», las dos coordenadas de ejemplo y el `-PkotmpegVersion=` del comando de `compat/kotlin-1.9` |
 
-`SECURITY.md` lleva la serie soportada (`2.x`), no una versión exacta, así que solo se toca al
+`SECURITY.md` lleva la serie soportada (`3.x`), no una versión exacta, así que solo se toca al
 subir la mayor.
 
 Y al publicar, el **tag de git tiene que llamarse exactamente igual que la versión**: JitPack usa el
@@ -129,6 +155,17 @@ que nadie puede descargar. La entrada del CHANGELOG se encabeza mientras tanto c
 `— sin publicar`, y la fecha se escribe en el commit que crea el tag, que es cuando pasa a ser
 cierta.
 
+Lo mismo vale para las marcas de «en preparación» que se pongan mientras tanto en el resto de la
+documentación. En el commit del tag, además de fechar el CHANGELOG:
+
+| Archivo | Qué se quita |
+|---|---|
+| `README.md` | El paréntesis «(en preparación: …)» de la cabecera «Versión: …» |
+| `SECURITY.md` | Si se sube la mayor, la fila de la serie anterior («`2.x` … hasta que se publique…») |
+
+Se olvidan con facilidad porque nada falla si siguen ahí, y el resultado es una versión publicada
+cuya portada dice que todavía no lo está.
+
 ### Cuánto subir: lo decide `public-api.txt`
 
 | Qué le pasa a `public-api.txt` | Versión |
@@ -139,6 +176,12 @@ cierta.
 
 El disparador es objetivo y lo comprueba un test, así que no hay que juzgar si un cambio «es
 grande»: basta con mirar de qué lado cae el diff del volcado.
+
+Con una salvedad: **un cambio de comportamiento observable del que alguien pueda depender también
+exige la mayor**, aunque el volcado solo gane líneas. Es el caso de la `3.0.0`: no quita ninguna
+firma, pero `MkvMuxer` pasó a empezar la línea de tiempo en el paquete más temprano y `Mp4Demuxer` a
+devolver idioma, nombre y pista predeterminada reales. Esos cambios van en `Cambios incompatibles`
+igual que una firma rota, con lo que hay que revisar.
 
 Y el caso que no parece incompatible pero lo es: **en Kotlin, añadir un parámetro con valor por
 defecto es compatible en código fuente pero no a nivel binario**. El volcado lo delata porque la
@@ -154,12 +197,14 @@ tablas del demuxer, el cierre con `mp4FastStart`— el KDoc de la clase que la c
 fallaba antes, con qué archivo se reproducía y por qué el código está como está. Casi todos vienen
 de un fallo real, no de un caso imaginado.
 
-Dos de ellos no comprueban una funcionalidad sino una **política**, y por eso no se archivan nunca:
+Cuatro de ellos no comprueban una funcionalidad sino una **política**, y por eso no se archivan nunca:
 
 | | |
 |---|---|
+| `RecordingAudioLayoutsTest` | la regla de audio: mezcla, micrófono, sistema, separadas y mezcla+separadas |
 | `PublicApiTest` | congela la superficie pública en `public-api.txt` |
 | `CommentPolicyTest` | la forma de documentar el código, con su única excepción |
+| `AndroidApiCompatibilityTest` | que el bytecode solo use API del JDK presente en Android 8.0 |
 
 Cuando uno falla, o el cambio es intencionado —y entonces se regenera el volcado o se ajusta el
 número en el mismo commit, que es una decisión con nombre— o es un descuido que acaba de evitarse.
@@ -172,5 +217,8 @@ Antes de crear uno:
 - Corre la suite **con ffmpeg instalado**. Sin él se omiten los tests de integración, que son los
   únicos que comparan la salida real contra un decodificador de verdad.
 - Comprueba que `public-api.txt` refleja la API que vas a publicar.
-- Comprueba que `./gradlew publishToMavenLocal` deja el jar, el jar de fuentes y el POM.
-- Fecha la entrada del CHANGELOG **en el mismo commit que crea el tag**, no antes.
+- Comprueba que `./gradlew publishToMavenLocal` deja el jar, el jar de fuentes y el POM, y que desde
+  `compat/kotlin-1.9`, con su propio wrapper, `sh gradlew run -PkotmpegVersion=<versión>`
+  (`.\gradlew.bat` en Windows) compila y termina con `OK`.
+- Fecha la entrada del CHANGELOG **en el mismo commit que crea el tag**, no antes, y quita en ese
+  mismo commit las marcas de «en preparación» del README y de `SECURITY.md`.

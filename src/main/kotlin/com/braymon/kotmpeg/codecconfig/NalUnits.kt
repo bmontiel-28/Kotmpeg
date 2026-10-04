@@ -42,26 +42,18 @@ public object NalUnits {
 
     /** Divide un stream Annex-B (delimitado por 00 00 01 / 00 00 00 01) en NAL units crudas. */
     public fun splitAnnexB(data: ByteArray): List<ByteArray> {
-        val nals = ArrayList<ByteArray>()
-        var i = 0
-        var nalStart = -1
-        val n = data.size
-        while (i + 2 < n) {
-            if (data[i].toInt() == 0 && data[i + 1].toInt() == 0 && data[i + 2].toInt() == 1) {
-                if (nalStart >= 0) nals.addTrimmed(data, nalStart, i)
-                i += 3
-                nalStart = i
-            } else {
-                i++
-            }
-        }
-        if (nalStart in 0 until n) nals.addTrimmed(data, nalStart, n)
-        else if (nalStart == -1 && n > 0) throw IllegalArgumentException("no se encontró código de inicio Annex-B")
-        return nals
+        val bounds = findAnnexBNals(data)
+        return List(bounds.count) { data.copyOfRange(bounds.start(it), bounds.end(it)) }
+    }
+
+    /** Límites `[inicio, fin)` de cada NAL dentro del array original, sin copiar nada. */
+    private class NalBounds(private val starts: IntArray, private val ends: IntArray, val count: Int) {
+        fun start(i: Int): Int = starts[i]
+        fun end(i: Int): Int = ends[i]
     }
 
     /**
-     * Añade data[start, end) como NAL quitando TODOS los ceros finales.
+     * Localiza las NAL de un stream Annex-B quitando a cada una **todos** sus ceros finales.
      *
      * Un NAL nunca termina en 0x00: los ceros de la cola son el cero que pertenece al
      * código de inicio de 4 bytes siguiente, más los `cabac_zero_word`/`trailing_zero_8bits`
@@ -69,10 +61,37 @@ public object NalUnits {
      * pegados al final del NAL anterior: corrupción silenciosa de la carga, sin ninguna
      * excepción que lo delate.
      */
-    private fun MutableList<ByteArray>.addTrimmed(data: ByteArray, start: Int, endExclusive: Int) {
-        var end = endExclusive
-        while (end > start && data[end - 1].toInt() == 0) end--
-        if (end > start) add(data.copyOfRange(start, end))
+    private fun findAnnexBNals(data: ByteArray): NalBounds {
+        var starts = IntArray(8)
+        var ends = IntArray(8)
+        var count = 0
+        fun addTrimmed(start: Int, endExclusive: Int) {
+            var end = endExclusive
+            while (end > start && data[end - 1].toInt() == 0) end--
+            if (end <= start) return
+            if (count == starts.size) {
+                starts = starts.copyOf(count * 2)
+                ends = ends.copyOf(count * 2)
+            }
+            starts[count] = start
+            ends[count] = end
+            count++
+        }
+        var i = 0
+        var nalStart = -1
+        val n = data.size
+        while (i + 2 < n) {
+            if (data[i].toInt() == 0 && data[i + 1].toInt() == 0 && data[i + 2].toInt() == 1) {
+                if (nalStart >= 0) addTrimmed(nalStart, i)
+                i += 3
+                nalStart = i
+            } else {
+                i++
+            }
+        }
+        if (nalStart in 0 until n) addTrimmed(nalStart, n)
+        else if (nalStart == -1 && n > 0) throw IllegalArgumentException("no se encontró código de inicio Annex-B")
+        return NalBounds(starts, ends, count)
     }
 
     /** Divide una muestra con prefijos de longitud de 4 bytes en NAL units crudas. */
@@ -93,29 +112,95 @@ public object NalUnits {
     }
 
     public fun joinLengthPrefixed(nals: List<ByteArray>): ByteArray {
-        val out = ByteArrayOutputStream()
+        val out = ByteArray(prefixedSize(nals))
+        var at = 0
         for (nal in nals) {
-            out.write(nal.size ushr 24); out.write(nal.size ushr 16)
-            out.write(nal.size ushr 8); out.write(nal.size)
-            out.write(nal)
+            writeLength(out, at, nal.size)
+            System.arraycopy(nal, 0, out, at + 4, nal.size)
+            at += 4 + nal.size
         }
-        return out.toByteArray()
+        return out
     }
 
     public fun joinAnnexB(nals: List<ByteArray>): ByteArray {
-        val out = ByteArrayOutputStream()
+        val out = ByteArray(prefixedSize(nals))
+        var at = 0
         for (nal in nals) {
-            out.write(0); out.write(0); out.write(0); out.write(1)
-            out.write(nal)
+            out[at + 3] = 1                                             // código de inicio 00 00 00 01
+            System.arraycopy(nal, 0, out, at + 4, nal.size)
+            at += 4 + nal.size
         }
-        return out.toByteArray()
+        return out
     }
 
-    /** Convierte una unidad de acceso Annex-B al formato ISO con prefijos de longitud de 4 bytes. */
-    public fun annexBToLengthPrefixed(data: ByteArray): ByteArray = joinLengthPrefixed(splitAnnexB(data))
+    private fun prefixedSize(nals: List<ByteArray>): Int {
+        var total = 0L
+        for (nal in nals) total += 4L + nal.size
+        require(total <= MAX_ARRAY_BYTES) { "la unidad de acceso no cabe en un array: $total bytes" }
+        return total.toInt()
+    }
 
-    /** Convierte una muestra ISO con prefijos a Annex-B (para decodificadores que piden códigos de inicio). */
-    public fun lengthPrefixedToAnnexB(data: ByteArray): ByteArray = joinAnnexB(splitLengthPrefixed(data))
+    private fun writeLength(out: ByteArray, at: Int, length: Int) {
+        out[at] = (length ushr 24).toByte()
+        out[at + 1] = (length ushr 16).toByte()
+        out[at + 2] = (length ushr 8).toByte()
+        out[at + 3] = length.toByte()
+    }
+
+    /**
+     * Convierte una unidad de acceso Annex-B al formato ISO con prefijos de longitud de 4 bytes.
+     *
+     * Es la conversión que se hace con **cada fotograma** que sale de un codificador por hardware,
+     * así que va en una sola pasada: localiza los límites de cada NAL y copia directamente al
+     * array final, del tamaño exacto. Antes se creaba un array por NAL y luego otro buffer más
+     * para unirlos, el doble de memoria y de copias por fotograma.
+     */
+    public fun annexBToLengthPrefixed(data: ByteArray): ByteArray {
+        val bounds = findAnnexBNals(data)
+        var total = 0L
+        for (k in 0 until bounds.count) total += 4L + (bounds.end(k) - bounds.start(k))
+        require(total <= MAX_ARRAY_BYTES) { "la unidad de acceso no cabe en un array: $total bytes" }
+        val out = ByteArray(total.toInt())
+        var at = 0
+        for (k in 0 until bounds.count) {
+            val length = bounds.end(k) - bounds.start(k)
+            writeLength(out, at, length)
+            System.arraycopy(data, bounds.start(k), out, at + 4, length)
+            at += 4 + length
+        }
+        return out
+    }
+
+    /**
+     * Convierte una muestra ISO con prefijos a Annex-B (para decodificadores que piden códigos de
+     * inicio). Un prefijo de 4 bytes y un código de inicio de 4 bytes miden lo mismo, así que basta
+     * una copia de la muestra con cada prefijo sustituido: no hace falta trocearla.
+     */
+    public fun lengthPrefixedToAnnexB(data: ByteArray): ByteArray {
+        var i = 0
+        while (i + 4 <= data.size) {
+            val len = readLength(data, i)
+            i += 4
+            require(len >= 0 && i.toLong() + len.toLong() <= data.size.toLong()) {
+                "muestra con prefijos de longitud corrupta"
+            }
+            i += len
+        }
+        val out = data.copyOf(i)
+        var at = 0
+        while (at + 4 <= i) {
+            val len = readLength(out, at)
+            out[at] = 0; out[at + 1] = 0; out[at + 2] = 0; out[at + 3] = 1 // código de inicio
+            at += 4 + len
+        }
+        return out
+    }
+
+    private fun readLength(data: ByteArray, at: Int): Int =
+        ((data[at].toInt() and 0xFF) shl 24) or ((data[at + 1].toInt() and 0xFF) shl 16) or
+            ((data[at + 2].toInt() and 0xFF) shl 8) or (data[at + 3].toInt() and 0xFF)
+
+    private const val MAX_ARRAY_BYTES = Int.MAX_VALUE - 8L
 
     /** Elimina los bytes de prevención de emulación (00 00 03 -> 00 00) de una carga NAL. */
     public fun unescapeRbsp(nal: ByteArray): ByteArray {

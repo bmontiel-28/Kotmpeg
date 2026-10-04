@@ -1,6 +1,8 @@
 [versions]
 kotlin = "2.2.10"
 junitJupiter = "6.1.2"
+animalSniffer = "1.24"
+androidApiSignature = "8.0.0_r2"
 
 [libraries]
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junitJupiter" }
@@ -9,6 +11,10 @@ junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "jun
 # y el emparejamiento no siempre fue evidente: hasta JUnit 5 el motor iba por 5.x y la plataforma
 # por 1.x (5.11.4 ↔ 1.11.4), y en JUnit 6 pasaron a compartir numeración.
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+# Solo para tests: comprueban el bytecode compilado contra la firma de la API 26 de Android, el
+# mínimo que se documenta. Ninguna de las dos llega al artefacto publicado.
+animal-sniffer = { module = "org.codehaus.mojo:animal-sniffer", version.ref = "animalSniffer" }
+android-api-signature = { module = "net.sf.androidscents.signature:android-api-level-26", version.ref = "androidApiSignature" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

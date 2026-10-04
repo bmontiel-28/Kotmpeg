@@ -74,6 +74,20 @@ jobs:
       - name: Publicación a Maven local
         run: ./gradlew publishToMavenLocal
 
+      # El Kotlin de la app que consume la librería es el techo, no el de este proyecto: un
+      # artefacto con metadata demasiado nueva no compila en esa app, y ningún test de aquí lo ve
+      # (así se rompió la 1.0.0). Este proyecto compila y ejecuta con Kotlin 1.9 contra el artefacto
+      # que se acaba de publicar.
+      #
+      # Usa su propio wrapper, fijado en Gradle 8, porque el plugin de Kotlin 1.9 no funciona con
+      # Gradle 9: así subir el Gradle del proyecto no rompe esta comprobación. Va con `sh` para no
+      # depender del bit de ejecución de ese segundo `gradlew`.
+      - name: Consumidor con Kotlin 1.9
+        working-directory: compat/kotlin-1.9
+        run: |
+          version=$(grep -oP '^version = "\K[^"]+' ../../build.gradle.kts)
+          sh ./gradlew run --no-configuration-cache -PkotmpegVersion="$version"
+
       - name: Informes
         if: always()
         uses: actions/upload-artifact@v4

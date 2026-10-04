@@ -10,17 +10,23 @@ import com.braymon.kotmpeg.model.AudioCodec
 import com.braymon.kotmpeg.model.ColorInfo
 import com.braymon.kotmpeg.model.HdrStaticInfo
 import com.braymon.kotmpeg.model.MediaPacket
+import com.braymon.kotmpeg.model.Timestamps
 import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.model.VideoCodec
+import java.io.ByteArrayOutputStream
+import java.io.EOFException
 import java.io.File
 import java.util.ArrayDeque
+import java.util.zip.DataFormatException
+import java.util.zip.Inflater
 
 /**
  * Demuxer Matroska (.mkv).
  *
  * Lee pistas (H.264/H.265/AAC/Opus), SimpleBlocks y BlockGroups, los tres esquemas de
- * lacing, y usa el índice Cues para las búsquedas. Las pistas no soportadas (p. ej.
- * subtítulos) se saltan de forma transparente.
+ * lacing, la compresión de contenido de `ContentEncoding` (eliminación de cabecera y zlib), y
+ * usa el índice Cues para las búsquedas. Las pistas no soportadas (p. ej. subtítulos) se
+ * saltan de forma transparente.
  *
  * **No es seguro entre hilos**: readPacket/seekTo comparten la posición del archivo.
  */
@@ -60,12 +66,27 @@ public class MkvDemuxer(
         private set
 
     private val trackMap = LinkedHashMap<Int, TrackInfo>()
-    override val tracks: List<TrackInfo> get() = trackMap.values.toList()
+    private var trackList: List<TrackInfo> = emptyList()
+    override val tracks: List<TrackInfo> get() = trackList
 
     /** Duración por defecto de fotograma por número de pista, en ns (0 = desconocida). */
     private val defaultDurationNs = HashMap<Int, Long>()
 
+    /** Codificaciones de contenido por número de pista, ya ordenadas para deshacerlas. */
+    private val contentEncodings = HashMap<Int, List<ContentEncoding>>()
+
     private class Cue(val timeUs: Long, val clusterPosition: Long)
+
+    /**
+     * Un `ContentEncoding` de compresión. Solo se conservan los que se saben deshacer —
+     * eliminación de cabecera (algoritmo 3) y zlib (0)—; una pista con cualquier otro, o con
+     * cifrado, se descarta con aviso, porque entregar sus bloques tal cual sería entregar datos
+     * que ningún decodificador puede usar.
+     */
+    private class ContentEncoding(val order: Long, val scope: Long, val algorithm: Long, val settings: ByteArray?)
+
+    /** Cabecera de un Block o SimpleBlock: pista, desfase respecto al cluster y flags. */
+    private class BlockHeader(val trackNumber: Int, val relative: Int, val flags: Int, val size: Int)
 
     private val cues = ArrayList<Cue>()
 
@@ -81,6 +102,11 @@ public class MkvDemuxer(
             runCatching { input.close() }
             throw t
         }
+        trackList = trackMap.values.toList()
+    }
+
+    private fun warn(message: String) {
+        runCatching { onWarning(message) }
     }
 
     /**
@@ -148,6 +174,7 @@ public class MkvDemuxer(
             }
             input.position = saved
         }
+        cues.sortBy { it.timeUs }
 
         if (firstClusterPos >= 0) {
             input.position = firstClusterPos
@@ -170,12 +197,20 @@ public class MkvDemuxer(
         while (input.position < info.dataEnd) {
             val el = reader.readElement()
             when (el.id) {
-                MatroskaIds.TIMESTAMP_SCALE -> timestampScaleNs = reader.readUInt(el)
+                MatroskaIds.TIMESTAMP_SCALE -> {
+                    val scale = reader.readUInt(el)
+                    if (scale > 0) {
+                        timestampScaleNs = scale
+                    } else {
+                        warn("TimestampScale inválido ($scale): se usa el valor por defecto de 1 ms")
+                    }
+                }
                 MatroskaIds.DURATION -> durationTicks = reader.readFloat(el)
                 else -> skipOrAbort(el)
             }
         }
-        durationUs = (durationTicks * timestampScaleNs / 1000.0).toLong()
+        val duration = durationTicks * timestampScaleNs / 1000.0
+        durationUs = if (duration.isFinite() && duration > 0) duration.toLong() else 0L
     }
 
     private fun parseSeekHead(seekHeadEl: EbmlElement) {
@@ -250,6 +285,7 @@ public class MkvDemuxer(
         var color: ColorInfo? = null
         /** El valor por omisión de `FlagDefault` en la especificación es 1: ausente = predeterminada. */
         var default = true
+        var encodings: List<ContentEncoding>? = emptyList()
 
         while (input.position < entry.dataEnd) {
             val el = reader.readElement()
@@ -265,6 +301,7 @@ public class MkvDemuxer(
                 MatroskaIds.FLAG_DEFAULT -> default = reader.readUInt(el) != 0L
                 MatroskaIds.DEFAULT_DURATION -> defaultDurNs = reader.readUInt(el)
                 MatroskaIds.CODEC_DELAY -> codecDelayNs = reader.readUInt(el)
+                MatroskaIds.CONTENT_ENCODINGS -> encodings = parseContentEncodings(requireSized(el))
                 MatroskaIds.VIDEO -> while (input.position < requireSized(el).dataEnd) {
                     val v = reader.readElement()
                     when (v.id) {
@@ -294,6 +331,22 @@ public class MkvDemuxer(
         }
         if (number <= 0) return
 
+        val usableEncodings = encodings ?: run {
+            warn(
+                "pista $number descartada: usa una compresión o un cifrado de contenido " +
+                    "(ContentEncoding) que no está soportado",
+            )
+            return
+        }
+        if (usableEncodings.isNotEmpty() && codecPrivate != null) {
+            codecPrivate = try {
+                decode(codecPrivate, usableEncodings, CONTENT_SCOPE_PRIVATE)
+            } catch (_: Exception) {
+                warn("pista $number descartada: su CodecPrivate comprimido no se pudo descomprimir")
+                return
+            }
+        }
+
         when (displayUnit) {
             DISPLAY_UNIT_PIXELS -> Unit
             DISPLAY_UNIT_ASPECT_RATIO -> {
@@ -320,13 +373,112 @@ public class MkvDemuxer(
         if (track != null) {
             trackMap[number] = track
             defaultDurationNs[number] = defaultDurNs
+            if (usableEncodings.isNotEmpty()) contentEncodings[number] = usableEncodings
         } else {
-            runCatching {
-                onWarning(
-                    "pista $number descartada: no se pudo construir desde su cabecera " +
-                        "(codecId '$codecId', tipo $type)",
-                )
+            warn(
+                "pista $number descartada: no se pudo construir desde su cabecera " +
+                    "(codecId '$codecId', tipo $type)",
+            )
+        }
+    }
+
+    /**
+     * Lee `ContentEncodings`. Devuelve las codificaciones ordenadas de mayor a menor
+     * `ContentEncodingOrder`, que es el orden en que la especificación manda deshacerlas, o `null`
+     * si alguna no se sabe deshacer.
+     *
+     * Ignorarlas, que era lo que se hacía, no fallaba: entregaba en silencio fotogramas sin los
+     * bytes de cabecera que el muxer había quitado —lo que `mkvmerge` hacía por defecto en sus
+     * versiones antiguas—, y el decodificador recibía basura sin ningún aviso.
+     */
+    private fun parseContentEncodings(container: EbmlElement): List<ContentEncoding>? {
+        val result = ArrayList<ContentEncoding>()
+        var supported = true
+        while (input.position < container.dataEnd) {
+            val encodingEl = reader.readElement()
+            if (encodingEl.id != MatroskaIds.CONTENT_ENCODING) { skipOrAbort(encodingEl); continue }
+            requireSized(encodingEl)
+            var order = 0L
+            var scope = CONTENT_SCOPE_FRAMES
+            var type = 0L
+            var algorithm = 0L
+            var settings: ByteArray? = null
+            while (input.position < encodingEl.dataEnd) {
+                val el = reader.readElement()
+                when (el.id) {
+                    MatroskaIds.CONTENT_ENCODING_ORDER -> order = reader.readUInt(el)
+                    MatroskaIds.CONTENT_ENCODING_SCOPE -> scope = reader.readUInt(el)
+                    MatroskaIds.CONTENT_ENCODING_TYPE -> type = reader.readUInt(el)
+                    MatroskaIds.CONTENT_COMPRESSION -> while (input.position < requireSized(el).dataEnd) {
+                        val c = reader.readElement()
+                        when (c.id) {
+                            MatroskaIds.CONTENT_COMP_ALGO -> algorithm = reader.readUInt(c)
+                            MatroskaIds.CONTENT_COMP_SETTINGS -> settings = reader.readBinary(c)
+                            else -> skipOrAbort(c)
+                        }
+                    }
+                    MatroskaIds.CONTENT_ENCRYPTION -> { type = CONTENT_TYPE_ENCRYPTION; reader.skip(el) }
+                    else -> skipOrAbort(el)
+                }
             }
+            val known = type == CONTENT_TYPE_COMPRESSION &&
+                (algorithm == CONTENT_ALGO_ZLIB || algorithm == CONTENT_ALGO_HEADER_STRIPPING)
+            if (!known) supported = false
+            result.add(ContentEncoding(order, scope, algorithm, settings))
+        }
+        if (!supported) return null
+        result.sortByDescending { it.order }
+        return result
+    }
+
+    /**
+     * Deshace sobre [data] las codificaciones que se aplican a [scope].
+     *
+     * Quien llama captura `Exception` y no cualquier `Throwable`: un bloque que no se puede
+     * descomprimir se descarta con aviso, pero un `OutOfMemoryError` no es un bloque dañado sino
+     * el proceso sin memoria. Tragárselo descartaba fotogramas en silencio mientras todo lo demás
+     * empezaba a fallar; ahora llega a quien lee, que es quien puede decidir qué hacer.
+     */
+    private fun decode(data: ByteArray, encodings: List<ContentEncoding>, scope: Long): ByteArray {
+        var current = data
+        for (encoding in encodings) {
+            if (encoding.scope and scope == 0L) continue
+            current = when (encoding.algorithm) {
+                CONTENT_ALGO_HEADER_STRIPPING -> encoding.settings?.let { it + current } ?: current
+                else -> inflate(current)
+            }
+        }
+        return current
+    }
+
+    /**
+     * Descompresión zlib con un techo de tamaño. Un bloque comprimido de unos pocos KB puede
+     * declarar cientos de MB al descomprimirse; sin el techo, un archivo manipulado agotaba la
+     * memoria del proceso con un solo fotograma.
+     */
+    private fun inflate(data: ByteArray): ByteArray {
+        val inflater = Inflater()
+        try {
+            inflater.setInput(data)
+            val out = ByteArrayOutputStream(data.size * 2)
+            val chunk = ByteArray(INFLATE_CHUNK_BYTES)
+            while (!inflater.finished()) {
+                val n = try {
+                    inflater.inflate(chunk)
+                } catch (e: DataFormatException) {
+                    throw EbmlException("bloque zlib corrupto: ${e.message}")
+                }
+                if (n == 0 && (inflater.needsInput() || inflater.needsDictionary())) {
+                    throw EbmlException("bloque zlib incompleto")
+                }
+                out.write(chunk, 0, n)
+                if (out.size() > MAX_INFLATED_BYTES) {
+                    throw EbmlException("bloque zlib que descomprime más de $MAX_INFLATED_BYTES bytes")
+                }
+            }
+            return out.toByteArray()
+        } finally {
+            inflater.end()
         }
     }
 
@@ -484,7 +636,7 @@ public class MkvDemuxer(
         }
     }
 
-    private fun ticksToUs(ticks: Long): Long = ticks * timestampScaleNs / 1000
+    private fun ticksToUs(ticks: Long): Long = Timestamps.rescaleFloor(ticks, timestampScaleNs, 1000)
 
     override fun readPacket(): MediaPacket? {
         while (pending.isEmpty()) {
@@ -498,17 +650,38 @@ public class MkvDemuxer(
      *
      * Aquí la política ante datos corruptos es deliberadamente distinta a la del parseo de
      * cabeceras: **se termina el stream en vez de lanzar**. Un archivo truncado (una
-     * grabación cortada de golpe, lo normal en este caso de uso) debe reproducirse hasta
-     * donde llegue, no fallar entero por la cola dañada. Las cabeceras sí lanzan, porque
-     * sin ellas no hay nada que reproducir.
+     * grabación cortada de golpe, lo normal en este caso de uso) debe reproducirse hasta donde
+     * llegue, no fallar entero por la cola dañada. Las cabeceras sí lanzan, porque sin ellas no hay nada que reproducir.
+     *
+     * Antes solo se protegía la lectura de la cabecera de cada elemento: un `SimpleBlock` cortado
+     * a mitad de su carga lanzaba al leerla, justo en el caso que esta política existe para
+     * cubrir. Ahora cualquier dato ilegible termina el stream con un aviso; un error de E/S de
+     * verdad —que no es un archivo dañado sino un disco o un descriptor que fallan— se propaga.
      */
     private fun advance(): Boolean {
         if (eof || input.remaining <= 0 || input.position >= segmentEnd) return false
+        return try {
+            advanceUnchecked()
+        } catch (e: EbmlException) {
+            endOfReadableData(e)
+        } catch (e: EOFException) {
+            endOfReadableData(e)
+        } catch (e: IllegalArgumentException) {
+            endOfReadableData(e)
+        }
+    }
 
+    private fun endOfReadableData(cause: Exception): Boolean {
+        eof = true
+        warn("datos de Matroska ilegibles en el offset ${input.position}: fin del stream (${cause.message})")
+        return false
+    }
+
+    private fun advanceUnchecked(): Boolean {
         if (clusterEnd < 0) {
             while (true) {
                 if (input.remaining <= 0 || input.position >= segmentEnd) return false
-                val el = try { reader.readElement() } catch (_: Exception) { return false }
+                val el = reader.readElement()
                 when (el.id) {
                     MatroskaIds.CLUSTER -> {
                         clusterEnd = if (el.size >= 0) el.dataEnd else Long.MAX_VALUE
@@ -527,10 +700,10 @@ public class MkvDemuxer(
             clusterEnd = -1
             return true
         }
-        val el = try { reader.readElement() } catch (_: Exception) { eof = true; return false }
+        val el = reader.readElement()
         when (el.id) {
             MatroskaIds.CLUSTER_TIMESTAMP -> clusterTimestampTicks = reader.readUInt(el)
-            MatroskaIds.SIMPLE_BLOCK -> parseBlock(el, simple = true, keyOverride = null, blockDurationTicks = -1)
+            MatroskaIds.SIMPLE_BLOCK -> readSimpleBlock(el)
             MatroskaIds.BLOCK_GROUP -> parseBlockGroup(el)
             MatroskaIds.CLUSTER -> {
                 clusterEnd = if (el.size >= 0) el.dataEnd else Long.MAX_VALUE
@@ -549,122 +722,179 @@ public class MkvDemuxer(
         return true
     }
 
+    /**
+     * Comprueba que la carga de un bloque está entera en el archivo antes de leer nada de ella.
+     * Si no lo está, es la cola de un archivo cortado: se lanza para que [advance] cierre el
+     * stream limpiamente.
+     */
+    private fun requireBlockPayload(el: EbmlElement) {
+        if (el.size < 0 || el.size > Int.MAX_VALUE || el.dataEnd > input.length) {
+            throw EbmlException("bloque de ${el.size} bytes en ${el.dataStart} cortado o imposible")
+        }
+    }
+
+    /**
+     * Lee la cabecera de un bloque (número de pista, desfase y flags) desde la posición actual,
+     * o `null` si es imposible. La carga se lee aparte, directamente a su array definitivo: así
+     * un fotograma sin lacing —el caso normal— no se copia dos veces.
+     */
+    private fun readBlockHeader(el: EbmlElement): BlockHeader? {
+        if (el.size < 4) return null
+        val first = input.readByte()
+        if (first == 0) return null
+        var length = 1
+        var mask = 0x80
+        while (first and mask == 0) { length++; mask = mask shr 1 }
+        if (length > 8 || el.size < length + 3) return null
+        var trackNumber = (first and (mask - 1)).toLong()
+        repeat(length - 1) { trackNumber = (trackNumber shl 8) or input.readByte().toLong() }
+        val relative = input.readBits(2).toInt().toShort().toInt()
+        val flags = input.readByte()
+        if (trackNumber !in 1..Int.MAX_VALUE) return null
+        return BlockHeader(trackNumber.toInt(), relative, flags, length + 3)
+    }
+
+    /** Pista de un bloque, o `null` (con un único aviso por pista) si no está soportada. */
+    private fun trackFor(number: Int): TrackInfo? = trackMap[number] ?: run {
+        if (unsupportedWarned.add(number)) {
+            warn("se descartan los bloques de la pista $number, que no está soportada")
+        }
+        null
+    }
+
+    private fun readSimpleBlock(el: EbmlElement) {
+        requireBlockPayload(el)
+        val header = readBlockHeader(el)
+        val track = header?.let { trackFor(it.trackNumber) }
+        if (header == null || track == null) {
+            input.position = el.dataEnd
+            return
+        }
+        val payload = input.readBytes((el.size - header.size).toInt())
+        emitBlock(track, header, payload, keyOverride = null, blockDurationTicks = -1, simpleFlags = true)
+    }
+
     private fun parseBlockGroup(groupEl: EbmlElement) {
+        requireBlockPayload(groupEl)
         val group = requireSized(groupEl)
-        var blockEl: EbmlElement? = null
-        var blockData: ByteArray? = null
+        var header: BlockHeader? = null
+        var track: TrackInfo? = null
+        var payload: ByteArray? = null
         var hasReference = false
         var durationTicks = -1L
         while (input.position < group.dataEnd) {
             val el = reader.readElement()
             when (el.id) {
-                MatroskaIds.BLOCK -> { blockEl = el; blockData = reader.readBinary(el) }
+                MatroskaIds.BLOCK -> {
+                    requireBlockPayload(el)
+                    header = readBlockHeader(el)
+                    track = header?.let { trackFor(it.trackNumber) }
+                    val current = header
+                    if (current != null && track != null) {
+                        payload = input.readBytes((el.size - current.size).toInt())
+                    } else {
+                        input.position = el.dataEnd
+                    }
+                }
                 MatroskaIds.REFERENCE_BLOCK -> { reader.readSInt(el); hasReference = true }
                 MatroskaIds.BLOCK_DURATION -> durationTicks = reader.readUInt(el)
                 else -> skipOrAbort(el)
             }
         }
-        if (blockEl != null && blockData != null) {
-            parseBlockPayload(blockData, keyOverride = !hasReference, blockDurationTicks = durationTicks, simpleFlags = false)
-        }
+        val blockHeader = header ?: return
+        val blockTrack = track ?: return
+        val blockPayload = payload ?: return
+        emitBlock(blockTrack, blockHeader, blockPayload, keyOverride = !hasReference, blockDurationTicks = durationTicks, simpleFlags = false)
     }
 
-    private fun parseBlock(el: EbmlElement, simple: Boolean, keyOverride: Boolean?, blockDurationTicks: Long) {
-        val data = reader.readBinary(el)
-        parseBlockPayload(data, keyOverride, blockDurationTicks, simpleFlags = simple)
-    }
-
-    private fun parseBlockPayload(data: ByteArray, keyOverride: Boolean?, blockDurationTicks: Long, simpleFlags: Boolean) {
+    /**
+     * Separa los fotogramas de un bloque según su lacing. [payload] empieza justo después de los
+     * flags; devuelve `null` si las longitudes declaradas no cuadran con los bytes que hay.
+     */
+    private fun splitLaces(payload: ByteArray, lacing: Int): List<ByteArray>? {
         var i = 0
-        if (data.isEmpty()) return
-        val first = data[i].toInt() and 0xFF
-        if (first == 0) return
-        var len = 1
-        var mask = 0x80
-        while (first and mask == 0) { len++; mask = mask shr 1 }
-        if (len > 8 || data.size < len + 3) return
-        var trackNumber = (first and (mask - 1)).toLong()
-        repeat(len - 1) { i++; trackNumber = (trackNumber shl 8) or (data[i].toLong() and 0xFF) }
+        if (i >= payload.size) return null
+        val frameCountMinus1 = payload[i].toInt() and 0xFF
         i++
-        val relative = (((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)).toShort().toInt()
-        i += 2
-        val flags = data[i].toInt() and 0xFF
-        i++
-
-        if (trackNumber !in 1..Int.MAX_VALUE) return
-        val track = trackMap[trackNumber.toInt()] ?: run {
-            val id = trackNumber.toInt()
-            if (unsupportedWarned.add(id)) {
-                runCatching { onWarning("se descartan los bloques de la pista $id, que no está soportada") }
-            }
-            return
-        }
-
-        val keyFrame = keyOverride ?: (track is TrackInfo.Audio || (simpleFlags && (flags and 0x80) != 0))
-        val lacing = (flags shr 1) and 0x03
-
-        val frames = ArrayList<ByteArray>()
+        val sizes = IntArray(frameCountMinus1 + 1)
         when (lacing) {
-            0 -> frames.add(data.copyOfRange(i, data.size))
-            else -> {
-                if (i >= data.size) return
-                val frameCountMinus1 = data[i].toInt() and 0xFF
-                i++
-                val sizes = IntArray(frameCountMinus1 + 1)
-                when (lacing) {
-                    2 -> {
-                        val total = data.size - i
-                        val each = total / (frameCountMinus1 + 1)
-                        for (k in sizes.indices) sizes[k] = each
-                    }
-                    1 -> {
-                        for (k in 0 until frameCountMinus1) {
-                            var size = 0
-                            while (true) {
-                                if (i >= data.size) return
-                                val b = data[i].toInt() and 0xFF; i++
-                                size += b
-                                if (b != 255) break
-                            }
-                            sizes[k] = size
-                        }
-                    }
-                    3 -> {
-                        var prev = 0L
-                        for (k in 0 until frameCountMinus1) {
-                            if (i >= data.size) return
-                            val b0 = data[i].toInt() and 0xFF
-                            if (b0 == 0) return
-                            var l2 = 1
-                            var m2 = 0x80
-                            while (b0 and m2 == 0) { l2++; m2 = m2 shr 1 }
-                            if (l2 > 8 || i + l2 > data.size) return
-                            var v = (b0 and (m2 - 1)).toLong()
-                            repeat(l2 - 1) { i++; v = (v shl 8) or (data[i].toLong() and 0xFF) }
-                            i++
-                            prev = if (k == 0) v else prev + (v - ((1L shl (7 * l2 - 1)) - 1))
-                            sizes[k] = prev.toInt()
-                        }
-                    }
-                }
-                var used = 0L
+            LACING_FIXED -> {
+                val each = (payload.size - i) / (frameCountMinus1 + 1)
+                for (k in sizes.indices) sizes[k] = each
+            }
+            LACING_XIPH -> {
                 for (k in 0 until frameCountMinus1) {
-                    if (sizes[k] < 0) return
-                    used += sizes[k]
+                    var size = 0
+                    while (true) {
+                        if (i >= payload.size) return null
+                        val b = payload[i].toInt() and 0xFF; i++
+                        size += b
+                        if (b != 255) break
+                    }
+                    sizes[k] = size
                 }
-                val lastSize = data.size - i - used
-                if (lastSize < 0) return
-                sizes[frameCountMinus1] = lastSize.toInt()
-                for (k in sizes.indices) {
-                    if (i + sizes[k] > data.size) return
-                    frames.add(data.copyOfRange(i, i + sizes[k]))
-                    i += sizes[k]
+            }
+            LACING_EBML -> {
+                var prev = 0L
+                for (k in 0 until frameCountMinus1) {
+                    if (i >= payload.size) return null
+                    val b0 = payload[i].toInt() and 0xFF
+                    if (b0 == 0) return null
+                    var l2 = 1
+                    var m2 = 0x80
+                    while (b0 and m2 == 0) { l2++; m2 = m2 shr 1 }
+                    if (l2 > 8 || i + l2 > payload.size) return null
+                    var v = (b0 and (m2 - 1)).toLong()
+                    repeat(l2 - 1) { i++; v = (v shl 8) or (payload[i].toLong() and 0xFF) }
+                    i++
+                    prev = if (k == 0) v else prev + (v - ((1L shl (7 * l2 - 1)) - 1))
+                    if (prev < 0 || prev > payload.size) return null
+                    sizes[k] = prev.toInt()
                 }
             }
         }
+        var used = 0L
+        for (k in 0 until frameCountMinus1) {
+            if (sizes[k] < 0) return null
+            used += sizes[k]
+        }
+        val lastSize = payload.size - i - used
+        if (lastSize < 0) return null
+        sizes[frameCountMinus1] = lastSize.toInt()
+        val frames = ArrayList<ByteArray>(sizes.size)
+        for (k in sizes.indices) {
+            if (i + sizes[k] > payload.size) return null
+            frames.add(payload.copyOfRange(i, i + sizes[k]))
+            i += sizes[k]
+        }
+        return frames
+    }
 
-        val basePtsUs = ticksToUs(clusterTimestampTicks + relative)
-        val defaultNs = defaultDurationNs[trackNumber.toInt()] ?: 0L
+    private fun emitBlock(
+        track: TrackInfo,
+        header: BlockHeader,
+        payload: ByteArray,
+        keyOverride: Boolean?,
+        blockDurationTicks: Long,
+        simpleFlags: Boolean,
+    ) {
+        val number = header.trackNumber
+        val keyFrame = keyOverride ?: (track is TrackInfo.Audio || (simpleFlags && (header.flags and 0x80) != 0))
+        val lacing = (header.flags shr 1) and 0x03
+        val rawFrames = if (lacing == LACING_NONE) listOf(payload) else splitLaces(payload, lacing) ?: return
+
+        val encodings = contentEncodings[number]
+        val frames = if (encodings == null) rawFrames else rawFrames.mapNotNull { frame ->
+            try {
+                decode(frame, encodings, CONTENT_SCOPE_FRAMES)
+            } catch (e: Exception) {
+                warn("pista $number: se descarta un bloque cuya compresión no se pudo deshacer (${e.message})")
+                null
+            }
+        }
+
+        val basePtsUs = ticksToUs(clusterTimestampTicks + header.relative)
+        val defaultNs = defaultDurationNs[number] ?: 0L
         val explicitDurUs = if (blockDurationTicks >= 0) ticksToUs(blockDurationTicks) else 0L
         val perFrameUs = when {
             frames.size > 1 && explicitDurUs > 0 -> explicitDurUs / frames.size
@@ -675,7 +905,7 @@ public class MkvDemuxer(
             val pts = basePtsUs + k * perFrameUs
             pending.add(
                 MediaPacket(
-                    trackId = trackNumber.toInt(),
+                    trackId = number,
                     data = frame,
                     ptsUs = pts,
                     dtsUs = pts,
@@ -686,11 +916,15 @@ public class MkvDemuxer(
         }
     }
 
+    /**
+     * Las cues se ordenan por tiempo al abrir, así que el último punto en o antes de
+     * [timestampUs] se encuentra por bisección en vez de recorrer el índice entero.
+     */
     override fun seekTo(timestampUs: Long): Long {
         pending.clear()
         eof = false
         clusterEnd = -1
-        val cue = cues.lastOrNull { it.timeUs <= timestampUs } ?: cues.firstOrNull()
+        val cue = lastCueAtOrBefore(timestampUs) ?: cues.firstOrNull()
         if (cue != null) {
             input.position = segmentDataStart + cue.clusterPosition
             return cue.timeUs
@@ -702,6 +936,16 @@ public class MkvDemuxer(
         val (pos, timeUs) = scanForCluster(timestampUs)
         input.position = pos
         return timeUs
+    }
+
+    private fun lastCueAtOrBefore(timestampUs: Long): Cue? {
+        var low = 0
+        var high = cues.size
+        while (low < high) {
+            val mid = (low + high) ushr 1
+            if (cues[mid].timeUs <= timestampUs) low = mid + 1 else high = mid
+        }
+        return if (low > 0) cues[low - 1] else null
     }
 
     /**
@@ -763,5 +1007,27 @@ public class MkvDemuxer(
          * fuera cualquier campo corrupto.
          */
         private const val MAX_SAMPLE_RATE_HZ = 768_000.0
+
+        private const val LACING_NONE = 0
+        private const val LACING_XIPH = 1
+        private const val LACING_FIXED = 2
+        private const val LACING_EBML = 3
+
+        /** `ContentEncodingScope`: bit 1 = fotogramas, bit 2 = `CodecPrivate`. */
+        private const val CONTENT_SCOPE_FRAMES = 1L
+        private const val CONTENT_SCOPE_PRIVATE = 2L
+
+        /** `ContentEncodingType`: 0 = compresión, 1 = cifrado. */
+        private const val CONTENT_TYPE_COMPRESSION = 0L
+        private const val CONTENT_TYPE_ENCRYPTION = 1L
+
+        /** `ContentCompAlgo`: 0 = zlib, 3 = eliminación de cabecera. bzlib (1) y lzo (2) no. */
+        private const val CONTENT_ALGO_ZLIB = 0L
+        private const val CONTENT_ALGO_HEADER_STRIPPING = 3L
+
+        private const val INFLATE_CHUNK_BYTES = 1 shl 16
+
+        /** Techo de un fotograma descomprimido: muy por encima de cualquier fotograma real. */
+        private const val MAX_INFLATED_BYTES = 64 * 1024 * 1024
     }
 }

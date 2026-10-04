@@ -39,9 +39,14 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
      */
     public constructor(fd: FileDescriptor) : this(FileInputStream(fd).channel)
 
-    public val length: Long = channel.size()
+    public val length: Long = try {
+        channel.size()
+    } catch (t: Throwable) {
+        runCatching { channel.close() }
+        throw t
+    }
 
-    private val buffer = ByteArray(1 shl 16)
+    private val buffer = ByteArray(BUFFER_SIZE)
     private var bufferStart = 0L
     private var bufferLen = 0
     private var pos = 0L
@@ -55,8 +60,10 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
 
     public val remaining: Long get() = length - pos
 
+    private fun isBuffered(at: Long): Boolean = at >= bufferStart && at < bufferStart + bufferLen
+
     private fun fill(at: Long): Int {
-        if (at >= bufferStart && at < bufferStart + bufferLen) return (at - bufferStart).toInt()
+        if (isBuffered(at)) return (at - bufferStart).toInt()
         bufferStart = at
         bufferLen = 0
         val n = channel.read(ByteBuffer.wrap(buffer), at)
@@ -71,11 +78,25 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
         return buffer[idx].toInt() and 0xFF
     }
 
+    /**
+     * Las lecturas de al menos un buffer completo van **directas del canal al destino**, sin
+     * pasar por el buffer interno: una muestra de vídeo de cientos de KB se copiaba antes dos
+     * veces, una al buffer y otra al array del paquete, y en el móvil esa segunda copia es
+     * memoria y batería que no aportan nada.
+     */
     public fun readFully(dst: ByteArray, offset: Int = 0, length: Int = dst.size - offset) {
         var done = 0
         while (done < length) {
+            val pending = length - done
+            if (pending >= buffer.size && !isBuffered(pos)) {
+                val n = channel.read(ByteBuffer.wrap(dst, offset + done, pending), pos)
+                if (n <= 0) throw EOFException("fin de archivo en $pos")
+                done += n
+                pos += n
+                continue
+            }
             val idx = fill(pos)
-            val n = minOf(length - done, bufferLen - idx)
+            val n = minOf(pending, bufferLen - idx)
             System.arraycopy(buffer, idx, dst, offset + done, n)
             done += n
             pos += n
@@ -91,6 +112,15 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
 
     /** Lee [count] bytes big-endian como valor sin signo (count <= 8). */
     public fun readBits(count: Int): Long {
+        require(count in 0..8) { "solo se pueden leer de 0 a 8 bytes como entero: $count" }
+        if (count == 0) return 0L
+        val idx = fill(pos)
+        if (bufferLen - idx >= count) {
+            var v = 0L
+            for (k in 0 until count) v = (v shl 8) or (buffer[idx + k].toLong() and 0xFF)
+            pos += count
+            return v
+        }
         var v = 0L
         repeat(count) { v = (v shl 8) or readByte().toLong() }
         return v
@@ -105,4 +135,8 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
     }
 
     override fun close(): Unit = channel.close()
+
+    private companion object {
+        private const val BUFFER_SIZE = 1 shl 16
+    }
 }

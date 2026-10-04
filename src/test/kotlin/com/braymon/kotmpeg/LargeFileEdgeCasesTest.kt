@@ -9,13 +9,13 @@ import com.braymon.kotmpeg.model.HdrStaticInfo
 import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.model.VideoCodec
-import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -57,23 +57,11 @@ class LargeFileEdgeCasesTest {
     }
 
     /**
-     * Cuenta los descriptores abiertos que apuntan a [file]. Solo Linux (`/proc`); en el
-     * resto el test se salta, que es preferible a dar por bueno lo que no se ha medido.
-     *
-     * En Windows este mismo fallo se manifestaba como un error al borrar el directorio
-     * temporal; en Linux el borrado funciona igual con el archivo abierto, así que la fuga
-     * pasaba desapercibida y hacía falta mirar los descriptores directamente.
+     * Este test y el siguiente miden la fuga con [OpenFiles]. En Windows este mismo fallo se
+     * manifestaba como un error al borrar el directorio temporal; en Linux el borrado funciona
+     * igual con el archivo abierto, así que la fuga pasaba desapercibida y hacía falta mirar los
+     * descriptores directamente.
      */
-    private fun openDescriptorsFor(file: File): Int {
-        val fdDir = File("/proc/self/fd")
-        assumeTrue(fdDir.isDirectory, "solo medible en Linux")
-        System.gc()
-        val target = file.canonicalPath
-        return fdDir.listFiles().orEmpty().count { fd ->
-            runCatching { fd.canonicalPath }.getOrNull() == target
-        }
-    }
-
     @Test
     fun `concat closes the output file when the segments turn out to be incompatible`() {
         val a = writeVideo(File(dir, "a.mkv"))
@@ -82,7 +70,7 @@ class LargeFileEdgeCasesTest {
 
         val result = runCatching { MkvKotlin.concat(listOf(a, b), out) }
         assertTrue(result.isFailure, "un desajuste de dimensiones debe rechazarse")
-        assertEquals(0, openDescriptorsFor(out), "el muxer de salida quedó abierto tras fallar")
+        assertFalse(OpenFiles.isOpen(out), "el muxer de salida quedó abierto tras fallar")
     }
 
     @Test
@@ -92,7 +80,7 @@ class LargeFileEdgeCasesTest {
 
         val result = runCatching { MkvKotlin.remux(input, out, trackFilter = { false }) }
         assertTrue(result.isFailure, "sin pistas seleccionadas el remux debe fallar")
-        assertEquals(0, openDescriptorsFor(out), "el muxer de salida quedó abierto tras fallar")
+        assertFalse(OpenFiles.isOpen(out), "el muxer de salida quedó abierto tras fallar")
     }
 
     private fun ebmlHeaderOf(file: File): ByteArray = file.readBytes()

@@ -331,4 +331,72 @@ class FfmpegIntegrationTest {
         assertEquals("240", fields[1])
         assertDecodesCleanly(out)
     }
+
+    /** `start_time` de cada stream según ffprobe, por tipo (`video`, `audio`). */
+    private fun streamStartTimes(f: File): Map<String, Double> {
+        val (out, code) = run(
+            "ffprobe", "-v", "error", "-show_entries", "stream=codec_type,start_time",
+            "-of", "csv=p=0", f.absolutePath,
+        )
+        assertEquals(0, code, "ffprobe failed: $out")
+        return out.trim().lines().filter { it.isNotBlank() }.associate { line ->
+            val (type, start) = line.split(",")
+            type to start.toDouble()
+        }
+    }
+
+    /**
+     * Real encoders reach the muxer out of capture order: the screen is captured from t=0 and the
+     * microphone from +64 ms, but video arrives with 150 ms of latency and audio with 20 ms, so the
+     * first packet written is audio. MKV and fMP4 used to anchor the timeline on that first
+     * packet: the MKV left the opening keyframe with a negative timestamp (no time for ffprobe,
+     * non-monotonic DTS on decode) and the fMP4 played the audio 64 ms early. Every container
+     * must now report what the plain MP4 always did: video at 0, audio at +0.064.
+     */
+    @Test
+    fun `tracks reaching the muxer out of capture order keep their offset in every container`() {
+        assumeTrue(available, "ffmpeg not installed")
+        val src = makeReference(
+            "order-src.mp4",
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "libx264", "-bf", "0", "-g", "30",
+            "-c:a", "aac",
+        )
+        val uptimeUs = 3L * 24 * 3600 * 1_000_000
+        class Arrival(val atUs: Long, val trackId: Int, val packet: MediaPacket)
+        val arrivals = ArrayList<Arrival>()
+        val sourceTracks = MkvKotlin.openDemuxer(src).use { demux ->
+            val videoId = demux.tracks.first { it is TrackInfo.Video }.id
+            while (true) {
+                val p = demux.readPacket() ?: break
+                val isVideo = p.trackId == videoId
+                if (!isVideo && p.ptsUs < 50_000) continue
+                val latencyUs = if (isVideo) 150_000L else 20_000L
+                arrivals += Arrival(
+                    p.ptsUs + latencyUs, p.trackId,
+                    MediaPacket(p.trackId, p.data, p.ptsUs + uptimeUs, isKeyFrame = isVideo && p.isKeyFrame),
+                )
+            }
+            demux.tracks
+        }
+        arrivals.sortBy { it.atUs }
+        assertTrue(sourceTracks.first { it.id == arrivals.first().trackId } is TrackInfo.Audio, "scenario must start with audio")
+
+        for ((name, fragmented) in listOf("order.mkv" to false, "order.mp4" to false, "order-frag.mp4" to true)) {
+            val out = File(dir, name)
+            val muxer = MkvKotlin.synchronizedMuxer(MkvKotlin.createMuxer(out, mp4Fragmented = fragmented))
+            val ids = sourceTracks.associate { it.id to muxer.addTrack(it) }
+            muxer.start()
+            for (a in arrivals) {
+                val p = a.packet
+                muxer.writePacket(MediaPacket(ids.getValue(a.trackId), p.data, p.ptsUs, isKeyFrame = p.isKeyFrame))
+            }
+            muxer.stop()
+
+            val starts = streamStartTimes(out)
+            assertEquals(0.0, starts.getValue("video"), 0.002, "$name: video start ${starts["video"]}")
+            assertEquals(0.064, starts.getValue("audio"), 0.002, "$name: audio start ${starts["audio"]}")
+            assertDecodesCleanly(out)
+        }
+    }
 }

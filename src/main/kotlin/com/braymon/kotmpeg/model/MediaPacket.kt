@@ -14,6 +14,13 @@ package com.braymon.kotmpeg.model
  *                    automáticamente en ese caso.
  * @param isKeyFrame  True para muestras IDR/sync y para todo paquete de audio.
  * @param durationUs  Duración del paquete en microsegundos, 0 si se desconoce.
+ *
+ * **[data] se puede reutilizar en cuanto `Muxer.writePacket` vuelve.** Ningún muxer guarda una
+ * referencia al array: `Mp4Muxer` lo escribe en el momento, y cuando un muxer tiene que retener
+ * muestras —`FragmentedMp4Muxer` hasta cerrar cada fragmento, `MkvMuxer` y `FragmentedMp4Muxer` al
+ * arrancar, hasta que todas las pistas han entregado su primer paquete— se queda con una copia.
+ * Así una app puede copiar la salida de `MediaCodec` siempre al mismo buffer sin corromper el
+ * archivo.
  */
 public class MediaPacket(
     public val trackId: Int,

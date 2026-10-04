@@ -4,7 +4,7 @@
 
 | Versión | Soporte |
 |---|---|
-| `2.x` | ✅ |
+| `3.x` | ✅ |
 
 Se da soporte a la última versión publicada de la serie mayor en curso.
 
@@ -27,11 +27,16 @@ Interesa sobre todo cualquier archivo MKV o MP4 —manipulado o simplemente corr
   entradas con unos pocos bytes);
 - un bucle que no termina o un tiempo de apertura desproporcionado;
 - una lectura fuera de los límites del archivo;
-- una excepción no tipada donde debería haber un fin de stream limpio.
+- una excepción no tipada donde debería haber un fin de stream limpio;
+- un bloque comprimido de Matroska que descomprima de forma desproporcionada (el techo es de
+  64 MiB por fotograma).
 
 La política declarada es que un archivo dañado produzca **un error claro o un fin de stream**, nunca
-un cuelgue ni un consumo sin control. Hay tres suites dedicadas a esto —`RobustnessTest`,
-`UntrustedTableSizesTest` y `LargeFileEdgeCasesTest`—; un caso que las burle es un reporte útil.
+un cuelgue ni un consumo sin control. Hay cuatro suites dedicadas a esto —`RobustnessTest`,
+`UntrustedTableSizesTest`, `LargeFileEdgeCasesTest` y `Mp4HeaderHardeningTest`—, y
+`MatroskaContentEncodingTest` cubre los bloques comprimidos de Matroska: dañados, con una
+codificación que no se soporta o que pasan del techo de descompresión; un caso que las burle es un
+reporte útil.
 
 ## Qué no lo es
 

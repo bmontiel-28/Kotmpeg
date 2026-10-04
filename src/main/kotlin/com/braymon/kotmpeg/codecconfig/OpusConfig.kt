@@ -62,16 +62,22 @@ public object OpusConfig {
         return buf.array()
     }
 
+    /**
+     * Lee los campos con accesos **absolutos** (`getShort(10)`) y no moviendo la posición del
+     * buffer. Compilado contra JDK 9 o posterior, `buf.position(9)` enlaza con
+     * `ByteBuffer.position(int): ByteBuffer`, una sobrecarga covariante que no existe en
+     * Android al menos hasta la API 30 (comprobado contra sus firmas): en esos móviles la
+     * llamada fallaba con `NoSuchMethodError` al abrir cualquier pista Opus.
+     */
     public fun parseOpusHead(head: ByteArray): Parsed {
         require(head.size >= 19 && head.copyOfRange(0, 8).contentEquals(MAGIC)) { "no es una cabecera OpusHead" }
         val buf = ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN)
-        buf.position(9)
-        val channels = buf.get().toInt() and 0xFF
+        val channels = buf.get(9).toInt() and 0xFF
         require(channels in 1..255) { "OpusHead con 0 canales" }
-        val preSkip = buf.short.toInt() and 0xFFFF
-        val rate = buf.int
-        val gain = buf.short.toInt()
-        val family = buf.get().toInt() and 0xFF
+        val preSkip = buf.getShort(10).toInt() and 0xFFFF
+        val rate = buf.getInt(12)
+        val gain = buf.getShort(16).toInt()
+        val family = buf.get(18).toInt() and 0xFF
         require(!(family == 0 && channels > 2)) {
             "OpusHead inválida: familia de mapeo 0 solo admite 1-2 canales, declara $channels"
         }

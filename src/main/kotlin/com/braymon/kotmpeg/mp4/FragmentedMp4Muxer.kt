@@ -1,8 +1,10 @@
 package com.braymon.kotmpeg.mp4
 
 import com.braymon.kotmpeg.Muxer
+import com.braymon.kotmpeg.TimelineGate
 import com.braymon.kotmpeg.io.SeekableOutput
 import com.braymon.kotmpeg.model.MediaPacket
+import com.braymon.kotmpeg.model.Timestamps
 import com.braymon.kotmpeg.model.TrackInfo
 import java.io.File
 
@@ -12,8 +14,9 @@ import java.io.File
  *
  * Estructura: `ftyp` + `moov` vacío (con `mvex`/`trex`) seguido de pares `moof`+`mdat`, un
  * fragmento por GOP de vídeo (o por [fragmentDurationUs] cuando no hay vídeo), y un índice
- * de acceso aleatorio `mfra` final. Cada byte se escribe estrictamente en modo añadir —
- * nunca se retrocede — que es lo que hace que la salida sea:
+ * de acceso aleatorio `mfra` final. Los datos se escriben estrictamente en modo añadir —lo único
+ * que se reescribe, al cerrar, son los campos de duración de la cabecera—, que es lo que hace que
+ * la salida sea:
  *
  *  - **a prueba de cortes**: si el proceso muere a mitad de grabación, todo hasta el
  *    último fragmento completo es reproducible (un MP4 plano con el `moov` al final pierde
@@ -24,6 +27,15 @@ import java.io.File
  * Los B-frames se soportan con offsets de composición firmados de `trun` versión 1; los
  * tiempos se derivan por fragmento con el mismo esquema de PTS ordenados que [Mp4Muxer],
  * con tiempos de decodificación acumulados sin deriva entre fragmentos (`tfdt`).
+ *
+ * **Memoria**: las muestras de un fragmento se retienen hasta cerrarlo, porque el `moof` que las
+ * describe va delante de ellas. [maxFragmentDurationUs] y [maxFragmentBytes] acotan esa retención;
+ * en un móvil con poca RAM conviene bajar el segundo (16 o 32 MB) con el constructor de cuatro
+ * parámetros o con `MkvKotlin.createFragmentedMp4Muxer`.
+ *
+ * **Origen**: la línea de tiempo empieza en el paquete más temprano de todas las pistas, como en
+ * [Mp4Muxer]. Como aquí se escribe en vivo, los primeros paquetes esperan a que cada pista haya
+ * entregado el suyo (ver `TimelineGate`), con los mismos dos límites de memoria.
  */
 public class FragmentedMp4Muxer(
     private val out: SeekableOutput,
@@ -40,7 +52,23 @@ public class FragmentedMp4Muxer(
 ) : Muxer {
 
     public constructor(file: File, fragmentDurationUs: Long = 2_000_000) :
-        this(SeekableOutput(file), fragmentDurationUs)
+        this(openValidated(file, fragmentDurationUs, 10_000_000, 64L * 1024 * 1024), fragmentDurationUs)
+
+    /**
+     * Igual que el constructor con [File], pero con los dos límites de retención a la vista: es la
+     * forma de bajar [maxFragmentBytes] en un dispositivo con poca memoria. Sin valores por
+     * defecto a propósito, para no competir en la resolución de sobrecargas con el de dos
+     * parámetros, que ya existía.
+     */
+    public constructor(file: File, fragmentDurationUs: Long, maxFragmentDurationUs: Long, maxFragmentBytes: Long) :
+        this(
+            openValidated(file, fragmentDurationUs, maxFragmentDurationUs, maxFragmentBytes),
+            fragmentDurationUs, maxFragmentDurationUs, maxFragmentBytes,
+        )
+
+    init {
+        requireValidLimits(fragmentDurationUs, maxFragmentDurationUs, maxFragmentBytes)
+    }
 
     /**
      * Fecha de creación que se escribe en `mvhd`, `tkhd` y `mdhd`, en milisegundos desde la época
@@ -63,6 +91,21 @@ public class FragmentedMp4Muxer(
         /** Flags de `tkhd`: `track_enabled` (0x1) y `track_in_movie` (0x2). */
         const val TKHD_ENABLED_IN_MOVIE = 3
         const val TKHD_IN_MOVIE_ONLY = 2
+
+        fun requireValidLimits(fragmentDurationUs: Long, maxFragmentDurationUs: Long, maxFragmentBytes: Long) {
+            require(fragmentDurationUs > 0) { "fragmentDurationUs debe ser positivo: $fragmentDurationUs" }
+            require(maxFragmentDurationUs > 0) { "maxFragmentDurationUs debe ser positivo: $maxFragmentDurationUs" }
+            require(maxFragmentBytes > 0) { "maxFragmentBytes debe ser positivo: $maxFragmentBytes" }
+        }
+
+        /**
+         * Valida **antes** de abrir: si el `require` del `init` fallara con el archivo ya abierto, el
+         * descriptor quedaría huérfano, porque nadie tendría el objeto para cerrarlo.
+         */
+        fun openValidated(file: File, fragmentDurationUs: Long, maxFragmentDurationUs: Long, maxFragmentBytes: Long): SeekableOutput {
+            requireValidLimits(fragmentDurationUs, maxFragmentDurationUs, maxFragmentBytes)
+            return SeekableOutput(file)
+        }
     }
 
     /** La fecha en la escala de MP4, o 0 si no hay ninguna que escribir. */
@@ -70,7 +113,7 @@ public class FragmentedMp4Muxer(
         creationTimeMillis?.let { (Math.floorDiv(it, 1000L) + MP4_EPOCH_OFFSET_S).coerceAtLeast(0L) } ?: 0L
 
     /** Microsegundos a ticks de la escala del `mvhd`, redondeando. */
-    private fun toMovieTicks(us: Long): Long = Math.floorDiv(us * MOVIE_TIMESCALE + 500_000, 1_000_000)
+    private fun toMovieTicks(us: Long): Long = Timestamps.rescaleRounded(us, MOVIE_TIMESCALE, 1_000_000)
 
     /** Cebado declarado por la pista, en µs; 0 si no es audio o no lo declara. */
     private fun primingUs(t: TrackState): Long {
@@ -85,7 +128,7 @@ public class FragmentedMp4Muxer(
     private fun primingTicks(t: TrackState): Long {
         val us = primingUs(t)
         if (us <= 0) return 0L
-        return Math.floorDiv(us * t.timescale + 500_000, 1_000_000)
+        return Timestamps.rescaleRounded(us, t.timescale, 1_000_000)
     }
 
     private class PendingSample(
@@ -106,7 +149,7 @@ public class FragmentedMp4Muxer(
         var decodeCumUs = 0L
         var lastDurationUs = 0L
 
-        fun toTicks(us: Long): Long = Math.floorDiv(us * timescale + 500_000, 1_000_000)
+        fun toTicks(us: Long): Long = Timestamps.rescaleRounded(us, timescale, 1_000_000)
     }
 
     /**
@@ -131,7 +174,15 @@ public class FragmentedMp4Muxer(
     private var started = false
     private var stopped = false
     private var sequenceNumber = 1L
-    private var baseUs = Long.MIN_VALUE
+
+    /**
+     * Origen de la línea de tiempo en µs: el paquete más temprano de todas las pistas. Se fija
+     * cuando [gate] lo permite, con el primer paquete de cada pista entregado o al agotar la espera.
+     */
+    private var baseUs = 0L
+
+    /** Retención de arranque; `null` en cuanto el origen está fijado. */
+    private var gate: TimelineGate? = null
     private var fragmentStartUs = 0L
     private var fragmentHasSamples = false
     private var fragmentBytes = 0L
@@ -164,6 +215,7 @@ public class FragmentedMp4Muxer(
         started = true
         hasVideo = tracks.any { it.info is TrackInfo.Video }
         cueTrackIndex = tracks.indexOfFirst { it.info is TrackInfo.Video }.let { if (it < 0) 0 else it }
+        gate = TimelineGate(tracks.size, maxFragmentDurationUs, maxFragmentBytes)
 
         val header = BoxBuilder()
         header.box("ftyp") {
@@ -178,29 +230,61 @@ public class FragmentedMp4Muxer(
         out.flush()
     }
 
+    /**
+     * El audio se marca siempre como muestra de sincronización, igual que en [Mp4Muxer]: con
+     * `isKeyFrame = false` —el valor por defecto de `MediaPacket`— cada paquete de AAC u Opus
+     * salía con el bit `sample_is_non_sync_sample` puesto y el fragmento entero quedaba sin un
+     * solo punto de acceso para el reproductor.
+     *
+     * **Los datos del paquete se copian al recibirlos.** Este es el único muxer que no los escribe
+     * en el momento —los retiene hasta cerrar el fragmento—, y antes guardaba una referencia al
+     * array de quien llama. Una app que reutiliza su buffer entre paquetes, algo habitual al copiar
+     * la salida de `MediaCodec`, acababa con todas las muestras del fragmento iguales a la última:
+     * 49 de 50 paquetes dañados en la prueba, sin ningún error. La copia cuesta una por paquete y
+     * su memoria la acota [maxFragmentBytes].
+     *
+     * Hasta que todas las pistas han entregado su primer paquete, los paquetes esperan en una
+     * retención de arranque acotada por los mismos dos límites: el origen de la línea de tiempo
+     * tiene que ser el paquete más temprano, y el primero que llega no siempre lo es. Antes se
+     * tomaba el primero, y cuando el vídeo llegaba más tarde que el audio aunque se hubiera
+     * capturado antes, el audio quedaba adelantado en el archivo.
+     */
     override fun writePacket(packet: MediaPacket) {
         check(started) { "start() no llamado" }
         check(!stopped) { "muxer ya detenido" }
         val track = tracks.getOrNull(packet.trackId - 1)
             ?: throw IllegalArgumentException("pista desconocida ${packet.trackId}")
-
-        if (baseUs == Long.MIN_VALUE) {
-            baseUs = packet.ptsUs
-            fragmentStartUs = 0
+        val waiting = gate
+        if (waiting != null) {
+            if (waiting.hold(packet, packet.trackId - 1)) openTimeline(waiting)
+            return
         }
+        append(track, packet, packet.data.copyOf())
+    }
+
+    /** Fija el origen en el paquete retenido más temprano y pasa lo retenido a los fragmentos. */
+    private fun openTimeline(waiting: TimelineGate) {
+        gate = null
+        baseUs = waiting.earliestPtsUs ?: 0L
+        for (held in waiting.release()) append(tracks[held.trackId - 1], held, held.data)
+    }
+
+    /** Añade una muestra al fragmento en curso. [data] ya es propiedad del muxer: no se copia aquí. */
+    private fun append(track: TrackState, packet: MediaPacket, data: ByteArray) {
         val pts = packet.ptsUs - baseUs
 
         val cutOnKeyFrame = hasVideo && track.info is TrackInfo.Video && packet.isKeyFrame
         val cutOnDuration = !hasVideo && pts - fragmentStartUs >= fragmentDurationUs
         val cutOnLimit = pts - fragmentStartUs >= maxFragmentDurationUs || fragmentBytes >= maxFragmentBytes
         if (fragmentHasSamples && (cutOnKeyFrame || cutOnDuration || cutOnLimit)) {
-            flushFragment()
+            flushFragment(nextTrack = track, nextPtsUs = pts)
             fragmentStartUs = pts
         }
 
-        track.pending.add(PendingSample(packet.data, pts, packet.isKeyFrame, packet.durationUs))
+        val key = packet.isKeyFrame || track.info is TrackInfo.Audio
+        track.pending.add(PendingSample(data, pts, key, packet.durationUs))
         fragmentHasSamples = true
-        fragmentBytes += packet.data.size
+        fragmentBytes += data.size
     }
 
     override fun stop() {
@@ -211,6 +295,7 @@ public class FragmentedMp4Muxer(
             return
         }
         try {
+            gate?.let { openTimeline(it) }
             if (fragmentHasSamples) flushFragment()
             writeMfra()
             patchDurations()
@@ -234,7 +319,18 @@ public class FragmentedMp4Muxer(
         val firstKeySampleNumber: Long?,
     )
 
-    private fun prepareTrackFragment(track: TrackState): TrackFragment? {
+    /**
+     * Prepara las muestras retenidas de [track] para el fragmento que se cierra.
+     *
+     * La duración de la última muestra es lo único que no se deduce de los PTS del propio
+     * fragmento. Si el corte lo provoca un paquete de **esta misma pista** —el keyframe que abre el
+     * GOP siguiente, que es el caso normal—, [nextPtsUs] es su PTS y la duración sale exacta. Antes
+     * se estimaba siempre con el intervalo anterior, y con vídeo de frecuencia variable —una
+     * captura de pantalla solo emite fotogramas cuando algo cambia— una pausa de dos segundos se
+     * contaba como 16 ms: el tiempo de decodificación de los fragmentos siguientes quedaba casi dos
+     * segundos por detrás del de presentación, y el desfase se acumulaba pausa a pausa.
+     */
+    private fun prepareTrackFragment(track: TrackState, nextPtsUs: Long?): TrackFragment? {
         val samples = track.pending
         if (samples.isEmpty()) return null
         val n = samples.size
@@ -243,14 +339,21 @@ public class FragmentedMp4Muxer(
         val durationsUs = LongArray(n)
         for (i in 0 until n - 1) durationsUs[i] = sorted[i + 1] - sorted[i]
         val last = samples[n - 1]
+        val nextDelta = nextPtsUs?.let { it - sorted[n - 1] }?.takeIf { it > 0 }
         durationsUs[n - 1] = when {
             last.durationUs > 0 -> last.durationUs
+            nextDelta != null -> nextDelta
             n > 1 -> sorted[n - 1] - sorted[n - 2]
             track.lastDurationUs > 0 -> track.lastDurationUs
             track.info is TrackInfo.Audio -> 1024L * 1_000_000 / (track.info as TrackInfo.Audio).sampleRate
             else -> 33_333L
         }
-        track.lastDurationUs = durationsUs[n - 1]
+        track.lastDurationUs = when {
+            last.durationUs > 0 || nextDelta == null -> durationsUs[n - 1]
+            n > 1 -> sorted[n - 1] - sorted[n - 2]
+            track.lastDurationUs > 0 -> track.lastDurationUs
+            else -> nextDelta
+        }
 
         val baseDecodeTicks = track.toTicks(track.decodeCumUs)
         val durationsTicks = LongArray(n)
@@ -284,8 +387,8 @@ public class FragmentedMp4Muxer(
         return fragment
     }
 
-    private fun flushFragment() {
-        val fragments = tracks.mapNotNull { prepareTrackFragment(it) }
+    private fun flushFragment(nextTrack: TrackState? = null, nextPtsUs: Long = 0) {
+        val fragments = tracks.mapNotNull { prepareTrackFragment(it, if (it === nextTrack) nextPtsUs else null) }
         if (fragments.isEmpty()) {
             fragmentHasSamples = false
             return
@@ -296,9 +399,7 @@ public class FragmentedMp4Muxer(
         val useLargeSize = totalData + 8 > 0xFFFFFFFFL
         val mdatHeaderSize = if (useLargeSize) 16 else 8
 
-        val moofSize = buildMoof(fragments, dataOffsetsKnown = false, moofSize = 0, mdatHeaderSize).size
-        val moof = buildMoof(fragments, dataOffsetsKnown = true, moofSize = moofSize, mdatHeaderSize)
-        out.write(moof)
+        out.write(buildMoof(fragments, mdatHeaderSize))
 
         if (useLargeSize) {
             out.writeInt32(1)
@@ -333,18 +434,19 @@ public class FragmentedMp4Muxer(
         fragmentBytes = 0
     }
 
-    private fun buildMoof(
-        fragments: List<TrackFragment>,
-        dataOffsetsKnown: Boolean,
-        moofSize: Int,
-        mdatHeaderSize: Int,
-    ): ByteArray {
+    /**
+     * Construye el `moof` en una sola pasada. El `data_offset` de cada `trun` depende del tamaño
+     * del propio `moof`, que no se conoce hasta terminarlo: se reserva a cero, se apunta dónde
+     * quedó y se rellena al final, en vez de construir la caja entera dos veces.
+     */
+    private fun buildMoof(fragments: List<TrackFragment>, mdatHeaderSize: Int): ByteArray {
         val dataStart = LongArray(fragments.size)
         var running = 0L
         for ((i, fragment) in fragments.withIndex()) {
             dataStart[i] = running
             running += fragment.data.sumOf { it.size.toLong() }
         }
+        val dataOffsetPositions = IntArray(fragments.size)
 
         val builder = BoxBuilder()
         builder.box("moof") {
@@ -356,8 +458,8 @@ public class FragmentedMp4Muxer(
                     fullBox("trun", 1, 0x000F01) {
                         val n = fragment.sizes.size
                         u32(n)
-                        val offset = if (dataOffsetsKnown) moofSize + mdatHeaderSize + dataStart[i] else 0L
-                        u32(offset)
+                        dataOffsetPositions[i] = size
+                        u32(0)                       // data_offset, se rellena al cerrar el moof
                         for (s in 0 until n) {
                             u32(fragment.durationsTicks[s])
                             u32(fragment.sizes[s])
@@ -367,6 +469,10 @@ public class FragmentedMp4Muxer(
                     }
                 }
             }
+        }
+        val moofSize = builder.size.toLong()
+        for (i in fragments.indices) {
+            builder.patchU32(dataOffsetPositions[i], moofSize + mdatHeaderSize + dataStart[i])
         }
         return builder.toByteArray()
     }
@@ -544,7 +650,8 @@ public class FragmentedMp4Muxer(
                     u32(created); u32(created)       // tiempos de creación/modificación
                     u32(t.timescale)
                     u32(0)                           // duración desconocida (en vivo)
-                    u16(0x55C4); u16(0)
+                    u16(SampleEntries.packLanguage(info.language)) // idioma ISO 639-2/T
+                    u16(0)
                 }
                 fullBox("hdlr", 0, 0) {
                     u32(0)
@@ -621,7 +728,6 @@ public class FragmentedMp4Muxer(
         }
     }
 
-    /** Índice de acceso aleatorio: permite buscar sin escanear todos los moof. */
     /**
      * Escribe el índice de acceso aleatorio (`mfra`/`tfra`/`mfro`).
      *

@@ -11,13 +11,13 @@ import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.model.VideoCodec
 import com.braymon.kotmpeg.mp4.Mp4Demuxer
-import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
 import java.io.RandomAccessFile
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -299,34 +299,20 @@ class HdrBoxAndDescriptorIoTest {
      * Una entrada que no es ni MKV ni MP4 se cierra antes de lanzar: quien pasa un
      * `SeekableInput` ya no tiene otra referencia con la que recuperar el descriptor.
      *
-     * Se cuentan descriptores en `/proc/self/fd` y no se intenta leer de la entrada
+     * Se mide si el archivo sigue abierto ([OpenFiles]) y no se intenta leer de la entrada
      * cerrada: `SeekableInput` tiene 64 KiB de buffer, así que un archivo pequeño ya está
      * entero en memoria tras la detección y la lectura respondería sin tocar el canal.
      */
     @Test
     fun `an unrecognised descriptor input is closed before throwing`() {
         val file = File(dir, "junk.bin").also { it.writeBytes(ByteArray(64) { 0x5A }) }
-        val before = openDescriptorsFor(file)
+        assertFalse(OpenFiles.isOpen(file), "el archivo ya estaba abierto antes de empezar")
 
         val input = SeekableInput(file)
-        assertEquals(before + 1, openDescriptorsFor(file), "no llegó a abrirse el archivo")
+        assertTrue(OpenFiles.isOpen(file), "no llegó a abrirse el archivo")
         assertFailsWith<IllegalArgumentException> { MkvKotlin.openDemuxer(input) }
 
-        assertEquals(
-            before, openDescriptorsFor(file),
-            "openDemuxer dejó el descriptor abierto al no reconocer el contenedor",
-        )
-    }
-
-    /** Cuenta descriptores abiertos sobre [file]; solo medible en Linux. */
-    private fun openDescriptorsFor(file: File): Int {
-        val fdDir = File("/proc/self/fd")
-        assumeTrue(fdDir.isDirectory, "solo medible en Linux")
-        System.gc()
-        val target = file.canonicalPath
-        return fdDir.listFiles().orEmpty().count { fd ->
-            runCatching { fd.canonicalPath }.getOrNull() == target
-        }
+        assertFalse(OpenFiles.isOpen(file), "openDemuxer dejó el descriptor abierto al no reconocer el contenedor")
     }
 
     /** Un archivo demasiado corto para tener cabecera no se confunde con ningún formato. */

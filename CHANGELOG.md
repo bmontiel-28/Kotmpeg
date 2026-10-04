@@ -20,7 +20,7 @@ cambio, sino **qué tienes que hacer tú**:
 |---|---|---|
 | El **parche** | `2.0.0` → `2.0.1` | Se corrigió algo. Actualiza y ya está: no hay nada nuevo que aprender ni nada que tocar. |
 | La **menor** | `2.0.0` → `2.1.0` | Hay algo nuevo que **puedes** usar si quieres. Lo que ya tenías escrito sigue funcionando igual. |
-| La **mayor** | `1.1.0` → `2.0.0` | Algo que antes funcionaba **deja de funcionar solo**. Lee la sección `Cambios incompatibles` antes de actualizar. |
+| La **mayor** | `1.1.0` → `2.0.0` | Algo que antes funcionaba **deja de funcionar igual**: por una firma que cambió o por un comportamiento que se corrigió. Lee la sección `Cambios incompatibles` antes de actualizar. |
 
 ### Qué quiere decir «Cambios incompatibles»
 
@@ -42,6 +42,18 @@ guardaba ya no apunta a nada. Recompilar la vuelve a escribir apuntando a la fun
 Por eso una entrada puede decir a la vez «no hay que tocar nada» y «es un cambio incompatible»: lo
 primero se refiere a tu código, lo segundo a lo ya compilado.
 
+Hay un segundo tipo, menos frecuente: el **cambio de comportamiento**. Ahí ninguna función cambia
+de forma —tu aplicación compila y arranca igual, sin recompilar—, pero alguna hace ahora algo
+distinto, casi siempre porque antes hacía algo mal. En la `3.0.0`, por ejemplo,
+`MkvMuxer.addTrack` rechaza una pista de vídeo sin configuración de códec que antes aceptaba (y que
+luego no se podía reproducir en Android). Cuenta igual como incompatible porque alguien podía estar
+contando con lo de antes, y la entrada lo dice en el propio título: «Cambios incompatibles (de
+comportamiento, no de API)».
+
+Lo que pide este tipo es distinto: no recompilar, sino **leer cada punto y comprobar si tu
+aplicación dependía del comportamiento anterior**. Si no dependía de ninguno, no tienes que hacer
+nada.
+
 ### Las demás secciones
 
 | Sección | Qué contiene |
@@ -53,6 +65,164 @@ primero se refiere a tu código, lo segundo a lo ya compilado.
 | **Documentación** | Solo cambia lo que está escrito, no el código. |
 
 ---
+
+## [3.0.0] — 2026-10-07
+
+Revisión completa del motor con tres objetivos: que no quede ningún fallo conocido sin cubrir, que
+rinda en archivos y grabaciones largas, y que se pueda usar en móviles desde **Android 8.0**. El
+análisis, con las mediciones antes/después, está en [`ANALISIS.md`](ANALISIS.md).
+
+**Compatibilidad con la 2.1.1: total a nivel de código.** No se quita ni se cambia ninguna firma
+pública —`public-api.txt` solo gana líneas—, así que una app compilada contra la `2.1.1` funciona
+con la `3.0.0` sin tocar una línea ni recompilar. Es mayor por los cambios de comportamiento de la
+sección siguiente: todos son correcciones, pero alguien podría depender del comportamiento viejo.
+
+**La regla de audio queda fijada.** El audio del sistema y el del micrófono se pueden grabar
+combinados en una pista (`PcmMixer`/`PcmResampler`), cada uno en la suya, o cualquiera de los dos
+solo, y las combinaciones. `RecordingAudioLayoutsTest` la hace cumplir en los tres contenedores.
+
+### Cambios incompatibles (de comportamiento, no de API)
+
+- **`MkvMuxer` empieza la línea de tiempo en el paquete más temprano de todas las pistas**, como
+  `Mp4Muxer`. Las marcas de `MediaCodec` cuentan desde el arranque del dispositivo y se escribían tal
+  cual: un archivo de un segundo declaraba días de duración. Como escribe en vivo, retiene los
+  primeros paquetes hasta que todas las pistas han entregado el suyo (ver *Corregido*). Un PTS
+  inicial negativo (cebado de AAC) se conserva sin desplazar. Si dependías de las marcas absolutas
+  en el MKV, guárdalas aparte.
+- **`Mp4Demuxer` devuelve el idioma, el nombre y la pista predeterminada reales.** Antes daba
+  siempre `und`, `null` y `true`. Si eliges pista por `default`, ahora puede haber pistas con
+  `false` (las que el archivo marca como no activadas).
+- **`MkvDemuxer` termina el stream ante un bloque cortado** en vez de lanzar `EbmlException`, y
+  avisa por `onWarning`. Es la política que ya documentaba para archivos truncados.
+- **Los constructores validan sus parámetros**: `maxClusterDurationMs`, `fragmentDurationUs`,
+  `maxFragmentDurationUs` y `maxFragmentBytes` tienen que ser positivos, o lanzan
+  `IllegalArgumentException` (antes producían un archivo roto). Con un `File`, se valida antes de
+  abrirlo.
+- **`MkvMuxer.addTrack` rechaza una pista de vídeo sin `codecPrivate`** (`avcC`/`hvcC`), igual que
+  ya hacían los muxers MP4. Antes la aceptaba y escribía un MKV que los reproductores de Android
+  no abren.
+- **`PcmResampler` puede entregar un frame en la llamada siguiente** a la que lo entregaba antes,
+  cuando la posición exacta cae justo en el borde de un trozo, y cada muestra puede diferir en el
+  último bit. El flujo concatenado es el mismo, y ahora además exacto en sesiones largas (ver
+  *Corregido*). `PcmMixer` da exactamente los mismos bytes que antes.
+
+### Corregido
+
+- **El fMP4 se corrompía si la app reutilizaba su buffer entre paquetes.** `FragmentedMp4Muxer`
+  retiene las muestras hasta cerrar cada fragmento y guardaba una referencia al `ByteArray` de quien
+  llama: con un buffer reutilizado —lo habitual al copiar la salida de `MediaCodec`— todas las
+  muestras del fragmento acababan iguales a la última, sin ningún error (49 de 50 paquetes dañados
+  en la prueba). Ahora guarda una copia, igual que la retención de arranque del MKV y del fMP4;
+  `Mp4Muxer` escribe en el momento y nunca lo tuvo. El KDoc de `MediaPacket` deja escrito que el
+  array se puede reutilizar.
+- **El fMP4 desincronizaba las pistas cuando la más temprana no era la primera en llegar.** Con dos
+  codificadores es lo normal: el de vídeo tarda más que el de audio, así que el primer trozo de
+  audio llega al muxer antes que el primer fotograma aunque se capturara después.
+  `FragmentedMp4Muxer` fijaba el origen con el primer paquete que llegaba, y el audio sonaba
+  adelantado: 64 ms en la prueba, con la pantalla capturada desde 0 y el micrófono desde +64 ms.
+  Ahora retiene los primeros paquetes —una copia— hasta que todas las pistas han entregado el suyo y
+  fija el origen en el más temprano, como `Mp4Muxer`; el nuevo origen del MKV funciona igual. La
+  espera está acotada (los límites de fragmento en fMP4; 5 s o 16 MB en MKV) por si una pista
+  declarada no llega a producir nada. Lo fijan `TrackStartOrderTest` y una prueba con FFmpeg real,
+  que fallan si el origen se toma del primer paquete que llega.
+- **El MKV escribía pistas sin `CodecPrivate`.** El MP4 generaba la configuración del audio que
+  llegaba sin ella; el MKV la dejaba vacía. FFmpeg lo tolera, pero Media3/ExoPlayer lanza «Missing
+  CodecPrivate» y el extractor nativo de Android descarta la pista AAC. Ahora los dos contenedores
+  generan la misma (ASC para AAC, OpusHead para Opus con el `preSkip` sacado de `codecDelayUs`).
+- **El audio sin marcar como `isKeyFrame` salía como no sincronizable.** `MediaPacket.isKeyFrame`
+  vale `false` por defecto y los tres muxers lo copiaban también para AAC y Opus: el MP4 salía con
+  un `stss` vacío, el fMP4 con todas las muestras dependientes y el MKV solo de audio sin un cue.
+  Ahora el audio es siempre muestra de sincronización.
+- **`PcmResampler` derivaba en grabaciones largas.** Acumulaba la fase sumando un `double` por frame
+  y el redondeo crecía con la sesión: con trozos de 960 frames de 44,1 a 48 kHz se desviaba a los
+  6,6 minutos y llegaba a 5 frames en tres horas, contra su propia promesa de convergencia exacta.
+  La fase va ahora en enteros y es exacta para cualquier duración.
+- **El fMP4 desalineaba el vídeo de frecuencia variable.** La duración del último fotograma de cada
+  fragmento se estimaba con el intervalo anterior; en una captura de pantalla, que solo emite
+  fotogramas cuando algo cambia, una pausa de 2 s se contaba como 16 ms y el tiempo de
+  decodificación quedaba casi 2 s por detrás del de presentación, acumulándose pausa a pausa. Ahora
+  se toma del keyframe que abre el fragmento siguiente.
+- **`OpusConfig` lanzaba `NoSuchMethodError` por debajo del `minSdk` 34 que se documentaba**:
+  compilado con JDK 17, `ByteBuffer.position(int)` enlaza con una sobrecarga covariante que Android
+  no tiene al menos hasta la API 30 (comprobado contra sus firmas). Se leen los campos con accesos
+  absolutos.
+- **Abrir un MP4 largo escrito por esta librería tardaba más de 10 s.** El reparto de muestras en
+  chunks recorría `stsc` desde el principio para cada chunk, y con audio y vídeo intercalados hay
+  casi tantas entradas como chunks. Ahora es un único recorrido: 0,3 s para dos horas a 60 fps.
+- **El `ContentEncoding` de Matroska se ignoraba**: un MKV con eliminación de cabecera entregaba
+  fotogramas sin sus primeros bytes, y uno con zlib, los datos comprimidos. Se deshacen las dos; una
+  pista cifrada o con bzlib/lzo se descarta con aviso. La descompresión tiene un techo de 64 MiB
+  por fotograma contra las bombas de descompresión, fijado por un test a los dos lados del límite:
+  un fotograma de 64 MiB llega entero y uno de un byte más se descarta con aviso.
+- **El idioma de las pistas no llegaba al MP4** (`mdhd` salía siempre con `und`): un MKV con audio
+  en dos idiomas, pasado a MP4 y vuelta, perdía idioma, nombre y pista predeterminada.
+- **El MKV declaraba un fotograma menos de duración** que el MP4 cuando los paquetes no traían
+  duración: el último fotograma de cada pista se contaba como si durase cero.
+- **HE-AAC en MKV no era conforme**: solo se escribía la tasa de salida, en `SamplingFrequency`.
+  Ahora va la del núcleo ahí y la de salida en `OutputSamplingFrequency`, como pide Matroska y como
+  hace FFmpeg. Era la única limitación de conformidad documentada.
+- **`entry_count` del `elst` sin acotar**: un valor manipulado hacía recorrer el resto del archivo
+  como lista de edición. Se acota al tamaño de la caja.
+- **Un `mvhd` con escala cero** descartaba toda pista con lista de edición por una división entre
+  cero, y un `TimestampScale` cero en Matroska anulaba todas las marcas. Se validan.
+- **`SeekableOutput.close()` filtraba el descriptor** si fallaba el último vaciado del buffer (disco
+  lleno). Ahora lo cierra siempre.
+- **`mp4FastStart` sustituía el original sin forzar el temporal a disco**: un corte de batería justo
+  después del movimiento podía dejar el archivo con su nombre y sin su contenido. Se hace `force`
+  antes de sustituir.
+- **Desbordamientos silenciosos en las conversiones de escala de tiempo** (`valor * escala` con
+  `Long`): ahora se detectan y se resuelven con aritmética exacta, saturando si no caben.
+
+### Añadido
+
+- `MkvKotlin.synchronizedMuxer(muxer)`: envoltura segura entre hilos para cuando el vídeo y el audio
+  llegan desde callbacks distintos, que es el caso normal en Android.
+- `MkvKotlin.createFragmentedMp4Muxer(...)` (para `File` y para `SeekableOutput`) y un constructor
+  de `FragmentedMp4Muxer` con `File` y los dos límites de retención: la forma de bajar los 64 MB
+  que retiene como mucho cada fragmento en un móvil con poca memoria. Son funciones nuevas, no
+  parámetros añadidos a las existentes, para no cambiar ninguna firma.
+- `SeekableOutput.sync()`: fuerza los datos escritos al almacenamiento físico.
+- `MatroskaIds.CONTENT_*`: los ids de `ContentEncodings`.
+- `RecordingAudioLayoutsTest`: la regla de audio como test de política, con los cinco montajes en
+  MKV, MP4 y fMP4 y tras convertir entre ellos.
+- `AndroidApiCompatibilityTest`: comprueba el bytecode compilado contra la firma oficial de la API 26
+  de Android. Sus dependencias son solo de test; el artefacto sigue sin dependencias.
+- `compat/kotlin-1.9` y su paso en el CI: una app mínima en Kotlin 1.9 que compila y ejecuta contra
+  el artefacto recién publicado. Con el nivel anterior falla exactamente como la 1.0.0 («Module was
+  compiled with an incompatible version of Kotlin»). Lleva su propio wrapper fijado en Gradle 8,
+  porque el plugin de Kotlin 1.9 no funciona con Gradle 9.
+- Los tres tests que comprueban que una operación fallida no deja archivos abiertos también miden en
+  **Windows**: antes solo podían hacerlo en Linux y en cualquier otro sistema se omitían.
+
+### Cambiado
+
+- **`minSdk` documentado: de 34 a 26 (Android 8.0)**, comprobado por el test anterior.
+- **Kotlin de la app: de 2.1 a 1.9 o superior.** El artefacto se compila en nivel de lenguaje y API
+  2.0 y declara `kotlin-stdlib:2.0.21`; con Kotlin 2.2.10 en ambos, una app necesitaba Kotlin 2.1 o
+  más para poder leer su metadata. El compilador de este proyecto no cambia.
+- **`PcmMixer`, misma API y mismos bytes, ~6 veces más rápido** sin ganancias —el caso de mezclar
+  micrófono y sistema tal cual—: la suma va en enteros, sin pasar cada muestra por `double` ni
+  desempaquetar un `Float` por muestra y fuente. `stereoToMono` también sin coma flotante.
+- **`PcmResampler`, misma API, ~25 % más rápido**, con la salida dimensionada exacta (sin la copia
+  final de recorte).
+- Medido sobre un MP4 de dos horas a 60 fps con AAC (~770 000 muestras):
+
+  | | 2.1.1 | 3.0.0 |
+  |---|---|---|
+  | Abrir con `Mp4Demuxer` | ~10,6 s | ~0,27 s |
+  | Heap del demuxer abierto | ~47,5 MB | ~29,3 MB |
+  | `seekTo` | ~0,9 ms | ~5 µs |
+  | Heap de `Mp4Muxer` antes de `stop()` | ~54 MB | ~34 MB |
+  | `Mp4Muxer.stop()` | ~0,9 s | ~0,4 s |
+
+  Vienen de guardar las tablas de muestras en columnas primitivas paginadas (sin un objeto por
+  muestra ni copias al crecer), de construir el `moov`/`moof` sobre un solo array sin cerrojos, del
+  recorrido lineal de `stsc` y del seek por bisección.
+- `SeekableInput` lee directamente al array de destino los bloques grandes (una muestra de vídeo ya
+  no se copia dos veces), y `MkvDemuxer` lee la carga de cada bloque sin copia intermedia.
+- `NalUnits.annexBToLengthPrefixed` y `lengthPrefixedToAnnexB` trabajan en una sola pasada y sin
+  arrays intermedios: es la conversión que se hace con cada fotograma de un codificador por hardware.
+- El `moof` del fMP4 se construye una vez en lugar de dos.
 
 ## [2.1.1] — 2026-08-13
 

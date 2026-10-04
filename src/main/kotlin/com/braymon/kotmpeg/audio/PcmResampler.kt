@@ -1,8 +1,5 @@
 package com.braymon.kotmpeg.audio
 
-import kotlin.math.ceil
-import kotlin.math.floor
-
 /**
  * Remuestreador en streaming por interpolación lineal para PCM de 16 bits intercalado
  * (el equivalente práctico del `aresample` de FFmpeg para pipelines de captura y
@@ -11,6 +8,16 @@ import kotlin.math.floor
  * Acepta trozos de cualquier tamaño; la fase se conserva entre llamadas, así que los
  * streams largos no derivan: tras N frames de entrada la salida converge exactamente a
  * N * outputRate / inputRate.
+ *
+ * Es la pieza que permite mezclar micrófono y audio del sistema cuando no llegan a la misma
+ * frecuencia (44,1 kHz frente a 48 kHz es lo habitual en Android): se lleva una de las dos a la
+ * tasa de la otra y después [PcmMixer] las suma.
+ *
+ * **La fase se lleva en enteros, no en coma flotante.** La posición de lectura es la fracción
+ * exacta `frames emitidos * inputRate / outputRate`, guardada como parte entera más resto. Antes
+ * se acumulaba sumando un `double` por cada frame de salida, y el error de redondeo crecía con la
+ * sesión: en tres horas de 44,1 a 48 kHz la salida iba hasta 5 frames por delante o por detrás de
+ * lo que promete esta clase. Ahora la cuenta es exacta durante cualquier duración.
  */
 public class PcmResampler(
     public val inputRate: Int,
@@ -22,12 +29,23 @@ public class PcmResampler(
         require(channels in 1..8) { "número de canales inválido: $channels" }
     }
 
-    /** Posición fraccional de lectura dentro del stream de entrada, en frames. */
-    private var position = 0.0
-    private val step = inputRate.toDouble() / outputRate
+    private val divisor = gcd(inputRate.toLong(), outputRate.toLong())
+
+    /** Avance por frame de salida, en frames de entrada: `inputStep / outputStep`, ya reducido. */
+    private val inputStep = inputRate / divisor
+    private val outputStep = outputRate / divisor
+    private val wholeStep = inputStep / outputStep
+    private val partialStep = inputStep % outputStep
+
+    /**
+     * Posición de lectura: frame de entrada absoluto ([phaseFrame]) más la fracción
+     * `phaseRemainder / outputStep` hacia el siguiente.
+     */
+    private var phaseFrame = 0L
+    private var phaseRemainder = 0L
 
     /** Último frame del trozo anterior, para interpolar entre fronteras de trozos. */
-    private var lastFrame = ShortArray(channels)
+    private val lastFrame = ShortArray(channels)
     private var framesConsumed = 0L
     private var framesEmitted = 0L
 
@@ -40,17 +58,11 @@ public class PcmResampler(
      * eficiente para el caso en que no hay nada que convertir, pero significa que mutar el
      * resultado muta la entrada. Copia tú si necesitas que sean independientes.
      *
-     * El buffer de salida se reserva de una vez y con **un frame de más a propósito**. Las dos
-     * cosas son deliberadas y ninguna es un descuido que optimizar:
-     *
-     *  - `ShortArray` y no una lista: `ArrayList<Short>` boxea *cada* muestra —la caché de
-     *    `Short.valueOf` solo cubre −128..127, así que en audio real casi ninguna se
-     *    reaprovecha—, lo que son millones de objetos por minuto en el hilo de captura, donde
-     *    un GC a destiempo se oye. El número de frames de salida se conoce de antemano.
-     *  - El `+ 1`: `ceil` sobre una división en coma flotante puede quedarse corto por un ulp, y
-     *    quedarse corto aquí no solo truncaría la salida, también dejaría `position` sin avanzar
-     *    y rompería la convergencia exacta que promete la clase. Sobrar un frame se recorta al
-     *    final; faltar sería un fallo silencioso.
+     * El número de frames de salida se calcula **exacto** antes de reservar, con la misma
+     * aritmética entera que la fase, así que el array sale del tamaño justo: ni falta sitio ni
+     * hay que recortarlo con una copia al final. `ShortArray` y no una lista a propósito: una
+     * `ArrayList<Short>` boxearía cada muestra, millones de objetos por minuto en el hilo de
+     * captura, donde un GC a destiempo se oye.
      */
     public fun resample(input: ShortArray): ShortArray {
         if (isPassthrough) return input
@@ -61,35 +73,49 @@ public class PcmResampler(
         val inFrames = input.size / channels
         if (inFrames == 0) return ShortArray(0)
 
-        val available = framesConsumed + inFrames
-
-        val span = (available - 1) - position
-        val outFrames = if (span <= 0) 0 else ceil(span / step).toInt() + 1
+        val lastIndex = framesConsumed + inFrames - 1
+        val outFrames = framesBefore(lastIndex)
         val out = ShortArray(outFrames * channels)
         var w = 0
-
-        while (position < available - 1) {
-            val base = position - (framesConsumed - 1)
-            val index = floor(base).toInt()
-            val frac = base - index
+        val scale = 1.0 / outputStep
+        repeat(outFrames) {
+            val relative = (phaseFrame - framesConsumed).toInt()
+            val frac = phaseRemainder * scale
             for (ch in 0 until channels) {
-                val s0 = sampleAt(input, index - 1, ch)
-                val s1 = sampleAt(input, index, ch)
+                val s0 = if (relative < 0) lastFrame[ch].toInt() else input[relative * channels + ch].toInt()
+                val s1 = input[(relative + 1) * channels + ch].toInt()
                 val v = s0 + (s1 - s0) * frac
                 out[w++] = Math.round(v).toInt().coerceIn(-32768, 32767).toShort()
             }
-            position += step
-            framesEmitted++
+            advance()
         }
 
-        for (ch in 0 until channels) lastFrame[ch] = input[(inFrames - 1) * channels + ch]
-        framesConsumed = available
-        return if (w == out.size) out else out.copyOf(w)
+        System.arraycopy(input, (inFrames - 1) * channels, lastFrame, 0, channels)
+        framesConsumed += inFrames
+        return out
     }
 
-    /** El índice es relativo al frame histórico: -1 = último frame del trozo anterior. */
-    private fun sampleAt(input: ShortArray, index: Int, ch: Int): Double =
-        if (index < 0) lastFrame[ch].toDouble() else input[index * channels + ch].toDouble()
+    /**
+     * Cuántos frames de salida caben antes de que la posición alcance [lastIndex]: los `j` con
+     * `fase + j * paso < lastIndex`, contados en enteros como `ceil(distancia / paso)`.
+     */
+    private fun framesBefore(lastIndex: Long): Int {
+        val distance = (lastIndex - phaseFrame) * outputStep - phaseRemainder
+        if (distance <= 0) return 0
+        val frames = (distance + inputStep - 1) / inputStep
+        require(frames * channels <= Int.MAX_VALUE) { "trozo de entrada demasiado grande: $frames frames de salida" }
+        return frames.toInt()
+    }
+
+    private fun advance() {
+        phaseFrame += wholeStep
+        phaseRemainder += partialStep
+        if (phaseRemainder >= outputStep) {
+            phaseRemainder -= outputStep
+            phaseFrame++
+        }
+        framesEmitted++
+    }
 
     /**
      * Emite el frame final del stream.
@@ -113,9 +139,12 @@ public class PcmResampler(
         var i = 0
         repeat(missing.toInt()) {
             for (ch in 0 until channels) out[i++] = lastFrame[ch]
-            position += step
-            framesEmitted++
+            advance()
         }
         return out
+    }
+
+    private companion object {
+        private tailrec fun gcd(a: Long, b: Long): Long = if (b == 0L) a else gcd(b, a % b)
     }
 }

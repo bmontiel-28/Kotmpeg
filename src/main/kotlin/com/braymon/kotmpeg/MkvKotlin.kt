@@ -5,6 +5,8 @@ import com.braymon.kotmpeg.io.SeekableOutput
 import com.braymon.kotmpeg.mkv.MkvDemuxer
 import com.braymon.kotmpeg.mkv.MkvMuxer
 import com.braymon.kotmpeg.model.ContainerFormat
+import com.braymon.kotmpeg.model.MediaPacket
+import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
 import com.braymon.kotmpeg.mp4.Mp4Demuxer
 import com.braymon.kotmpeg.mp4.Mp4Muxer
@@ -90,6 +92,32 @@ public object MkvKotlin {
             if (mp4Fragmented) FragmentedMp4Muxer(output, mp4FragmentDurationUs)
             else Mp4Muxer(output)
     }
+
+    /**
+     * Crea un muxer de MP4 fragmentado con los límites de retención a la vista.
+     *
+     * Es lo mismo que [createMuxer] con `mp4Fragmented = true`, más los dos parámetros que deciden
+     * cuánta memoria retiene: las muestras de cada fragmento se guardan hasta cerrarlo, como mucho
+     * [maxFragmentDurationUs] o [maxFragmentBytes], lo que llegue antes. En un móvil con poca RAM
+     * conviene bajar [maxFragmentBytes] a 16 o 32 MB.
+     *
+     * Es una función aparte, y no dos parámetros más en [createMuxer], porque añadir parámetros a
+     * una función pública cambia su firma JVM y rompería a quien ya la usa compilada.
+     */
+    public fun createFragmentedMp4Muxer(
+        file: File,
+        fragmentDurationUs: Long = 2_000_000,
+        maxFragmentDurationUs: Long = 10_000_000,
+        maxFragmentBytes: Long = 64L * 1024 * 1024,
+    ): Muxer = FragmentedMp4Muxer(file, fragmentDurationUs, maxFragmentDurationUs, maxFragmentBytes)
+
+    /** Variante de [createFragmentedMp4Muxer] sobre un [SeekableOutput] ya abierto (`MediaStore`/SAF). */
+    public fun createFragmentedMp4Muxer(
+        output: SeekableOutput,
+        fragmentDurationUs: Long = 2_000_000,
+        maxFragmentDurationUs: Long = 10_000_000,
+        maxFragmentBytes: Long = 64L * 1024 * 1024,
+    ): Muxer = FragmentedMp4Muxer(output, fragmentDurationUs, maxFragmentDurationUs, maxFragmentBytes)
 
     /**
      * Abre un demuxer detectando el contenedor por los bytes mágicos del archivo.
@@ -245,5 +273,37 @@ public object MkvKotlin {
             "la salida ${output.name} es también una de las entradas: se truncaría y " +
                 "reescribiría mientras se lee. Escribe a un archivo temporal y renómbralo."
         }
+    }
+
+    /**
+     * Envuelve [muxer] para poder llamarlo desde varios hilos a la vez.
+     *
+     * Los muxers son de un solo hilo a propósito, pero en una app móvil lo normal es que el
+     * codificador de vídeo y el de audio entreguen sus paquetes cada uno desde su propio hilo
+     * (los callbacks de `MediaCodec`). Esta envoltura serializa cada operación con un único
+     * cerrojo, que es exactamente lo que habría que escribir a mano, sin el riesgo de olvidarse
+     * de una de las cinco.
+     *
+     * ```kotlin
+     * val muxer = MkvKotlin.synchronizedMuxer(MkvKotlin.createMuxer(File("salida.mp4"), mp4Fragmented = true))
+     * ```
+     *
+     * Envolver uno que ya lo está devuelve el mismo objeto.
+     */
+    public fun synchronizedMuxer(muxer: Muxer): Muxer =
+        if (muxer is SynchronizedMuxer) muxer else SynchronizedMuxer(muxer)
+
+    private class SynchronizedMuxer(private val delegate: Muxer) : Muxer {
+        private val lock = Any()
+
+        override fun addTrack(track: TrackInfo): Int = synchronized(lock) { delegate.addTrack(track) }
+
+        override fun start(): Unit = synchronized(lock) { delegate.start() }
+
+        override fun writePacket(packet: MediaPacket): Unit = synchronized(lock) { delegate.writePacket(packet) }
+
+        override fun stop(): Unit = synchronized(lock) { delegate.stop() }
+
+        override fun close(): Unit = synchronized(lock) { delegate.close() }
     }
 }

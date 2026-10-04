@@ -50,6 +50,16 @@ public object MatroskaIds {
     public const val CODEC_DELAY: Long = 0x56AAL
     public const val SEEK_PRE_ROLL: Long = 0x56BBL
 
+    public const val CONTENT_ENCODINGS: Long = 0x6D80L
+    public const val CONTENT_ENCODING: Long = 0x6240L
+    public const val CONTENT_ENCODING_ORDER: Long = 0x5031L
+    public const val CONTENT_ENCODING_SCOPE: Long = 0x5032L
+    public const val CONTENT_ENCODING_TYPE: Long = 0x5033L
+    public const val CONTENT_COMPRESSION: Long = 0x5034L
+    public const val CONTENT_COMP_ALGO: Long = 0x4254L
+    public const val CONTENT_COMP_SETTINGS: Long = 0x4255L
+    public const val CONTENT_ENCRYPTION: Long = 0x5035L
+
     public const val VIDEO: Long = 0xE0L
     public const val PIXEL_WIDTH: Long = 0xB0L
     public const val PIXEL_HEIGHT: Long = 0xBAL

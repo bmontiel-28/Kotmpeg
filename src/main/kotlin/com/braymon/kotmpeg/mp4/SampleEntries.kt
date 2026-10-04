@@ -1,6 +1,6 @@
 package com.braymon.kotmpeg.mp4
 
-import com.braymon.kotmpeg.codecconfig.AacConfig
+import com.braymon.kotmpeg.codecconfig.DefaultCodecPrivate
 import com.braymon.kotmpeg.codecconfig.OpusConfig
 import com.braymon.kotmpeg.model.AudioCodec
 import com.braymon.kotmpeg.model.HdrStaticInfo
@@ -20,6 +20,33 @@ internal object SampleEntries {
      * su `SamplingFrequency` es un float.
      */
     internal const val MAX_SAMPLE_ENTRY_RATE: Long = 0xFFFF
+
+    /** `und` empaquetado como lo guarda `mdhd`. */
+    private const val LANGUAGE_UNDETERMINED: Int = 0x55C4
+
+    /**
+     * Código ISO 639-2/T empaquetado como lo guarda `mdhd`: tres letras minúsculas, cada una
+     * menos 0x60, en 5 bits. Lo que no sea exactamente tres letras ASCII sale como `und`: un
+     * código mal formado no puede viajar en ese campo sin corromper los vecinos.
+     */
+    internal fun packLanguage(code: String): Int {
+        val normalized = code.trim().lowercase()
+        if (normalized.length != 3 || normalized.any { it !in 'a'..'z' }) return LANGUAGE_UNDETERMINED
+        return ((normalized[0].code - 0x60) shl 10) or
+            ((normalized[1].code - 0x60) shl 5) or
+            (normalized[2].code - 0x60)
+    }
+
+    /**
+     * Inversa de [packLanguage]. Por debajo de 0x400 el campo lleva un código de idioma de
+     * Macintosh (QuickTime), no ISO, y se trata como desconocido.
+     */
+    internal fun unpackLanguage(packed: Int): String {
+        val value = packed and 0x7FFF
+        if (value < 0x400) return "und"
+        val letters = CharArray(3) { i -> (((value shr (10 - 5 * i)) and 0x1F) + 0x60).toChar() }
+        return if (letters.all { it in 'a'..'z' }) String(letters) else "und"
+    }
 
     fun writeVisual(b: BoxBuilder, info: TrackInfo.Video) {
         val config = requireNotNull(info.codecPrivate) { "la pista de vídeo requiere codecPrivate" }
@@ -76,10 +103,8 @@ internal object SampleEntries {
             when (info.codec) {
                 AudioCodec.AAC -> writeEsds(this, info)
                 AudioCodec.OPUS -> box("dOps") {
-                    val head = info.codecPrivate
-                    val dops = if (head != null) OpusConfig.opusHeadToDops(head)
-                    else OpusConfig.opusHeadToDops(OpusConfig.buildOpusHead(info.channelCount))
-                    bytes(dops)
+                    val head = info.codecPrivate ?: DefaultCodecPrivate.forAudio(info)
+                    bytes(OpusConfig.opusHeadToDops(head))
                 }
             }
         }
@@ -106,7 +131,7 @@ internal object SampleEntries {
     }
 
     private fun writeEsds(b: BoxBuilder, info: TrackInfo.Audio) {
-        val asc = info.codecPrivate ?: AacConfig.build(info.sampleRate, info.channelCount)
+        val asc = info.codecPrivate ?: DefaultCodecPrivate.forAudio(info)
         val dsiSize = 1 + descriptorLengthSize(asc.size) + asc.size
         val decoderConfigContent = 13 + dsiSize
         val decoderConfigSize = 1 + descriptorLengthSize(decoderConfigContent) + decoderConfigContent

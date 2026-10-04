@@ -1,12 +1,16 @@
 package com.braymon.kotmpeg.mkv
 
 import com.braymon.kotmpeg.Muxer
+import com.braymon.kotmpeg.TimelineGate
+import com.braymon.kotmpeg.codecconfig.AacConfig
+import com.braymon.kotmpeg.codecconfig.DefaultCodecPrivate
 import com.braymon.kotmpeg.codecconfig.OpusConfig
 import com.braymon.kotmpeg.ebml.EbmlWriter
 import com.braymon.kotmpeg.ebml.MatroskaIds
 import com.braymon.kotmpeg.io.SeekableOutput
 import com.braymon.kotmpeg.model.AudioCodec
 import com.braymon.kotmpeg.model.MediaPacket
+import com.braymon.kotmpeg.model.Timestamps
 import com.braymon.kotmpeg.model.TrackInfo
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -23,6 +27,14 @@ import java.util.Random
  * de presentación; los paquetes deben llegar en orden de decodificación por pista (Matroska
  * guarda los fotogramas en orden de decodificación con PTS, así que los B-frames no
  * necesitan señalización extra aquí).
+ *
+ * La línea de tiempo empieza en el paquete **más temprano de todas las pistas**, igual que en los
+ * dos muxers MP4. Es lo que permite pasarle directamente las marcas de un reloj absoluto —las de
+ * `MediaCodec` cuentan desde el arranque del dispositivo—: escritas tal cual, un archivo de diez
+ * segundos declaraba una duración de días. Como este muxer escribe en vivo, retiene los primeros
+ * paquetes hasta que todas las pistas han entregado el suyo (ver `TimelineGate`): el primero que
+ * llega no tiene por qué ser el más temprano. Un PTS inicial negativo (el cebado de un AAC) se
+ * conserva sin desplazar.
  *
  * **No es seguro entre hilos**: toda la secuencia addTrack/start/writePacket/stop debe
  * ejecutarse desde un solo hilo, o serializarse por fuera. Es lo que hace falta en cuanto hay un
@@ -45,7 +57,11 @@ public class MkvMuxer(
 ) : Muxer {
 
     public constructor(file: File, maxClusterDurationMs: Long = 5_000) :
-        this(SeekableOutput(file), maxClusterDurationMs)
+        this(openValidated(file, maxClusterDurationMs), maxClusterDurationMs)
+
+    init {
+        requireValidClusterDuration(maxClusterDurationMs)
+    }
 
     private val ebml = EbmlWriter(out)
     private val tracks = ArrayList<TrackInfo>()
@@ -67,6 +83,24 @@ public class MkvMuxer(
     private var clusterTimestampMs = 0L
     private var maxEndTimestampMs = 0L
 
+    /**
+     * Origen de la línea de tiempo en µs. Se fija cuando [gate] lo permite: con el primer paquete
+     * de cada pista entregado, o al agotar la espera.
+     */
+    private var timelineOriginUs = 0L
+
+    /** Retención de arranque; `null` en cuanto el origen está fijado. */
+    private var gate: TimelineGate? = null
+
+    /**
+     * Los dos mayores PTS escritos por pista (ms). Con B-frames el orden de llegada no es el de
+     * presentación, pero los dos mayores siempre son fotogramas consecutivos: su diferencia es la
+     * duración del último.
+     */
+    private var trackMaxPtsMs = LongArray(0)
+    private var trackSecondMaxPtsMs = LongArray(0)
+    private var trackHasDurations = BooleanArray(0)
+
     private class CueEntry(val timeMs: Long, val trackNumber: Int, val clusterPosition: Long)
 
     private val cues = ArrayList<CueEntry>()
@@ -84,13 +118,54 @@ public class MkvMuxer(
          * cualquier fecha anterior a 2001 es negativa. De ahí que se escriba con signo.
          */
         const val MATROSKA_EPOCH_MILLIS = 978_307_200_000L
+
+        /**
+         * Topes de la retención de arranque. Cinco segundos de diferencia entre pistas es mucho
+         * más que la latencia de cualquier codificador; por encima, lo razonable es que una pista
+         * no vaya a llegar. Los 16 MB acotan la memoria aunque una sola pista llene ese tiempo.
+         */
+        const val START_WAIT_US = 5_000_000L
+        const val START_HELD_BYTES = 16L * 1024 * 1024
+
+        fun requireValidClusterDuration(maxClusterDurationMs: Long) {
+            require(maxClusterDurationMs > 0) { "maxClusterDurationMs debe ser positivo: $maxClusterDurationMs" }
+        }
+
+        /**
+         * Valida **antes** de abrir: si el `require` del `init` fallara con el archivo ya abierto, el
+         * descriptor quedaría huérfano, porque nadie tendría el objeto para cerrarlo.
+         */
+        fun openValidated(file: File, maxClusterDurationMs: Long): SeekableOutput {
+            requireValidClusterDuration(maxClusterDurationMs)
+            return SeekableOutput(file)
+        }
     }
 
+    /**
+     * Registra una pista con las mismas exigencias de `codecPrivate` que los muxers MP4.
+     *
+     * Antes el MKV aceptaba cualquier pista sin configuración de códec y la escribía tal cual.
+     * FFmpeg lo tolera, pero Media3/ExoPlayer lanza "Missing CodecPrivate" y el extractor nativo de
+     * Android descarta la pista AAC: el archivo se grababa sin error y luego no se reproducía en el
+     * móvil. Ahora el vídeo sin `avcC`/`hvcC` se rechaza aquí, igual que en MP4, y el audio sin
+     * configuración recibe la misma por defecto que escribe el MP4.
+     */
     override fun addTrack(track: TrackInfo): Int {
         check(!started) { "no se pueden añadir pistas después de start()" }
         val trackNumber = tracks.size + 1
         require(trackNumber in 1..126) { "Matroska admite como máximo 126 pistas en este muxer" }
-        tracks.add(track.withId(trackNumber))
+        val complete = when (track) {
+            is TrackInfo.Video -> {
+                requireNotNull(track.codecPrivate) {
+                    "las pistas de vídeo MKV requieren codecPrivate (avcC/hvcC): sin él, " +
+                        "los reproductores de Android no pueden abrirlas"
+                }
+                track
+            }
+            is TrackInfo.Audio ->
+                if (track.codecPrivate != null) track else track.copy(codecPrivate = DefaultCodecPrivate.forAudio(track))
+        }
+        tracks.add(complete.withId(trackNumber))
         return trackNumber
     }
 
@@ -100,6 +175,10 @@ public class MkvMuxer(
         started = true
 
         cueTrackNumber = (tracks.firstOrNull { it is TrackInfo.Video } ?: tracks.first()).id
+        trackMaxPtsMs = LongArray(tracks.size) { Long.MIN_VALUE }
+        trackSecondMaxPtsMs = LongArray(tracks.size) { Long.MIN_VALUE }
+        trackHasDurations = BooleanArray(tracks.size)
+        gate = TimelineGate(tracks.size, START_WAIT_US, START_HELD_BYTES)
 
         writeEbmlHeader()
 
@@ -240,13 +319,35 @@ public class MkvMuxer(
                     ebml.writeUInt(MatroskaIds.SEEK_PRE_ROLL, 80_000_000)
                 }
                 val aPos = ebml.beginMaster(MatroskaIds.AUDIO)
-                ebml.writeFloat(MatroskaIds.SAMPLING_FREQUENCY, track.sampleRate.toDouble())
+                val coreRate = sbrCoreSampleRate(track)
+                if (coreRate != null) {
+                    ebml.writeFloat(MatroskaIds.SAMPLING_FREQUENCY, coreRate.toDouble())
+                    ebml.writeFloat(MatroskaIds.OUTPUT_SAMPLING_FREQUENCY, track.sampleRate.toDouble())
+                } else {
+                    ebml.writeFloat(MatroskaIds.SAMPLING_FREQUENCY, track.sampleRate.toDouble())
+                }
                 ebml.writeUInt(MatroskaIds.CHANNELS, track.channelCount.toLong())
                 if (track.bitDepth > 0) ebml.writeUInt(MatroskaIds.BIT_DEPTH, track.bitDepth.toLong())
                 ebml.endMaster(aPos)
             }
         }
         ebml.endMaster(entryPos)
+    }
+
+    /**
+     * Frecuencia del núcleo de una pista HE-AAC, o `null` si no es HE-AAC con SBR explícito.
+     *
+     * Matroska pide para SBR las dos tasas: `SamplingFrequency` con la del núcleo y
+     * `OutputSamplingFrequency` con la de salida, que es lo que escribe FFmpeg. Antes solo se
+     * escribía la de salida en el primer campo: no causaba desajustes, pero no era conforme. Solo
+     * se separan cuando el ASC lo declara y su tasa de salida coincide con la de la pista; en
+     * cualquier otro caso se mantiene una sola tasa, la de la pista.
+     */
+    private fun sbrCoreSampleRate(track: TrackInfo.Audio): Int? {
+        if (track.codec != AudioCodec.AAC) return null
+        val parsed = track.codecPrivate?.let { runCatching { AacConfig.parse(it) }.getOrNull() } ?: return null
+        val isSbr = parsed.coreSampleRate in 1 until parsed.sampleRate
+        return if (isSbr && parsed.sampleRate == track.sampleRate) parsed.coreSampleRate else null
     }
 
     /**
@@ -265,25 +366,58 @@ public class MkvMuxer(
      *  - El desfase respecto al cluster va en 16 bits **con signo**, y ahí está el límite real de
      *    lo que este contenedor puede expresar (unos ±32,7 s). Sin la comprobación se truncaba
      *    en silencio y salía un archivo que se abre pero suena descolocado.
+     *
+     * El audio se escribe siempre como fotograma clave: `MediaPacket.isKeyFrame` vale `false` por
+     * defecto, y un archivo solo de audio salía sin un solo cue y con todos sus bloques marcados
+     * como dependientes.
+     *
+     * Hasta que todas las pistas han entregado su primer paquete, los paquetes se retienen (una
+     * copia) en vez de escribirse: el origen de la línea de tiempo tiene que ser el más temprano,
+     * y el primero que llega no siempre lo es.
      */
     override fun writePacket(packet: MediaPacket) {
         check(started) { "start() no llamado" }
         check(!stopped) { "muxer ya detenido" }
         val track = tracks.getOrNull(packet.trackId - 1)
             ?: throw IllegalArgumentException("pista desconocida ${packet.trackId}")
-        val ptsMs = Math.floorDiv(packet.ptsUs + 500, 1000)
+        val waiting = gate
+        if (waiting != null) {
+            if (waiting.hold(packet, packet.trackId - 1)) openTimeline(waiting)
+            return
+        }
+        writeBlock(track, packet)
+    }
+
+    /**
+     * Fija el origen en el paquete retenido más temprano y escribe lo retenido. Con un PTS inicial
+     * negativo el origen se queda en cero, para conservar el cebado sin desplazar el resto.
+     */
+    private fun openTimeline(waiting: TimelineGate) {
+        gate = null
+        timelineOriginUs = maxOf(0L, waiting.earliestPtsUs ?: 0L)
+        for (held in waiting.release()) writeBlock(tracks[held.trackId - 1], held)
+    }
+
+    private fun writeBlock(track: TrackInfo, packet: MediaPacket) {
+        val relativePtsUs = try {
+            Math.subtractExact(packet.ptsUs, timelineOriginUs)
+        } catch (_: ArithmeticException) {
+            throw IllegalArgumentException("pts ${packet.ptsUs} µs fuera de rango para la pista ${packet.trackId}")
+        }
+        val ptsMs = Timestamps.rescaleRounded(relativePtsUs, 1, 1000)
         val isVideo = track is TrackInfo.Video
+        val isKeyFrame = packet.isKeyFrame || track is TrackInfo.Audio
         val isCueTrack = track.id == cueTrackNumber
 
         val needNewCluster = clusterSizePos < 0 ||
-            (isVideo && packet.isKeyFrame) ||
+            (isVideo && isKeyFrame) ||
             ptsMs - clusterTimestampMs > maxClusterDurationMs ||
             ptsMs - clusterTimestampMs > Short.MAX_VALUE ||
             ptsMs < clusterTimestampMs + Short.MIN_VALUE
 
         if (needNewCluster) startCluster(ptsMs)
 
-        if (isCueTrack && packet.isKeyFrame && clusterStartPos != lastCuedClusterPos) {
+        if (isCueTrack && isKeyFrame && clusterStartPos != lastCuedClusterPos) {
             cues.add(CueEntry(ptsMs.coerceAtLeast(0), track.id, clusterStartPos - segmentDataStart))
             lastCuedClusterPos = clusterStartPos
         }
@@ -299,11 +433,42 @@ public class MkvMuxer(
         ebml.writeVintSize(header.size.toLong() + 3L + packet.data.size.toLong())
         out.write(header)
         out.writeBits(relative and 0xFFFF, 2)
-        out.writeByte(if (packet.isKeyFrame) 0x80 else 0x00)
+        out.writeByte(if (isKeyFrame) 0x80 else 0x00)
         out.write(packet.data)
 
         val durMs = if (packet.durationUs > 0) (packet.durationUs + 500) / 1000 else 0
         maxEndTimestampMs = maxOf(maxEndTimestampMs, ptsMs + durMs)
+        val index = track.id - 1
+        if (ptsMs > trackMaxPtsMs[index]) {
+            trackSecondMaxPtsMs[index] = trackMaxPtsMs[index]
+            trackMaxPtsMs[index] = ptsMs
+        } else if (ptsMs < trackMaxPtsMs[index] && ptsMs > trackSecondMaxPtsMs[index]) {
+            trackSecondMaxPtsMs[index] = ptsMs
+        }
+        if (packet.durationUs > 0) trackHasDurations[index] = true
+    }
+
+    /**
+     * Fin de la línea de tiempo para `Duration`. Si los paquetes no traen duración —lo normal con
+     * `MediaCodec`—, el último fotograma de cada pista se cuenta con el intervalo entre sus dos
+     * mayores PTS, o con su `DefaultDuration` si no hubo dos. Sin eso, la duración declarada se
+     * quedaba un fotograma corta respecto a la que dan los muxers MP4 para la misma entrada. Las
+     * pistas que sí traen duraciones ya están contadas en [maxEndTimestampMs] y no se estiman.
+     */
+    private fun endTimestampMs(): Long {
+        var end = maxEndTimestampMs
+        for ((index, track) in tracks.withIndex()) {
+            val maxPts = trackMaxPtsMs[index]
+            if (maxPts == Long.MIN_VALUE || trackHasDurations[index]) continue
+            val secondPts = trackSecondMaxPtsMs[index]
+            val lastDuration = when {
+                secondPts != Long.MIN_VALUE -> maxPts - secondPts
+                track.defaultDurationNs > 0 -> (track.defaultDurationNs + 500_000) / 1_000_000
+                else -> 0L
+            }
+            end = maxOf(end, maxPts + lastDuration)
+        }
+        return end
     }
 
     private fun trackNumberVint(number: Int): ByteArray {
@@ -336,12 +501,13 @@ public class MkvMuxer(
             return
         }
         try {
+            gate?.let { openTimeline(it) }
             closeCluster()
             writeCues()
 
             out.patch(
                 durationValuePos,
-                longToBytes(maxEndTimestampMs.toDouble().toRawBits()),
+                longToBytes(endTimestampMs().toDouble().toRawBits()),
             )
             writeSeekHead()
 

@@ -176,9 +176,7 @@ class HeAacConfigTest {
      *
      * La dirección importa. Al convertir a MP4 el dato se recupera solo, porque `parseMp4a`
      * vuelve a sacar la frecuencia del ASC y ahí la extensión sí está: el error quedaba tapado.
-     * Nuestro MKV, en cambio, escribe un único `SamplingFrequency` con lo que se leyó, y no
-     * emite `OutputSamplingFrequency` —limitación documentada—, así que una tasa mal leída se
-     * escribía como buena y ya no había de dónde recuperarla.
+     * En MKV, una tasa mal leída se escribía como buena y ya no había de dónde recuperarla.
      */
     @Test
     fun `remuxing a foreign he aac mkv to mkv keeps its real sample rate`() {
@@ -192,11 +190,31 @@ class HeAacConfigTest {
         val out = File(dir, "he-convertido.mkv")
         MkvKotlin.remux(source, out)
         assertEquals(48_000, readTrack(out).sampleRate, "el remux heredó la tasa del núcleo")
-        assertTrue(
-            !declaresOutputSamplingFrequency(out),
-            "nuestro muxer no emite OutputSamplingFrequency: por eso el valor escrito " +
-                "tiene que ser ya el de salida",
-        )
+    }
+
+    /**
+     * **Nuestro MKV declara las dos tasas de una pista HE-AAC**, como pide Matroska y como hace
+     * FFmpeg: `SamplingFrequency` con la del núcleo y `OutputSamplingFrequency` con la de salida.
+     * Antes solo escribía la de salida en el primer campo, que no causaba desajustes pero no era
+     * conforme. Se relee a la tasa de salida en los dos casos, y el AAC-LC no gana el elemento.
+     */
+    @Test
+    fun `our mkv declares both sample rates of an sbr track`() {
+        val he = File(dir, "propio-he.mkv")
+        writeAudio(he, ContainerFormat.MKV, ASC_HE)
+        assertTrue(declaresOutputSamplingFrequency(he), "falta OutputSamplingFrequency en HE-AAC")
+        assertEquals(48_000, readTrack(he).sampleRate)
+
+        val lc = File(dir, "propio-lc.mkv")
+        MkvKotlin.createMuxer(lc, ContainerFormat.MKV).use { muxer ->
+            val id = muxer.addTrack(
+                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2, codecPrivate = AacConfig.build(48_000, 2)),
+            )
+            muxer.start()
+            muxer.writePacket(MediaPacket(id, ByteArray(16), ptsUs = 0))
+        }
+        assertTrue(!declaresOutputSamplingFrequency(lc), "un AAC-LC no lleva OutputSamplingFrequency")
+        assertEquals(48_000, readTrack(lc).sampleRate)
     }
 
     /**
