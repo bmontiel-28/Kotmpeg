@@ -24,9 +24,18 @@ import java.io.File
  *  - **streameable**: los fragmentos pueden empujarse a un socket/empaquetador DASH/HLS
  *    según se van cortando.
  *
- * Los B-frames se soportan con offsets de composición firmados de `trun` versión 1; los
- * tiempos se derivan por fragmento con el mismo esquema de PTS ordenados que [Mp4Muxer],
- * con tiempos de decodificación acumulados sin deriva entre fragmentos (`tfdt`).
+ * Con [segmentIndex], cada fragmento lleva delante un índice `sidx` por pista, como
+ * `-movflags dash` de FFmpeg: es un segmento indexado que un reproductor o un empaquetador DASH/HLS
+ * puede direccionar por rangos de bytes, sin dejar de ser un único archivo solo-añadir. Y
+ * [onSegment] avisa de cada segmento según se escribe, con su posición y su duración, para montar
+ * la lista de reproducción en vivo.
+ *
+ * Los B-frames se soportan con offsets de composición firmados de `trun` versión 1, como en
+ * CMAF: el tiempo de decodificación de cada muestra sale de los PTS ordenados de su fragmento, con
+ * tiempos acumulados sin deriva entre fragmentos (`tfdt`), y un B-frame queda con un offset
+ * negativo de uno o dos fotogramas. Ese adelanto del DTS sobre el PTS está acotado a la
+ * profundidad de reordenación (ver `boundReorderOffsets`), también cuando una pausa del vídeo de
+ * frecuencia variable cae entre un B-frame y su referencia.
  *
  * **Memoria**: las muestras de un fragmento se retienen hasta cerrarlo, porque el `moof` que las
  * describe va delante de ellas. [maxFragmentDurationUs] y [maxFragmentBytes] acotan esa retención;
@@ -79,6 +88,50 @@ public class FragmentedMp4Muxer(
      */
     public var creationTimeMillis: Long? = System.currentTimeMillis()
 
+    /**
+     * Escribe delante de cada fragmento un `sidx` (Segment Index Box, ISO/IEC 14496-12 §8.16.3) por
+     * cada pista que tiene muestras en él, con la misma forma que `-movflags dash` de FFmpeg:
+     * versión 1, una sola referencia al `moof`+`mdat` que sigue, su tiempo de presentación más
+     * temprano y su duración en la escala de la pista, y si empieza en un punto de acceso. El
+     * `first_offset` de cada uno salta los `sidx` que van detrás de él.
+     *
+     * Así cada fragmento es un **segmento indexado** de DASH, y un reproductor puede saltar de uno a
+     * otro sin recorrer los `moof`. Todo se escribe hacia delante, porque el fragmento entero está
+     * en memoria antes de escribirse: el archivo sigue siendo solo-añadir y a prueba de cortes.
+     * Cuesta 52 bytes por pista y fragmento.
+     *
+     * No se declara la marca CMAF (`cmfc`): CMAF exige una sola pista por archivo, y este muxer
+     * intercala todas en el mismo `moof`. Quien necesite pistas CMAF separadas puede escribir cada
+     * pista con su propio muxer.
+     *
+     * **Hay que asignarlo antes de [start]**; después lanza `IllegalStateException`. Con él activo,
+     * [maxFragmentBytes] no puede pasar de 1 GiB, porque el `sidx` describe el tamaño de cada
+     * fragmento en 31 bits.
+     */
+    public var segmentIndex: Boolean = false
+        set(value) {
+            check(!started) { "segmentIndex se asigna antes de start()" }
+            field = value
+        }
+
+    /**
+     * Se llama con cada fragmento ya escrito y volcado al archivo, con o sin [segmentIndex]. Es la
+     * forma de empaquetar en vivo: con su posición, su tamaño y su duración, una app puede añadirlo
+     * a una lista HLS por rangos de bytes en cuanto existe, sin releer el archivo.
+     *
+     * Se llama desde el hilo que escribe el paquete que cierra el fragmento, o desde [stop] para el
+     * último. Si lanza, la excepción se ignora: un fallo de la app al anotar un segmento no puede
+     * dejar la grabación a medias, que es lo que pasaría si cortara el cierre del archivo.
+     */
+    public var onSegment: ((Mp4Segment) -> Unit)? = null
+
+    /**
+     * Bytes de la cabecera (`ftyp` + `moov`), que es el segmento de inicialización: ocupa
+     * `[0, initSegmentSize)` del archivo. Vale 0 hasta [start].
+     */
+    public var initSegmentSize: Long = 0
+        private set
+
     private companion object {
         const val MOVIE_TIMESCALE = 1000L
         const val VIDEO_TIMESCALE = 90000L
@@ -91,6 +144,18 @@ public class FragmentedMp4Muxer(
         /** Flags de `tkhd`: `track_enabled` (0x1) y `track_in_movie` (0x2). */
         const val TKHD_ENABLED_IN_MOVIE = 3
         const val TKHD_IN_MOVIE_ONLY = 2
+
+        /** Tamaño de un `sidx` de versión 1 con una sola referencia. */
+        private const val SIDX_BYTES = 52L
+
+        /**
+         * Tope de [maxFragmentBytes] con [segmentIndex]: `referenced_size` tiene 31 bits, y un
+         * fragmento puede pasar del límite en lo que ocupe la muestra que lo hace cortarse.
+         */
+        private const val MAX_INDEXED_FRAGMENT_BYTES = 1L shl 30
+
+        /** Última palabra de la referencia del `sidx` con `starts_with_SAP` puesto y `SAP_type` 0. */
+        private const val STARTS_WITH_SAP = 0x80000000L
 
         fun requireValidLimits(fragmentDurationUs: Long, maxFragmentDurationUs: Long, maxFragmentBytes: Long) {
             require(fragmentDurationUs > 0) { "fragmentDurationUs debe ser positivo: $fragmentDurationUs" }
@@ -212,6 +277,9 @@ public class FragmentedMp4Muxer(
     override fun start() {
         check(!started) { "ya iniciado" }
         check(tracks.isNotEmpty()) { "sin pistas" }
+        check(!segmentIndex || maxFragmentBytes <= MAX_INDEXED_FRAGMENT_BYTES) {
+            "con segmentIndex, maxFragmentBytes no puede pasar de $MAX_INDEXED_FRAGMENT_BYTES: $maxFragmentBytes"
+        }
         started = true
         hasVideo = tracks.any { it.info is TrackInfo.Video }
         cueTrackIndex = tracks.indexOfFirst { it.info is TrackInfo.Video }.let { if (it < 0) 0 else it }
@@ -228,6 +296,7 @@ public class FragmentedMp4Muxer(
         locateDurationFields(bytes, out.position)
         out.write(bytes)
         out.flush()
+        initSegmentSize = bytes.size.toLong()
     }
 
     /**
@@ -317,6 +386,13 @@ public class FragmentedMp4Muxer(
         val firstKeyPtsTicks: Long?,
         /** Ordinal (base 1) de esa muestra clave dentro del `trun`, para el índice `tfra`. */
         val firstKeySampleNumber: Long?,
+        /** Lo que describe el `sidx` de la pista: su PTS más temprano y su duración, en ticks y en µs. */
+        val earliestPtsTicks: Long,
+        val durationTicks: Long,
+        val earliestPtsUs: Long,
+        val durationUs: Long,
+        /** Si la primera muestra en orden de decodificación es un punto de acceso. */
+        val startsWithSync: Boolean,
     )
 
     /**
@@ -354,6 +430,7 @@ public class FragmentedMp4Muxer(
             track.lastDurationUs > 0 -> track.lastDurationUs
             else -> nextDelta
         }
+        boundReorderOffsets(samples, sorted, durationsUs, track.timescale)
 
         val baseDecodeTicks = track.toTicks(track.decodeCumUs)
         val durationsTicks = LongArray(n)
@@ -377,14 +454,87 @@ public class FragmentedMp4Muxer(
             dtsTicks += durationsTicks[i]
             cumUs = nextCumUs
         }
+        val startUs = track.decodeCumUs
         track.decodeCumUs = cumUs
 
         val fragment = TrackFragment(
             track, durationsTicks, ctts, flags, sizes, baseDecodeTicks,
             samples.map { it.data }, firstKeyPtsTicks, firstKeySampleNumber,
+            earliestPtsTicks = track.toTicks(sorted[0]),
+            durationTicks = dtsTicks - baseDecodeTicks,
+            earliestPtsUs = sorted[0],
+            durationUs = cumUs - startUs,
+            startsWithSync = samples[0].key,
         )
         track.pending.clear()
         return fragment
+    }
+
+    /**
+     * Acota cuánto se adelanta el tiempo de decodificación de una muestra a su tiempo de
+     * presentación, reescribiendo [durationsUs] si hace falta.
+     *
+     * Con los PTS ordenados, la muestra `i` en orden de decodificación se decodifica en el `i`-ésimo
+     * PTS del fragmento. Un B-frame se adelanta así uno o dos fotogramas, lo normal en CMAF. Pero si
+     * entre un B-frame y la referencia que se decodifica antes que él hay una pausa —una captura de
+     * pantalla deja de emitir fotogramas mientras nada cambia, y el codificador retiene el B-frame
+     * hasta el siguiente—, el adelanto es **la pausa entera**. Pasó con una grabación real de una
+     * tablet Android: un B-frame mostrado a los 4,6 s quedó decodificándose a los 11,3 s, y FFmpeg,
+     * que retrasa la pista entera lo que mida el mayor adelanto, ponía todo el vídeo 6,7 s por
+     * detrás del audio.
+     *
+     * El tiempo de decodificación de cada muestra se limita al menor PTS de las que quedan por
+     * decodificar más la profundidad de reordenación del fragmento —cuántas posiciones se adelanta
+     * como mucho una muestra respecto a su orden de presentación— por el intervalo típico entre
+     * fotogramas, la mediana. Así el adelanto queda en lo que tendría sin la pausa, y la pausa pasa a
+     * la duración del B-frame, que es lo que se muestra durante ella. Sin B-frames, o cuando ninguna
+     * muestra pasa del límite, no cambia nada: el archivo es idéntico. El tramo total del fragmento
+     * tampoco cambia, así que los fragmentos siguientes no se mueven.
+     */
+    private fun boundReorderOffsets(samples: List<PendingSample>, sorted: LongArray, durationsUs: LongArray, timescale: Long) {
+        val n = samples.size
+        var reordered = false
+        for (i in 1 until n) if (samples[i].ptsUs < samples[i - 1].ptsUs) reordered = true
+        if (!reordered) return
+
+        var depth = 0
+        for (i in 0 until n) depth = maxOf(depth, i - lowerBound(sorted, samples[i].ptsUs))
+        var positive = 0
+        for (i in 0 until n - 1) if (sorted[i + 1] > sorted[i]) positive++
+        if (depth == 0 || positive == 0) return
+        val gaps = LongArray(positive)
+        var g = 0
+        for (i in 0 until n - 1) if (sorted[i + 1] > sorted[i]) gaps[g++] = sorted[i + 1] - sorted[i]
+        gaps.sort()
+        val allowance = depth * gaps[positive / 2]
+
+        val pendingMin = LongArray(n)
+        pendingMin[n - 1] = samples[n - 1].ptsUs
+        for (i in n - 2 downTo 0) pendingMin[i] = minOf(samples[i].ptsUs, pendingMin[i + 1])
+        val minStepUs = (1_000_000 + timescale - 1) / timescale
+        val decode = LongArray(n)
+        var changed = false
+        for (i in 0 until n) {
+            var d = minOf(sorted[i], pendingMin[i] + allowance)
+            if (i > 0) d = maxOf(d, minOf(sorted[i], decode[i - 1] + minStepUs))
+            if (d != sorted[i]) changed = true
+            decode[i] = d
+        }
+        if (!changed) return
+        val end = sorted[n - 1] + durationsUs[n - 1]
+        for (i in 0 until n - 1) durationsUs[i] = decode[i + 1] - decode[i]
+        durationsUs[n - 1] = end - decode[n - 1]
+    }
+
+    /** Primera posición de [sorted] con un valor `>= value`: el rango de [value] contando empates a su favor. */
+    private fun lowerBound(sorted: LongArray, value: Long): Int {
+        var low = 0
+        var high = sorted.size
+        while (low < high) {
+            val mid = (low + high) ushr 1
+            if (sorted[mid] < value) low = mid + 1 else high = mid
+        }
+        return low
     }
 
     private fun flushFragment(nextTrack: TrackState? = null, nextPtsUs: Long = 0) {
@@ -393,13 +543,15 @@ public class FragmentedMp4Muxer(
             fragmentHasSamples = false
             return
         }
-        val moofOffset = out.position
-
         val totalData = fragments.sumOf { f -> f.data.sumOf { it.size.toLong() } }
         val useLargeSize = totalData + 8 > 0xFFFFFFFFL
         val mdatHeaderSize = if (useLargeSize) 16 else 8
 
-        out.write(buildMoof(fragments, mdatHeaderSize))
+        val moof = buildMoof(fragments, mdatHeaderSize)
+        val segmentOffset = out.position
+        if (segmentIndex) out.write(buildSegmentIndexes(fragments, moof.size + mdatHeaderSize + totalData))
+        val moofOffset = out.position
+        out.write(moof)
 
         if (useLargeSize) {
             out.writeInt32(1)
@@ -429,9 +581,45 @@ public class FragmentedMp4Muxer(
             }
         }
 
+        val reference = fragments.firstOrNull { it.track === tracks[cueTrackIndex] } ?: fragments.first()
+        val segment = Mp4Segment(
+            sequenceNumber, segmentOffset, out.position - segmentOffset,
+            reference.earliestPtsUs, reference.durationUs, reference.startsWithSync,
+        )
+
         sequenceNumber++
         fragmentHasSamples = false
         fragmentBytes = 0
+        onSegment?.let { notify -> runCatching { notify(segment) } }
+    }
+
+    /**
+     * Los `sidx` de un fragmento, uno por pista con muestras en él y en el orden de sus `traf`.
+     * Todos apuntan al mismo `moof`+`mdat` ([referencedSize] bytes): el `first_offset` de cada uno
+     * es lo que ocupan los que van detrás, para que su referencia empiece justo en el `moof`.
+     *
+     * `earliest_presentation_time` no tiene signo, y un fragmento puede empezar antes del origen: un
+     * B-frame que se muestra antes que el keyframe que abrió la línea de tiempo, como los fotogramas
+     * iniciales de un GOP abierto al remuxear desde un punto de búsqueda. Ahí se escribe 0, igual
+     * que el tiempo del `tfra`; escrito tal cual, el negativo se leía como un inicio a miles de
+     * millones de años.
+     */
+    private fun buildSegmentIndexes(fragments: List<TrackFragment>, referencedSize: Long): ByteArray {
+        check(referencedSize <= 0x7FFFFFFFL) { "fragmento de $referencedSize bytes: el sidx solo describe hasta 2 GiB" }
+        val builder = BoxBuilder()
+        for ((i, fragment) in fragments.withIndex()) {
+            builder.fullBox("sidx", 1, 0) {
+                u32(fragment.track.info.id)                  // reference_ID
+                u32(fragment.track.timescale)                // timescale
+                u64(fragment.earliestPtsTicks.coerceAtLeast(0)) // earliest_presentation_time
+                u64((fragments.size - 1 - i) * SIDX_BYTES)   // first_offset
+                u16(0); u16(1)                               // reserved, reference_count
+                u32(referencedSize)                          // reference_type 0 | referenced_size
+                u32(clampToU32(fragment.durationTicks))      // subsegment_duration
+                u32(if (fragment.startsWithSync) STARTS_WITH_SAP else 0L) // SAP: tipo 0, delta 0
+            }
+        }
+        return builder.toByteArray()
     }
 
     /**

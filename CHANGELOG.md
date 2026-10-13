@@ -63,8 +63,134 @@ nada.
 | **Cambiado** | Algo que sigue funcionando igual desde fuera, pero por dentro se comporta distinto (más rápido, mejor mensaje de error, menos memoria). |
 | **Eliminado** | Algo que ya no está. Aparece acompañado de `Cambios incompatibles` si alguien podía estar usándolo. |
 | **Documentación** | Solo cambia lo que está escrito, no el código. |
+| **Desarrollo** | Herramientas del propio proyecto: tests, fuzzing, benchmarks, CI. No cambian la librería que usas. |
 
 ---
+
+## [3.1.0] — 2026-10-12
+
+Mezcla en vivo del audio de grabación, segmentos indexados para HLS y DASH, lectura de MP4 largos
+sin cargar el mapa de muestras, y fuzzing de los dos demuxers. **Solo añade**: quien use la `3.0.0` actualiza sin tocar una línea ni
+recompilar. `public-api.txt` gana líneas y no pierde ninguna.
+
+### Añadido
+
+- **`PcmStreamMixer`: la mezcla de micrófono y sistema según llegan.** `PcmMixer.mix` exige
+  bloques que cubran exactamente el mismo tiempo, y en Android casi nunca llegan así: el micrófono
+  suele ir mono a 44,1 kHz y el sistema estéreo a 48 kHz, cada `AudioRecord` se lee en su propio
+  hilo y entrega trozos de un tamaño distinto. Cuadrarlos le tocaba a la app, y un bloque mal
+  cuadrado se oía como un hueco. El mezclador nuevo:
+  - recibe cada fuente en su formato y desde su hilo (`write`), y entrega la mezcla alineada en el
+    formato de salida (`read`, y `flush` al terminar);
+  - da **exactamente** lo mismo que convertir y mezclar a mano los flujos enteros con
+    `PcmResampler`, `PcmMixer.convertChannels` y `PcmMixer.mix`, sea cual sea el tamaño de los
+    trozos;
+  - es **seguro entre hilos**, y copia lo que recibe, así que la app puede reutilizar su buffer;
+  - si una fuente se retrasa, la espera hasta `maxLatencyMs` (500 ms por defecto) y después mezcla
+    su parte como silencio; el audio que llega tarde se descarta, para que un tirón de un hilo deje
+    un hueco corto en vez de desincronizar esa fuente el resto de la grabación. `lostFrames` lo
+    cuenta por fuente;
+  - expone `emittedFrames` para calcular la marca de tiempo de cada bloque que pasa al codificador.
+
+  No corrige la deriva entre los relojes de las fuentes: toma las frecuencias por su valor nominal.
+  Lo fija `PcmStreamMixerTest`, y el consumidor con Kotlin 1.9 del CI lo usa contra el artefacto
+  publicado.
+- **Segmentos indexados en el fMP4, para empaquetar HLS o DASH directamente.** Tres propiedades
+  nuevas de `FragmentedMp4Muxer`, que se asignan antes de `start()`:
+  - `segmentIndex`: escribe delante de cada fragmento un `sidx` por pista, como `-movflags dash` de
+    FFmpeg, para que un reproductor lo pida por rangos de bytes. El archivo sigue siendo uno solo y
+    solo-añadir, igual de resistente a cortes; cuesta 52 bytes por pista y fragmento.
+  - `onSegment`: avisa de cada fragmento en cuanto está en disco, con su posición, su tamaño, su
+    inicio y su duración (`Mp4Segment`). Con eso una app mantiene una lista HLS en vivo sin releer
+    el archivo. Si el aviso lanza, se ignora: un fallo de la app no puede dejar la grabación a
+    medias.
+  - `initSegmentSize`: el tamaño de la cabecera, que es el `EXT-X-MAP` de la lista.
+
+  Lo fijan `SegmentIndexTest`, campo a campo, y una prueba de integración en la que FFmpeg
+  decodifica y busca en el archivo, y reproduce todos los fotogramas a través de una lista HLS
+  montada solo con los avisos. No se declara la marca CMAF, que exige una pista por archivo; y no
+  hay índice único al principio (perfil DASH *on-demand*), porque obligaría a reescribir el archivo
+  al cerrar.
+
+### Cambiado
+
+- **`Mp4Demuxer` ya no carga el mapa de muestras al abrir: la memoria no crece con la duración.**
+  Hasta la `3.0.0` construía al abrir una tabla de 37 bytes por muestra —unos 28 MB para dos horas a
+  60 fps con AAC, y más de 140 MB para diez, que en el heap de un móvil es un `OutOfMemoryError`—.
+  Ahora recorre las tablas una vez para validarlas, guarda un punto de control cada 256 muestras y
+  lee cada muestra del archivo cuando hace falta; en fMP4, vuelve a leer el fragmento. Medido en la
+  misma máquina, sobre ese archivo de dos horas (~770 000 muestras):
+
+  | | 3.0.0 | 3.1.0 |
+  |---|---|---|
+  | Heap del demuxer abierto, MP4 / fMP4 | ~28 MB / ~28 MB | ~0,5 MB / ~0,13 MB |
+  | Abrir | ~38 ms | ~23 ms |
+  | `seekTo`, MP4 / fMP4 | ~0,7 µs / ~0,7 µs | ~7 µs / ~50 µs |
+  | Leer el archivo entero (paquetes de pocos bytes) | ~44 ms | ~77 ms |
+
+  Buscar y leer cuestan algo más, pero siguen en microsegundos por operación, muy por debajo de lo
+  que cuesta leer los datos de un vídeo real. **El resultado es idéntico**: mismos paquetes, mismas
+  marcas, mismos avisos y mismo destino en cada `seekTo`, comprobado paquete a paquete contra la
+  `3.0.0` publicada sobre 600 000 archivos mutados y sobre todas las semillas del fuzzing.
+
+### Corregido
+
+- **Un MKV con bloques comprimidos podía reservar cientos de MB al leerse.** Cada fotograma con zlib
+  creaba su propio descompresor y un buffer de 64 KB, y un bloque con lacing fijo puede declarar 256
+  fotogramas con un solo byte: un archivo de **953 bytes** reservaba 110 MB en una lectura. Ahora el
+  descompresor y el buffer se reutilizan. El techo de 64 MiB por fotograma no cambia.
+- **Con lacing, un fotograma comprimido que no se podía descomprimir adelantaba a los siguientes.**
+  Se descartaba, y los que venían detrás en el mismo bloque heredaban su marca de tiempo. Ahora el
+  hueco se mantiene, y el aviso sale una vez por bloque —«se descartan 2 de 6 fotogramas…»— en vez
+  de una por fotograma.
+
+  Los dos los encontró el fuzzing nuevo; los fijan dos tests de `MatroskaContentEncodingTest` que
+  construyen la entrada que los provocaba.
+- **Un fMP4 con B-frames podía leerse en FFmpeg con el vídeo segundos por detrás del audio.** Si una
+  pausa del vídeo de frecuencia variable caía entre un B-frame y su referencia —una captura de
+  pantalla que se queda quieta mientras el codificador retiene ese B-frame—, `FragmentedMp4Muxer`
+  lo dejaba decodificándose tanto después de mostrarlo como durase la pausa. FFmpeg retrasa la pista
+  entera lo que mida ese adelanto, así que todo el vídeo quedaba por detrás: 6,7 s en una grabación
+  real de una tablet Android. Ahora el adelanto se acota a la profundidad de reordenación por el
+  intervalo típico entre fotogramas, y la pausa pasa a la duración del B-frame, que es lo que se ve
+  durante ella. Sin esa situación el archivo sale idéntico al de antes.
+- **`Mp4Demuxer` no aplicaba la lista de edición a los MP4 fragmentados.** Un fMP4 con cebado de
+  audio —`FragmentedMp4Muxer` lo escribe así cuando la pista declara `codecDelayUs`— se leía con el
+  audio 21 ms por detrás de donde lo ponen FFmpeg y el MP4 plano de la misma entrada, y ese desfase
+  pasaba a cualquier contenedor al que se convirtiera. Ahora la lista se aplica igual que en un MP4
+  plano, también sus ediciones vacías.
+
+  Estos dos salieron al validar con grabaciones reales de un móvil, una tablet y OBS (ver
+  `ANALISIS.md`, §9.6); los fijan tests de `SyncSamplesAndTimelineTest` y `FfmpegIntegrationTest`
+  que reproducen la situación, y que fallan con el código anterior.
+
+### Desarrollo
+
+- **Fuzzing de `MkvDemuxer` y `Mp4Demuxer`** (`DemuxerFuzzTest`). Muta archivos válidos —de la
+  propia librería y, si está instalado, de FFmpeg, con los tres tipos de lacing, compresión de
+  contenido, B-frames, `edts`, HDR, `sidx` y fMP4 con y sin `base_data_offset`— a ciegas y conociendo
+  su estructura (tamaños de caja y de
+  elemento EBML, contadores de tabla, versiones, cabeceras de bloque), y comprueba en cada variante
+  la política de `SECURITY.md`: un error tipado o un fin de stream limpio, nunca un cuelgue, un
+  `Error`, una excepción no prevista, un archivo abierto ni una reserva de memoria desproporcionada.
+  Un archivo solo truncado tiene que leerse hasta donde llegue sin lanzar.
+  - En cada `./gradlew test`: 20 000 variantes fijas y cada semilla cortada en ~200 puntos.
+  - Cada semana, y a mano, una campaña larga con semilla nueva (`.github/workflows/fuzz.yml`), que
+    deja cada fallo con su entrada, su semilla y la traza.
+  - Es un fuzzer propio y no Jazzer: corre igual en Windows y en Linux, no trae dependencias ni
+    agente nativo, y es determinista, así que un hallazgo se reproduce con dos números.
+- **Benchmarks JMH** en `benchmarks/`, un build aparte que compila contra el código actual: abrir,
+  buscar y leer el MP4 de dos horas, escribirlo con `Mp4Muxer`, y mezcla, remuestreo y
+  `PcmStreamMixer` en bloques de 10 ms. El CI los ejecuta en cada push y falla si alguno reserva por
+  operación más memoria que su límite en `benchmarks/limites.properties`; los tiempos se publican en
+  el resumen, pero no se vigilan, porque en un runner compartido varían más que cualquier regresión.
+- **El repositorio no guarda archivos de vídeo.** Las semillas del fuzzing se generan en cada
+  ejecución —las de terceros con FFmpeg, como ya hacían los tests de integración—, y cada fallo que
+  encuentra se fija con un test que construye su propia entrada. El jar publicado nunca los llevó:
+  solo contiene el código de la librería.
+- Las clases nuevas del índice son `internal`, pero figuran en `public-api.txt` como todas las
+  internas: son las líneas añadidas. `SampleTable` conserva tres métodos que el demuxer ya no usa,
+  porque quitarlos quitaría líneas del volcado y eso exige la versión mayor; se retirarán en ella.
 
 ## [3.0.0] — 2026-10-07
 

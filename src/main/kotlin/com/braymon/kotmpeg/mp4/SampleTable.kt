@@ -1,7 +1,9 @@
 package com.braymon.kotmpeg.mp4
 
 /**
- * Tabla de muestras en columnas de tipos primitivos, compartida por [Mp4Muxer] y [Mp4Demuxer].
+ * Tabla de muestras de [Mp4Muxer], en columnas de tipos primitivos. Hasta la 3.0.0 también era el
+ * mapa de muestras de [Mp4Demuxer], que desde la 3.1.0 las lee del archivo bajo demanda
+ * ([TrackSamples]).
  *
  * Sustituye a una lista con un objeto por muestra. Cada objeto costaba unos 64 bytes entre
  * cabecera, relleno y la referencia de la lista, más el trabajo del recolector al soltarlos;
@@ -49,7 +51,13 @@ internal class SampleTable {
 
     fun isEmpty(): Boolean = size == 0
 
-    /** Si los DTS nunca retroceden, lo que permite buscar por bisección. */
+    /**
+     * Si los DTS nunca retroceden, lo que permite buscar por bisección.
+     *
+     * Este método y los dos de búsqueda eran del demuxer, que desde la 3.1.0 ya no los usa. Siguen
+     * aquí solo porque la clase, aunque `internal`, figura en `public-api.txt`, y quitar una línea
+     * del volcado exige la versión mayor según CONTRIBUTING. Se retiran en la próxima mayor.
+     */
     fun dtsIsMonotonic(): Boolean {
         for (i in 1 until size) if (dtsUs(i) < dtsUs(i - 1)) return false
         return true

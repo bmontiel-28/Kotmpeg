@@ -75,6 +75,16 @@ public class MkvDemuxer(
     /** Codificaciones de contenido por número de pista, ya ordenadas para deshacerlas. */
     private val contentEncodings = HashMap<Int, List<ContentEncoding>>()
 
+    /**
+     * Descompresor zlib y su buffer de trabajo, reutilizados entre fotogramas. Crearlos para cada
+     * uno costaba 64 KB de basura por fotograma más la memoria nativa de un `Inflater` nuevo: con
+     * lacing, un bloque de 256 fotogramas diminutos eran 16 MB por bloque, y un MKV de menos de
+     * 1 KB llegaba a reservar más de 100 MB en una lectura. Se crean la primera vez que hacen
+     * falta, porque casi ningún MKV comprime nada, y [close] libera el `Inflater`.
+     */
+    private var inflater: Inflater? = null
+    private var inflateChunk: ByteArray? = null
+
     private class Cue(val timeUs: Long, val clusterPosition: Long)
 
     /**
@@ -99,6 +109,7 @@ public class MkvDemuxer(
         try {
             parseHeaders()
         } catch (t: Throwable) {
+            runCatching { inflater?.end() }
             runCatching { input.close() }
             throw t
         }
@@ -457,29 +468,26 @@ public class MkvDemuxer(
      * memoria del proceso con un solo fotograma.
      */
     private fun inflate(data: ByteArray): ByteArray {
-        val inflater = Inflater()
-        try {
-            inflater.setInput(data)
-            val out = ByteArrayOutputStream(data.size * 2)
-            val chunk = ByteArray(INFLATE_CHUNK_BYTES)
-            while (!inflater.finished()) {
-                val n = try {
-                    inflater.inflate(chunk)
-                } catch (e: DataFormatException) {
-                    throw EbmlException("bloque zlib corrupto: ${e.message}")
-                }
-                if (n == 0 && (inflater.needsInput() || inflater.needsDictionary())) {
-                    throw EbmlException("bloque zlib incompleto")
-                }
-                out.write(chunk, 0, n)
-                if (out.size() > MAX_INFLATED_BYTES) {
-                    throw EbmlException("bloque zlib que descomprime más de $MAX_INFLATED_BYTES bytes")
-                }
+        val inflater = inflater ?: Inflater().also { inflater = it }
+        val chunk = inflateChunk ?: ByteArray(INFLATE_CHUNK_BYTES).also { inflateChunk = it }
+        inflater.reset()
+        inflater.setInput(data)
+        val out = ByteArrayOutputStream(minOf(data.size * 2L, INFLATE_CHUNK_BYTES.toLong()).toInt())
+        while (!inflater.finished()) {
+            val n = try {
+                inflater.inflate(chunk)
+            } catch (e: DataFormatException) {
+                throw EbmlException("bloque zlib corrupto: ${e.message}")
             }
-            return out.toByteArray()
-        } finally {
-            inflater.end()
+            if (n == 0 && (inflater.needsInput() || inflater.needsDictionary())) {
+                throw EbmlException("bloque zlib incompleto")
+            }
+            out.write(chunk, 0, n)
+            if (out.size() > MAX_INFLATED_BYTES) {
+                throw EbmlException("bloque zlib que descomprime más de $MAX_INFLATED_BYTES bytes")
+            }
         }
+        return out.toByteArray()
     }
 
     /**
@@ -870,6 +878,13 @@ public class MkvDemuxer(
         return frames
     }
 
+    /**
+     * Encola los fotogramas de un bloque. Con lacing, la duración del bloque se reparte por
+     * **posición**: un fotograma cuya compresión no se puede deshacer se descarta dejando su
+     * hueco, y los siguientes conservan su tiempo. Hasta la 3.0.0 se numeraban solo los que
+     * quedaban, así que cada descarte adelantaba el resto del bloque, y se avisaba una vez por
+     * fotograma: 255 avisos para un solo bloque dañado. Ahora es un aviso por bloque.
+     */
     private fun emitBlock(
         track: TrackInfo,
         header: BlockHeader,
@@ -884,13 +899,19 @@ public class MkvDemuxer(
         val rawFrames = if (lacing == LACING_NONE) listOf(payload) else splitLaces(payload, lacing) ?: return
 
         val encodings = contentEncodings[number]
-        val frames = if (encodings == null) rawFrames else rawFrames.mapNotNull { frame ->
+        var discarded = 0
+        var cause: String? = null
+        val frames: List<ByteArray?> = if (encodings == null) rawFrames else rawFrames.map { frame ->
             try {
                 decode(frame, encodings, CONTENT_SCOPE_FRAMES)
             } catch (e: Exception) {
-                warn("pista $number: se descarta un bloque cuya compresión no se pudo deshacer (${e.message})")
+                if (discarded++ == 0) cause = e.message
                 null
             }
+        }
+        if (discarded > 0) {
+            val what = if (rawFrames.size == 1) "se descarta un bloque" else "se descartan $discarded de ${rawFrames.size} fotogramas de un bloque"
+            warn("pista $number: $what cuya compresión no se pudo deshacer ($cause)")
         }
 
         val basePtsUs = ticksToUs(clusterTimestampTicks + header.relative)
@@ -902,6 +923,7 @@ public class MkvDemuxer(
             else -> explicitDurUs
         }
         for ((k, frame) in frames.withIndex()) {
+            if (frame == null) continue
             val pts = basePtsUs + k * perFrameUs
             pending.add(
                 MediaPacket(
@@ -986,7 +1008,14 @@ public class MkvDemuxer(
         return bestPos to bestUs
     }
 
-    override fun close(): Unit = input.close()
+    override fun close() {
+        try {
+            inflater?.end()
+            inflater = null
+        } finally {
+            input.close()
+        }
+    }
 
     /**
      * Constantes internas. Van marcadas `private` una a una y no solo el `companion`: un

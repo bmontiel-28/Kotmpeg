@@ -5,7 +5,7 @@ plugins {
 
 // La versión vive aquí y no como texto suelto en el README: es la que acaba en el POM y en el
 // nombre del jar, así que cualquier otra copia acabaría desincronizándose.
-version = "3.0.0"
+version = "3.1.0"
 group = "com.braymon"
 
 // El nombre del jar sigue al del artefacto publicado, no al de la carpeta del repositorio.
@@ -58,6 +58,13 @@ tasks.test {
     // Gradle no reenvía las `-D` de la línea de comandos al JVM de test. `PublicApiTest` la
     // necesita para poder regenerar el volcado de API pública a petición.
     systemProperty("kotmpeg.api.update", providers.systemProperty("kotmpeg.api.update").orNull ?: "false")
+
+    // La campaña de fuzzing larga se pide igual, con `-D` en la línea de comandos (ver
+    // `DemuxerFuzzTest`). Sin ellas corre la pasada corta y fija de siempre.
+    for (propiedad in listOf("kotmpeg.fuzz.iterations", "kotmpeg.fuzz.seconds", "kotmpeg.fuzz.seed")) {
+        providers.systemProperty(propiedad).orNull?.let { systemProperty(propiedad, it) }
+    }
+    systemProperty("kotmpeg.fuzz.findings", layout.buildDirectory.dir("fuzz-findings").get().asFile.absolutePath)
 
     // `AndroidApiCompatibilityTest` necesita la firma de Android y las clases compiladas de la
     // librería; se le pasan como rutas para que no dependa del directorio de trabajo.

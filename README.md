@@ -11,15 +11,23 @@ pantalla, audio del sistema y micrófono —mezclados en una pista o cada uno en
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10. Sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
 
-**Versión: 3.0.0 — estable.**
+**Versión: 3.1.0**
 
+- **La `3.1.0` solo añade, y no te pide nada si usas la `3.0.0`.** Trae
+  [`PcmStreamMixer`](#mezclar-en-streaming-con-pcmstreammixer), la mezcla de micrófono y sistema
+  según llegan; [segmentos indexados con `sidx`](#segmentos-para-hls-y-dash) en el fMP4, con un
+  aviso por segmento para empaquetar HLS o DASH en vivo; y `Mp4Demuxer` deja de cargar el mapa de
+  muestras al abrir: [la memoria ya no crece con la duración](#memoria-al-leer-archivos-largos).
+  Corrige además dos fallos de `MkvDemuxer` con bloques comprimidos que encontró el fuzzing de los
+  demuxers, nuevo en esta versión.
 - **Si ya usas la `2.1.1`, tu código no cambia.** La `3.0.0` no quita ni modifica ninguna firma
   pública —ni siquiera hace falta recompilar—: solo añade. Lo que la hace mayor son unos pocos
   cambios de **comportamiento**, todos correcciones, que el [CHANGELOG](CHANGELOG.md) explica uno a
   uno con lo que hay que revisar.
 - La API pública está congelada: romperla exige subir la mayor. No depende de que nadie se acuerde
   — `PublicApiTest` compara la superficie pública contra un volcado versionado y falla si se mueve.
-- El análisis técnico de la `3.0`, con mediciones antes/después, está en [`ANALISIS.md`](ANALISIS.md).
+- El análisis técnico de la `3.0` y la `3.1`, con mediciones antes/después, está en
+  [`ANALISIS.md`](ANALISIS.md).
 
 La librería **no codifica ni decodifica**: empaqueta y desempaqueta streams que ya vienen
 comprimidos. Lo único que procesa en crudo es el audio PCM, para poder mezclar micrófono y sistema
@@ -76,7 +84,7 @@ muxer.stop()
 
 ```
  micrófono (PCM) ─┐
-                  ├─► PcmResampler / PcmMixer ─► codificador AAC ─┐
+                  ├─► PcmStreamMixer ──────────► codificador AAC ─┐
  sistema   (PCM) ─┘   (solo si se quiere mezcla)                  │
                                                                   ├─► Kotmpeg Core ─► .mkv / .mp4
  micrófono / sistema por separado ───────────► codificador AAC ───┤      (muxer)
@@ -116,7 +124,7 @@ contenedores y tras convertir entre ellos; si un cambio la rompe, el cambio est�
 
 | Montaje | Pistas de audio en el archivo | Cómo |
 |---|---|---|
-| Mezcla | `Mezcla` | `PcmMixer.mix` antes de un único codificador |
+| Mezcla | `Mezcla` | `PcmStreamMixer` (o `PcmMixer.mix` con bloques ya cuadrados) antes de un único codificador |
 | Solo micrófono | `Micrófono` | una pista |
 | Solo sistema | `Audio del sistema` | una pista |
 | Separadas | `Micrófono` + `Audio del sistema` | una pista por fuente, un codificador por fuente |
@@ -143,10 +151,50 @@ fun mezclar(sistemaEstereo48k: ShortArray, microfonoMono44k: ShortArray): ShortA
 - **Alimenta bloques que cubran el mismo tiempo.** `mix` trata la fuente más corta como silencio
   a partir de su final, así que si los bloques no cuadran, se oye un hueco. El remuestreador es
   exacto en enteros: tras N frames de entrada ha emitido exactamente los que corresponden, sin
-  deriva en sesiones de horas, así que no hace falta corregir nada a mano.
+  deriva en sesiones de horas, así que no hace falta corregir nada a mano. Si cuadrarlos te toca a
+  ti, usa `PcmStreamMixer` (abajo), que lo hace por ti.
 - **Rendimiento**: mezclar una hora de estéreo a 48 kHz en bloques de 10 ms cuesta unos 0,3 s de
   CPU sin ganancias (la ruta es entera, ~6 veces más rápida que en la `2.x`) y unos 2,3 s con
   ganancias, medido en un equipo de desarrollo. El resultado es idéntico bit a bit al de la `2.x`.
+
+### Mezclar en streaming con `PcmStreamMixer`
+
+En Android cada fuente se lee en su propio hilo y cada `AudioRecord` entrega trozos de un tamaño
+distinto, así que cuadrar bloques a mano es justo lo incómodo. `PcmStreamMixer` (desde la `3.1.0`)
+recibe cada fuente según llega, en su formato, y entrega la mezcla ya alineada:
+
+```kotlin
+val mezclador = PcmStreamMixer(outputRate = 48_000, outputChannels = 2)
+val micro = mezclador.addSource(sampleRate = 44_100, channels = 1)
+val sistema = mezclador.addSource(sampleRate = 48_000, channels = 2)      // o gain = 0.8f
+
+// Desde el hilo del micrófono:             mezclador.write(micro, pcmMicro)
+// Desde el hilo de la captura del sistema:  mezclador.write(sistema, pcmSistema)
+
+// Desde el hilo del codificador:
+val desde = mezclador.emittedFrames
+val bloque = mezclador.read()                         // lo ya alineado; puede venir vacío
+val ptsUs = inicioUs + desde * 1_000_000 / 48_000     // marca del primer frame del bloque
+
+// Al terminar la grabación:
+val cola = mezclador.flush()
+```
+
+- **El resultado es el de mezclar a mano**: idéntico, muestra a muestra, a convertir y sumar los
+  flujos enteros con `PcmResampler`, `PcmMixer.convertChannels` y `PcmMixer.mix`, sea cual sea el
+  tamaño de los trozos y el orden en que lleguen.
+- **Es seguro entre hilos**: cada fuente desde su hilo y la lectura desde el del codificador. Los
+  arrays se copian, así que puedes reutilizar tu buffer.
+- **Si una fuente se retrasa**, se la espera hasta `maxLatencyMs` (500 ms por defecto). Pasado ese
+  margen, su parte se mezcla como silencio y, cuando el audio retrasado llega, se descarta lo ya
+  entregado: un tirón deja un hueco corto, pero nunca desincroniza esa fuente para el resto de la
+  grabación. `lostFrames(fuente)` lo cuenta, y si crece, esa fuente se está quedando atrás.
+- **Arranque**: las fuentes que entregan audio antes de que salga la primera mezcla se consideran
+  simultáneas. Si sabes que una arrancó X ms después, escríbele antes X ms de silencio. Una fuente
+  que empieza cuando la mezcla ya ha salido se coloca donde llega.
+- **No corrige la deriva de reloj** entre fuentes: las frecuencias se toman por su valor nominal.
+  Si un dispositivo entregara una fuente algo más despacio de lo que declara, se vería en
+  `lostFrames` como pérdidas puntuales, nunca como un desfase creciente.
 
 ### Cada fuente en su pista
 
@@ -247,7 +295,7 @@ dependencyResolutionManagement {
 
 // build.gradle.kts — qué bajar
 dependencies {
-    implementation("com.github.bmontiel-28:Kotmpeg:3.0.0")
+    implementation("com.github.bmontiel-28:Kotmpeg:3.1.0")
 }
 ```
 
@@ -273,7 +321,7 @@ aquí sale uno. Escribirla con punto antes de `Kotmpeg` da un `Could not find`.
 // settings.gradle.kts
 dependencyResolutionManagement { repositories { mavenLocal(); mavenCentral() } }
 // build.gradle.kts
-dependencies { implementation("com.braymon:kotmpeg-core:3.0.0") }
+dependencies { implementation("com.braymon:kotmpeg-core:3.1.0") }
 ```
 
 Las dos opciones publican el jar y un jar de fuentes, así que el IDE deja navegar el código y leer
@@ -291,7 +339,8 @@ hilos**, y es intencional: serializar por dentro costaría rendimiento en el 100
 Si varios productores escriben al mismo archivo —lo normal en cuanto hay vídeo y audio en hilos
 distintos—, envuelve el muxer con `MkvKotlin.synchronizedMuxer`, que serializa cada operación con
 un único cerrojo. Un `PcmResampler` por fuente, usado desde el hilo de esa fuente. `PcmMixer` no
-tiene estado y se puede llamar desde cualquier hilo.
+tiene estado y se puede llamar desde cualquier hilo. `PcmStreamMixer` es la excepción a propósito:
+es seguro entre hilos, porque existe precisamente para recibir cada fuente desde su hilo.
 
 ## Memoria al escribir archivos largos
 
@@ -320,18 +369,26 @@ queda intacto y reproducible, sin inicio rápido, y `stop()` lanza explicándolo
 
 ## Memoria al *leer* archivos largos
 
-`Mp4Demuxer` construye el mapa **completo** de muestras al abrir, porque es lo que permite el seek
-exacto por índice. Para un archivo de 2 horas a 60 fps con audio AAC:
+Desde la `3.1.0`, `Mp4Demuxer` **no carga las muestras en memoria**: al abrir recorre sus tablas una
+vez para validarlas y guarda un punto de control cada 256 muestras, y después lee cada muestra del
+archivo cuando hace falta. Para un archivo de 2 horas a 60 fps con audio AAC (~770 000 muestras),
+medido en la misma máquina:
 
-| Pista | Muestras | RAM aprox. |
+| | `3.0.0` | `3.1.0` |
 |---|---|---|
-| Vídeo 60 fps | ~432 000 | ~16 MB |
-| Audio AAC (1024 muestras/paquete) | ~337 000 | ~13 MB |
-| **Total** (medido) | | **~29 MB** |
+| Heap del demuxer abierto, MP4 / fMP4 | ~28 MB / ~28 MB | **~0,5 MB / ~0,13 MB** |
+| Abrir | ~38 ms | ~23 ms |
+| `seekTo`, MP4 / fMP4 | ~0,7 µs / ~0,7 µs | ~7 µs / ~50 µs |
+| Leer el archivo entero (paquetes de pocos bytes) | ~44 ms | ~77 ms |
 
-Se paga **al abrir**: en ese archivo, unos 0,3 s (la `2.x` tardaba más de 10 s y ocupaba ~48 MB).
-Con fMP4 el recorrido además atraviesa todos los fragmentos. `MkvDemuxer` no tiene este coste:
-Matroska se recorre cluster a cluster y el índice `Cues` solo se consulta al buscar.
+La diferencia crece con la duración: con la `3.0.0` diez horas eran más de 140 MB, que en el heap
+de un móvil es un `OutOfMemoryError`; ahora son del orden de 2,5 MB. A cambio, buscar y leer cuestan
+algo más, pero siguen en microsegundos por operación, muy por debajo de lo que cuesta leer los datos
+de un vídeo real. El resultado es idéntico al de la `3.0.0`: mismos paquetes y mismo destino en
+cada `seekTo`.
+
+`MkvDemuxer` nunca tuvo este coste: Matroska se recorre cluster a cluster y el índice `Cues` solo se
+consulta al buscar.
 
 ## Errores y avisos
 
@@ -349,8 +406,9 @@ MkvKotlin.remux(entrada, salida, onWarning = { println("aviso: $it") })
 
 La política es que un archivo dañado produzca **un error claro o un fin de stream**, nunca un
 cuelgue ni un consumo de memoria sin control. La hacen cumplir `RobustnessTest`,
-`UntrustedTableSizesTest`, `LargeFileEdgeCasesTest` y `Mp4HeaderHardeningTest`, y está descrita en
-[`SECURITY.md`](SECURITY.md).
+`UntrustedTableSizesTest`, `LargeFileEdgeCasesTest` y `Mp4HeaderHardeningTest`, y el fuzzing de
+`DemuxerFuzzTest`, que la comprueba sobre miles de archivos mutados en cada ejecución de los tests
+y sobre millones en una campaña semanal del CI. Está descrita en [`SECURITY.md`](SECURITY.md).
 
 ---
 
@@ -373,6 +431,7 @@ cuelgue ni un consumo de memoria sin control. La hacen cumplir `RobustnessTest`,
 | Archivos > 4 GiB | ✅ | ✅ (mdat de 64 bits + co64) |
 | Inicio rápido / progresivo | ✅ (por diseño del formato) | ✅ `mp4FastStart` (= `-movflags +faststart`) |
 | Fragmentado / a prueba de cortes | ✅ (por diseño del formato) | ✅ fMP4 lectura y escritura (= `frag_keyframe+empty_moov`) |
+| Segmentos indexados para HLS/DASH | — | ✅ un `sidx` por pista y fragmento (= `-movflags dash`) y aviso por segmento |
 | Rotación de pantalla | ✅ (`Projection`/PoseRoll) | ✅ (matriz `tkhd`, visible en ffprobe) |
 | Píxeles no cuadrados | ✅ (`DisplayWidth`/`Height`, con `DisplayUnit` resuelto al leer) | ✅ (tamaño de presentación del `tkhd`) |
 | Color y HDR10 estático | ✅ (`Colour` + `MasteringMetadata`) | ✅ (`colr` nclx + `mdcv` + `clli`) |
@@ -387,6 +446,7 @@ cuelgue ni un consumo de memoria sin control. La hacen cumplir `RobustnessTest`,
 | Demuxer `concat` (unir segmentos sin recodificar) | `MkvKotlin.concat(inputs, output)` |
 | `-movflags +faststart` | `createMuxer(..., mp4FastStart = true)` |
 | `-movflags frag_keyframe+empty_moov` (fMP4) | `createMuxer(..., mp4Fragmented = true)` |
+| `-movflags dash` (un `sidx` por pista y fragmento) | `FragmentedMp4Muxer(file).apply { segmentIndex = true }` |
 | `-map` (selección de pistas) | `remux(..., trackFilter = { id -> ... })` |
 | `-metadata:s:a:0 language=spa` / `title=` | `TrackInfo.Audio(language = "spa", name = "Micrófono")` |
 | `-disposition:a:1 0` | `TrackInfo.Audio(default = false)` |
@@ -394,7 +454,7 @@ cuelgue ni un consumo de memoria sin control. La hacen cumplir `RobustnessTest`,
 | `-color_primaries/-color_trc/-colorspace/-color_range` + HDR10 | `TrackInfo.Video(color = ColorInfo(...))` |
 | ffprobe (inspección) | `openDemuxer(file).tracks` / `durationUs` |
 | Seek por índice | `Demuxer.seekTo(us)` (Cues / stss, por bisección) |
-| Filtro `amix` / `pan` | `PcmMixer` (mezcla saturada con ganancias, mono↔estéreo) |
+| Filtro `amix` / `pan` | `PcmMixer` (mezcla saturada con ganancias, mono↔estéreo) y `PcmStreamMixer` (en vivo, fuentes con formato y ritmo distintos) |
 | `-ar` / `-ac` sobre PCM | `PcmResampler` (remuestreo lineal en streaming, fase exacta) |
 
 **Detalle del fMP4/CMAF**, por ser la parte menos habitual: `FragmentedMp4Muxer` escribe `ftyp` +
@@ -407,7 +467,40 @@ se rellenan al cerrar; si el proceso muere antes, se quedan a cero y lo grabado 
 fragmento completo se reproduce sin más. La duración del último fotograma de cada fragmento se toma
 del keyframe que abre el siguiente, así que el vídeo de frecuencia variable de una captura de
 pantalla no desalinea los tiempos. Los B-frames van por `trun` v1 con offsets de composición
-firmados. El demuxer lee fMP4 propio y de FFmpeg.
+firmados, como en CMAF, y lo que un B-frame se decodifica después de mostrarse queda acotado aunque
+una pausa de la pantalla caiga entre él y su referencia. El demuxer lee fMP4 propio y de FFmpeg,
+con su lista de edición igual que en un MP4 plano.
+
+## Segmentos para HLS y DASH
+
+Con `segmentIndex`, `FragmentedMp4Muxer` escribe delante de cada fragmento un índice `sidx` por
+pista, igual que `-movflags dash` de FFmpeg: cada fragmento pasa a ser un **segmento indexado** que
+un reproductor DASH o HLS puede pedir por rangos de bytes. Sigue siendo un único archivo que se
+escribe solo hacia delante —el fragmento entero está en memoria antes de escribirse, así que su
+índice se calcula sin volver atrás—, y por tanto igual de resistente a cortes. Cuesta 52 bytes por
+pista y fragmento.
+
+`onSegment` avisa de cada fragmento en cuanto está en disco, con su posición, su tamaño y su
+duración, y `initSegmentSize` da el tamaño de la cabecera: es todo lo que hace falta para mantener
+una lista HLS en vivo mientras se graba, sin releer el archivo.
+
+```kotlin
+val lista = StringBuilder()
+val muxer = FragmentedMp4Muxer(File(dir, "grabacion.mp4")).apply {
+    segmentIndex = true                       // antes de start()
+    onSegment = { s ->
+        lista.append("#EXTINF:%.3f,\n".format(Locale.ROOT, s.durationUs / 1e6))
+        lista.append("#EXT-X-BYTERANGE:${s.size}@${s.offset}\ngrabacion.mp4\n")
+    }
+}
+// addTrack, start(), writePacket… La lista empieza con #EXTM3U, #EXT-X-VERSION:7 (la que admite
+// fMP4), #EXT-X-TARGETDURATION con la duración máxima redondeada hacia arriba, y
+// #EXT-X-MAP:URI="grabacion.mp4",BYTERANGE="${muxer.initSegmentSize}@0"; al cerrar, #EXT-X-ENDLIST.
+```
+
+Así lo prueba el CI: una lista montada solo con esos avisos tiene que reproducir en FFmpeg todos los
+fotogramas. No se declara la marca CMAF (`cmfc`), porque CMAF exige una sola pista por archivo y
+este muxer intercala todas; si la necesitas, escribe cada pista con su propio muxer.
 
 ## Estructura
 
@@ -421,12 +514,14 @@ com/braymon/kotmpeg/
 ├── Muxer.kt             Interfaces Muxer y Demuxer.
 ├── TimelineGate.kt      Retención de arranque: origen común de los muxers que escriben en vivo.
 │
-├── audio/               PCM de grabación: PcmMixer (mezcla micrófono + sistema, canales) y
-│                        PcmResampler (remuestreo en streaming con fase exacta).
+├── audio/               PCM de grabación: PcmMixer (mezcla micrófono + sistema, canales),
+│                        PcmResampler (remuestreo en streaming con fase exacta) y
+│                        PcmStreamMixer (mezcla en vivo de fuentes desalineadas).
 ├── ebml/                EBML: lector, escritor e IDs de Matroska (RFC 8794).
 ├── mkv/                 MkvMuxer / MkvDemuxer (SeekHead, Cues, lacing, ContentEncoding).
 ├── mp4/                 ISO/IEC 14496-12: Mp4Muxer (faststart), FragmentedMp4Muxer (fMP4),
-│                        Mp4Demuxer, BoxBuilder, SampleEntries y SampleTable.
+│                        Mp4Demuxer y su índice bajo demanda (SampleIndex), BoxBuilder,
+│                        SampleEntries y SampleTable.
 ├── model/               Modelo canónico: MediaPacket, TrackInfo, códecs, ColorInfo/HDR.
 ├── codecconfig/         NalUnits (Annex-B ↔ ISO, avcC/hvcC), AacConfig, OpusConfig.
 ├── io/                  SeekableInput / SeekableOutput (File, RAF o FileDescriptor).
@@ -446,9 +541,11 @@ contenedor.
 | `Muxer` / `Demuxer` | Interfaces de escritura/lectura de contenedores |
 | `MkvMuxer` / `MkvDemuxer` | Matroska directo (si no quieres pasar por la fachada) |
 | `Mp4Muxer` / `FragmentedMp4Muxer` / `Mp4Demuxer` | ISO BMFF plano, fMP4 y lectura de ambos |
+| `Mp4Segment` | Un fragmento ya escrito, tal como lo avisa `FragmentedMp4Muxer.onSegment`: posición, tamaño, inicio y duración |
 | `MediaPacket`, `TrackInfo.Video/Audio`, `VideoCodec`, `AudioCodec`, `ContainerFormat` | Modelo de datos canónico (nombre, idioma y pista predeterminada por pista; rotación y color en vídeo) |
 | `ColorInfo` / `HdrStaticInfo` | Color BT.709/BT.2020, rango, PQ/HLG y HDR10 estático |
 | `PcmMixer` / `PcmResampler` | Audio de grabación: mezcla saturada con ganancias, mono↔estéreo, remuestreo en streaming |
+| `PcmStreamMixer` | Mezcla en vivo de micrófono y sistema: cada fuente en su formato y desde su hilo, entrega alineada, segura entre hilos |
 | `Remuxer` | Copia de streams demuxer→muxer con filtro/progreso y `concat` de segmentos |
 | `NalUnits`, `HevcSpsInfo`, `BitReader` | Annex-B ↔ ISO, avcC/hvcC, parser de SPS HEVC |
 | `AacConfig`, `OpusConfig` | AudioSpecificConfig y OpusHead/dOps |
@@ -480,7 +577,7 @@ Todas son decisiones de alcance, no carencias pendientes:
 | Funcionalidad | Aquí | Por qué |
 |---|---|---|
 | Códecs (H.264/H.265/AAC/Opus) | ❌ | Este proyecto empaqueta streams **ya codificados**. En un móvil la codificación va por el chip, y en un servidor, por lo que ya tengas. |
-| Filtros de vídeo (`scale`, `crop`, `overlay`) | ❌ | Esto es un muxer, no un motor de edición. El único proceso de señal es el de audio PCM (`PcmMixer`/`PcmResampler`), y existe por la regla de audio: mezclar micrófono y sistema antes de codificar. |
+| Filtros de vídeo (`scale`, `crop`, `overlay`) | ❌ | Esto es un muxer, no un motor de edición. El único proceso de señal es el de audio PCM (`PcmMixer`/`PcmResampler`/`PcmStreamMixer`), y existe por la regla de audio: mezclar micrófono y sistema antes de codificar. |
 | Subtítulos y capítulos | ❌ (las pistas ajenas se ignoran limpiamente al leer) | Los flujos objetivo no los generan ni los consumen; añadirlos es posible sobre la misma base. |
 | Otros códecs (VP9, AV1, MP3, ProRes…) | ❌ | Alcance deliberado: los cuatro con soporte universal en MKV/MP4 y aceleración garantizada por hardware. |
 | Otros contenedores (AVI, MPEG-TS, MOV antiguos…) | ❌ | La librería nace exactamente para MKV y MP4/fMP4. (Los WebM se pueden *leer* porque son Matroska.) |
@@ -489,7 +586,7 @@ Todas son decisiones de alcance, no carencias pendientes:
 | SIMD / ensamblador | ❌ | La JVM no da acceso a eso; el trabajo es sobre todo E/S y copia de buffers. |
 | Recuperar un MP4 con el `moov` corrupto o ausente | ❌ (falla limpio con "no se encontró la caja moov") | Reconstruir las tablas escaneando el `mdat` es mucha superficie para un caso que el fMP4 ya cubre por diseño. Una pista ilegible sí se tolera: se descarta y el resto se lee. |
 | Entrada/salida por streaming puro (tuberías, sockets) | ❌ (hace falta un destino posicionable) | Los muxers vuelven atrás a parchear tamaños al cerrar. Sí vale cualquier **descriptor ya abierto**. |
-| Segmentación e índice `sidx` en fMP4 | ❌ (se escribe `moof`+`mdat` y un `mfra` final) | El fMP4 de aquí es un **único archivo** solo-añadir; segmentar es trabajo del empaquetador. |
+| Índice `sidx` único al principio (perfil DASH *on-demand*) | ❌ (con `segmentIndex`, cada fragmento lleva el suyo) | Un índice global va delante de todos los fragmentos, que solo se conocen al cerrar: habría que reescribir el archivo entero, y dejaría de ser solo-añadir y a prueba de cortes. Partir el archivo en varios es trabajo del empaquetador. |
 | Salida sobre el propio archivo de entrada | ❌ (rechazado con un error claro) | El muxer trunca el destino al abrirlo. Escribe a un temporal y renómbralo. |
 | Cifrado y compresión bzlib/lzo de Matroska | ❌ (la pista se descarta con aviso) | Entregar esos bloques sin deshacerlos sería entregar basura al decodificador. La eliminación de cabecera y zlib, que sí aparecen en archivos reales, se leen. |
 
@@ -501,7 +598,7 @@ Todas son decisiones de alcance, no carencias pendientes:
 ./gradlew test
 ```
 
-211 tests. Necesitan **JDK 17+**; si además tienes **ffmpeg** en el `PATH`, se ejecuta también la
+239 tests. Necesitan **JDK 17+**; si además tienes **ffmpeg** en el `PATH`, se ejecuta también la
 suite de integración, que genera archivos con FFmpeg real, los reescribe con esta librería en ambas
 direcciones y valida el resultado con `ffprobe` y una decodificación completa sin errores. Sin
 ffmpeg esos tests se omiten solos (`assumeTrue`).
@@ -530,12 +627,41 @@ Kotlin 1.9 no funciona con Gradle 9; se lanza desde su carpeta:
 ```bash
 ./gradlew publishToMavenLocal
 cd compat/kotlin-1.9
-sh gradlew run -PkotmpegVersion=3.0.0
+sh gradlew run -PkotmpegVersion=3.1.0
 ```
 
-En Windows, el último paso es `.\gradlew.bat run -PkotmpegVersion=3.0.0`.
+En Windows, el último paso es el mismo con `.\gradlew.bat` en lugar de `sh gradlew`.
 
 Cómo contribuir y qué hacer cuando cambia la API pública está en [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Fuzzing
+
+`DemuxerFuzzTest` muta archivos válidos de los dos contenedores y comprueba que cada variante falle
+con un error tipado o termine limpia: nunca un cuelgue, un `Error` ni una reserva de memoria
+desproporcionada. Parte de archivos generados en cada ejecución por la propia librería y, si está
+instalado, por FFmpeg: el repositorio no guarda archivos de vídeo. Dentro de `./gradlew test` hace
+siempre la misma pasada corta —20 000 variantes—, y el CI lanza cada semana una campaña larga con
+semilla nueva (`.github/workflows/fuzz.yml`). Para una campaña en local, de diez minutos y con la
+semilla que quieras:
+
+```bash
+./gradlew test --tests "*DemuxerFuzzTest*" -Dkotmpeg.fuzz.seconds=600 -Dkotmpeg.fuzz.seed=1234
+```
+
+Cada fallo queda en `build/fuzz-findings/`, con la entrada exacta y lo necesario para reproducirlo.
+
+## Benchmarks
+
+Los benchmarks JMH están en `benchmarks/`, un build aparte que compila contra el código actual:
+
+```bash
+./gradlew -p benchmarks verificarLimites
+```
+
+Miden abrir, buscar y leer un MP4 de dos horas, escribirlo con `Mp4Muxer`, y el audio PCM en
+bloques de 10 ms. La tarea falla si alguno reserva por operación más memoria que su límite en
+`benchmarks/limites.properties`; el CI la ejecuta en cada push y publica los tiempos en el resumen
+del job.
 
 ## Licencia
 

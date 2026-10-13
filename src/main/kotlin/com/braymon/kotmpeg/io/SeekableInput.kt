@@ -126,6 +126,21 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
         return v
     }
 
+    /**
+     * Lee [length] bytes desde [at] directamente del canal, **sin mover [position] ni tocar el
+     * buffer**. Es para el índice de muestras de `Mp4Demuxer`, que lee sus tablas por páginas a
+     * medida que avanza la lectura: pasar por el buffer compartido lo vaciaría con cada página y
+     * obligaría a releer la zona de datos en el paquete siguiente.
+     */
+    internal fun readAt(at: Long, dst: ByteArray, offset: Int, length: Int) {
+        var done = 0
+        while (done < length) {
+            val n = channel.read(ByteBuffer.wrap(dst, offset + done, length - done), at + done)
+            if (n <= 0) throw EOFException("fin de archivo en ${at + done}")
+            done += n
+        }
+    }
+
     public fun readInt32(): Int = readBits(4).toInt()
     public fun readInt64(): Long = readBits(8)
 

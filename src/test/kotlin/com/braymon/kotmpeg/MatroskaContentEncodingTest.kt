@@ -54,13 +54,17 @@ class MatroskaContentEncodingTest {
 
     /**
      * MKV mínimo escrito a mano, porque ningún muxer de aquí produce `ContentEncodings`: una pista
-     * de audio AAC con la codificación pedida y un cluster con [payloads] tal cual.
+     * de audio AAC con la codificación pedida y un cluster con [payloads] tal cual. Con [lacing]
+     * (1 = Xiph, 2 = fijo) van todos en un solo `SimpleBlock`, y [defaultDurationNs] es lo que
+     * reparte el tiempo entre los fotogramas de ese bloque.
      */
     private fun handMadeMkv(
         file: File,
         encoding: Encoding,
         payloads: List<ByteArray>,
         timestampScale: Long = 1_000_000,
+        lacing: Int = 0,
+        defaultDurationNs: Long = 0,
     ): File {
         SeekableOutput(file).use { out ->
             val ebml = EbmlWriter(out)
@@ -77,6 +81,7 @@ class MatroskaContentEncodingTest {
             ebml.writeUInt(MatroskaIds.TRACK_TYPE, MatroskaIds.TRACK_TYPE_AUDIO)
             ebml.writeString(MatroskaIds.CODEC_ID, AudioCodec.AAC.matroskaId)
             ebml.writeElement(MatroskaIds.CODEC_PRIVATE, AacConfig.build(48000, 2))
+            if (defaultDurationNs > 0) ebml.writeUInt(MatroskaIds.DEFAULT_DURATION, defaultDurationNs)
             val encodings = ebml.beginMaster(MatroskaIds.CONTENT_ENCODINGS)
             val single = ebml.beginMaster(MatroskaIds.CONTENT_ENCODING)
             ebml.writeUInt(MatroskaIds.CONTENT_ENCODING_SCOPE, 1)
@@ -100,7 +105,25 @@ class MatroskaContentEncodingTest {
             ebml.endMaster(tracks)
             val cluster = ebml.beginMaster(MatroskaIds.CLUSTER)
             ebml.writeUInt(MatroskaIds.CLUSTER_TIMESTAMP, 0)
+            if (lacing != 0) {
+                val block = ByteArrayOutputStream()
+                block.write(0x81)
+                block.write(0)
+                block.write(0)
+                block.write(0x80 or (lacing shl 1))
+                block.write(payloads.size - 1)
+                if (lacing == 1) {
+                    for (payload in payloads.dropLast(1)) {
+                        var size = payload.size
+                        while (size >= 255) { block.write(255); size -= 255 }
+                        block.write(size)
+                    }
+                }
+                payloads.forEach { block.write(it) }
+                ebml.writeElement(MatroskaIds.SIMPLE_BLOCK, block.toByteArray())
+            }
             for ((i, payload) in payloads.withIndex()) {
+                if (lacing != 0) break
                 val block = ByteArrayOutputStream()
                 block.write(0x81)
                 block.write(0)
@@ -231,6 +254,54 @@ class MatroskaContentEncodingTest {
         assertEquals(INFLATE_CEILING, packets[2].data.size.toLong())
         assertTrue(packets[2].data.all { it == 0.toByte() }, "el fotograma no se descomprimió bien")
         assertTrue(warnings.isEmpty(), "un fotograma dentro del techo no debería avisar: $warnings")
+    }
+
+    /**
+     * Encontrado por el fuzzing (`DemuxerFuzzTest`). En un bloque con lacing, un fotograma cuya
+     * compresión no se podía deshacer se descartaba y los siguientes heredaban su tiempo: el audio
+     * de detrás se adelantaba un fotograma por cada descarte. Ahora el hueco se mantiene y se avisa
+     * una sola vez por bloque, no una por fotograma.
+     */
+    @Test
+    fun `a corrupt frame inside a laced block leaves its gap and warns once`() {
+        val payloads = frames.map(::zlib).toMutableList()
+        payloads[1] = byteArrayOf(1, 2, 3, 4)
+        payloads[3] = byteArrayOf(5, 6)
+        val warnings = ArrayList<String>()
+        val file = handMadeMkv(
+            File(dir, "lacing-roto.mkv"), Encoding(algorithm = 0), payloads, lacing = 1, defaultDurationNs = 21_000_000,
+        )
+        val packets = read(file, warnings)
+
+        val kept = listOf(0, 2, 4, 5)
+        assertEquals(kept.map { it * 21_000L }, packets.map { it.ptsUs }, "los fotogramas tras un descarte cambiaron de tiempo")
+        for ((index, packet) in kept.zip(packets)) assertContentEquals(frames[index], packet.data)
+        assertEquals(1, warnings.size, "un bloque dañado debe avisar una vez: $warnings")
+        assertTrue("2 de 6 fotogramas" in warnings.single(), warnings.single())
+    }
+
+    /**
+     * Encontrado por el fuzzing: un MKV de 953 bytes reservaba 110 MB al leerse. Cada fotograma
+     * comprimido creaba su propio `Inflater` y un buffer de 64 KB, y un bloque con lacing fijo
+     * puede declarar 256 fotogramas vacíos con un solo byte. Ahora ambos se reutilizan.
+     *
+     * Se mide la segunda lectura, no la primera: la primera carga clases y eso también cuenta
+     * como memoria reservada por el hilo.
+     */
+    @Test
+    fun `many tiny compressed laced frames do not allocate a buffer each`() {
+        val threads = java.lang.management.ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
+        org.junit.jupiter.api.Assumptions.assumeTrue(threads != null, "este JDK no mide la memoria por hilo")
+        val file = handMadeMkv(File(dir, "lacing-vacio.mkv"), Encoding(algorithm = 0), List(256) { ByteArray(0) }, lacing = 2)
+        read(file)
+        val before = threads!!.currentThreadAllocatedBytes
+        val warnings = ArrayList<String>()
+        val packets = read(file, warnings)
+        val allocated = threads.currentThreadAllocatedBytes - before
+
+        assertEquals(0, packets.size)
+        assertEquals(1, warnings.size, "256 fotogramas ilegibles de un bloque son un solo aviso: ${warnings.size}")
+        assertTrue(allocated < 8L * 1024 * 1024, "leer un bloque de 256 fotogramas vacíos reservó ${allocated / 1024} KiB")
     }
 
     /**

@@ -37,6 +37,10 @@ import kotlin.test.assertTrue
  * Por último, el vídeo de **frecuencia variable** de una captura de pantalla en fMP4: la duración
  * del último fotograma de cada fragmento se estimaba con el intervalo anterior, así que cada pausa
  * de la pantalla desplazaba el tiempo de decodificación respecto al de presentación.
+ *
+ * Dos más salieron al validar con grabaciones reales (3.1.0): una pausa entre un B-frame y su
+ * referencia, que dejaba ese B-frame decodificándose segundos después de mostrarse, y el cebado del
+ * audio en un fMP4, que el demuxer no aplicaba.
  */
 class SyncSamplesAndTimelineTest {
 
@@ -178,6 +182,75 @@ class SyncSamplesAndTimelineTest {
                 )
             }
         }
+    }
+
+    /**
+     * La pausa de una captura de pantalla cayendo entre un B-frame y su referencia, como en una
+     * grabación real de una tablet Android: el codificador retiene el B-frame mostrado justo antes
+     * de la pausa y lo entrega después de la referencia mostrada justo después. Con el DTS sacado
+     * solo de los PTS ordenados, ese B-frame se decodificaba cinco segundos después de mostrarse, y
+     * FFmpeg retrasaba todo el vídeo esos cinco segundos. Ahora se adelanta un fotograma, como
+     * cualquier otro B-frame, y la pausa pasa a su duración, que es lo que se ve durante ella.
+     */
+    @Test
+    fun `a b-frame held across a screen pause is decoded at most one frame after it is shown in fmp4`() {
+        val file = File(dir, "pausa-bframe.mp4")
+        val frame = 16_667L
+        val pause = 5_000_000L
+        fun shownAt(index: Int): Long = index * frame + if (index >= 20) pause else 0L
+        val expected = ArrayList<Long>()
+        FragmentedMp4Muxer(file).use { muxer ->
+            val video = muxer.addTrack(videoTrack())
+            muxer.start()
+            for (first in listOf(0, 30)) {
+                val order = arrayListOf(first)
+                for (reference in first + 2 until first + 30 step 2) order += listOf(reference, reference - 1)
+                order += first + 29
+                for (index in order) {
+                    val payload = NalUnits.joinLengthPrefixed(listOf(byteArrayOf(0x41, index.toByte())))
+                    muxer.writePacket(MediaPacket(video, payload, ptsUs = shownAt(index), isKeyFrame = index == first))
+                    expected += shownAt(index)
+                }
+            }
+        }
+        MkvKotlin.openDemuxer(file).use { demuxer ->
+            val frames = generateSequence { demuxer.readPacket() }.toList()
+            assertEquals(expected.size, frames.size)
+            var previousDts = Long.MIN_VALUE
+            for ((read, ptsUs) in frames.zip(expected)) {
+                assertTrue(abs(read.ptsUs - ptsUs) <= ONE_VIDEO_TICK_US, "PTS ${read.ptsUs} µs, se esperaba $ptsUs")
+                assertTrue(read.dtsUs > previousDts, "el DTS no avanza en el fotograma de $ptsUs µs")
+                previousDts = read.dtsUs
+                assertTrue(
+                    read.dtsUs - read.ptsUs <= frame + ONE_VIDEO_TICK_US,
+                    "el fotograma de $ptsUs µs se decodifica ${read.dtsUs - read.ptsUs} µs después de mostrarse",
+                )
+            }
+            val held = frames.first { abs(it.ptsUs - shownAt(19)) <= ONE_VIDEO_TICK_US }
+            assertTrue(held.durationUs >= pause, "la pausa tiene que quedar en el B-frame retenido, que dura ${held.durationUs} µs")
+        }
+    }
+
+    /**
+     * El cebado del AAC va en la lista de edición tanto en el MP4 plano como en el fragmentado,
+     * pero el demuxer solo la aplicaba al plano: el fMP4 se releía con el audio 21 ms por detrás de
+     * donde lo ponen FFmpeg y el MP4 plano, y pasarlo a otro contenedor arrastraba ese desfase.
+     */
+    @Test
+    fun `an fmp4 with encoder priming reads back exactly like the plain mp4`() {
+        val primed = audioTrack().copy(codecDelayUs = 21_333)
+        val timestamps = listOf(false, true).map { fragmented ->
+            val file = File(dir, if (fragmented) "cebado-frag.mp4" else "cebado.mp4")
+            MkvKotlin.createMuxer(file, ContainerFormat.MP4, mp4Fragmented = fragmented).use { muxer ->
+                val audio = muxer.addTrack(primed)
+                muxer.start()
+                for (i in 0 until 200) muxer.writePacket(MediaPacket(audio, ByteArray(8), ptsUs = i * 21_333L, isKeyFrame = true))
+            }
+            MkvKotlin.openDemuxer(file).use { demuxer -> generateSequence { demuxer.readPacket() }.map { it.ptsUs }.toList() }
+        }
+        val (plain, fragmented) = timestamps
+        assertTrue(abs(plain.first() + 21_333) <= 21, "el MP4 plano ya no aplica el cebado: empieza en ${plain.first()} µs")
+        assertEquals(plain, fragmented, "el fMP4 se lee con otros tiempos que el MP4 plano de la misma entrada")
     }
 
     @Test

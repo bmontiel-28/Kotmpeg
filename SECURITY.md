@@ -38,13 +38,26 @@ un cuelgue ni un consumo sin control. Hay cuatro suites dedicadas a esto —`Rob
 codificación que no se soporta o que pasan del techo de descompresión; un caso que las burle es un
 reporte útil.
 
+Desde la `3.1.0` la política se comprueba además por **fuzzing** (`DemuxerFuzzTest`): archivos MKV,
+MP4 y fMP4 válidos, mutados a ciegas y conociendo su estructura, se pasan por los dos demuxers y
+cada variante tiene que terminar con un error tipado —de E/S, `EbmlException`,
+`IllegalArgumentException` o `IllegalStateException`— o con un fin de stream limpio, sin cuelgues,
+sin `Error`, sin dejar el archivo abierto y sin reservar memoria desproporcionada. Corre en cada
+ejecución de los tests con una pasada fija, y cada semana en el CI con una campaña larga y semilla
+nueva. Cada fallo que ha encontrado queda fijado por un test que reconstruye la entrada que lo
+provocaba.
+
+Si encuentras un archivo que la incumpla, puedes comprobarlo antes de reportar con una campaña
+local (los detalles, en el [README](README.md#fuzzing)); el archivo que deja en `build/fuzz-findings/`
+es justo lo que conviene adjuntar al reporte privado.
+
 ## Qué no lo es
 
 - Que un códec no soportado se descarte: es el comportamiento documentado, y además se avisa por
   `onWarning`.
 - Los límites declarados como no-objetivos en el
   [README](README.md#lo-que-no-está-implementado-y-por-qué), como no reconstruir un MP4 sin `moov`.
-- Un `OutOfMemoryError` al abrir un archivo legítimo y enorme con `Mp4Demuxer`: el coste del mapa
-  completo de muestras está medido y documentado en el
-  [README](README.md#memoria-al-leer-archivos-largos). Es un límite conocido del formato, no un
-  fallo de validación.
+- Hasta la `3.0.0`, un `OutOfMemoryError` al abrir con `Mp4Demuxer` un archivo legítimo de muchas
+  horas, por el mapa completo de muestras que construía. Desde la `3.1.0` ese mapa ya no existe (ver
+  el [README](README.md#memoria-al-leer-archivos-largos)), así que en la serie actual un caso así
+  **sí** es un reporte útil.

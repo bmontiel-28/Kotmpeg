@@ -12,6 +12,9 @@ romperla:
 - `PcmMixer` y `PcmResampler` se quedan, con su API tal cual. Se pueden optimizar por dentro, pero
   sin cambiar lo que devuelven: `PcmFastPathEquivalenceTest` los compara contra una copia literal de
   la implementación anterior.
+- `PcmStreamMixer` (desde la 3.1.0) tiene que dar siempre lo mismo que convertir y mezclar a mano
+  con esos dos, sea cual sea el troceado de la entrada, y seguir siendo seguro entre hilos:
+  `PcmStreamMixerTest` lo comprueba.
 - Los muxers tienen que admitir cualquier número de pistas de audio con nombre, idioma y una sola
   predeterminada, en MKV, MP4 y fMP4, y conservarlas al convertir.
 - `RecordingAudioLayoutsTest` comprueba los cinco montajes. Si falla, el cambio está mal, no el test.
@@ -47,8 +50,8 @@ sí los ejecuta. El build imprime todos los `SKIPPED` a propósito, para que un 
 sin ejecutar no pase por cobertura.
 
 El [CI](.github/workflows/ci.yml) corre en cada push la suite con FFmpeg instalado —para que los de
-integración no se omitan en silencio— y comprueba además que el artefacto se puede publicar de
-verdad.
+integración no se omitan en silencio—, comprueba que el artefacto se puede publicar de verdad, y en
+un job paralelo ejecuta los benchmarks y su límite de memoria.
 
 Los tests de integración generan archivos de referencia con FFmpeg (x264 con B-frames, x265, AAC
 multipista, Opus), los remuxean con Kotmpeg en ambas direcciones — incluidos `mp4FastStart`, la
@@ -59,6 +62,46 @@ exigir una decodificación completa sin un solo error.
 La suite de robustez ataca la librería con archivos truncados en varios puntos y con basura tras
 una cabecera válida, y comprueba que el resultado siempre sea un error claro: nunca un bloqueo, un
 consumo desbocado de memoria ni un archivo que se quede abierto.
+
+### Fuzzing
+
+`DemuxerFuzzTest` lleva esa misma política a miles de archivos mutados. Dentro de `./gradlew test`
+hace siempre la misma pasada —20 000 variantes con una semilla fija y cada semilla cortada en unos
+200 puntos—, así que se comporta como un test más: si falla, falla siempre igual. Las campañas largas, con semilla nueva, las lanza cada semana
+[`fuzz.yml`](.github/workflows/fuzz.yml), y en local:
+
+```bash
+./gradlew test --tests "*DemuxerFuzzTest*" -Dkotmpeg.fuzz.seconds=600 -Dkotmpeg.fuzz.seed=1234
+```
+
+Un hallazgo deja en `build/fuzz-findings/` la entrada exacta y un `.txt` con la semilla, la
+iteración, las mutaciones y la traza. Para cerrarlo:
+
+1. Corrige el fallo y añade un test **con nombre** en la suite de la zona —los de
+   `MatroskaContentEncodingTest` para los bloques comprimidos, por ejemplo—, que **construya** la
+   entrada que lo provoca y falle con el código anterior.
+2. Anótalo en el CHANGELOG, en `Corregido`, diciendo que lo encontró el fuzzing.
+
+**El repositorio no guarda archivos de vídeo**, ni semillas ni regresiones: un test que construye su
+entrada explica qué fallaba y no pesa. Las semillas se generan en cada ejecución, las de terceros con
+FFmpeg si está instalado (en `FuzzSeeds`); sin él, el fuzzing sigue con las de la librería. Si
+añades una, que sea pequeña —unos KB—: una mutación al azar casi siempre cae en la carga de un
+fotograma, y cuanto más grande el archivo, menos mutaciones llegan al parser.
+
+### Benchmarks
+
+`benchmarks/` es un build aparte, como `compat/kotlin-1.9`, que compila contra el código del árbol:
+
+```bash
+./gradlew -p benchmarks verificarLimites
+```
+
+Lo que se vigila son los **bytes reservados por operación** de cada benchmark, contra su límite en
+`benchmarks/limites.properties`; el CI falla si alguno se pasa. Los tiempos se publican, pero no se
+vigilan: en un runner compartido varían más que cualquier regresión que importe. Si un cambio sube
+la memoria de un benchmark a propósito, sube su límite en el mismo commit y di por qué; casi siempre
+es algo que se leía bajo demanda y vuelve a cargarse entero. Para medir tiempos en serio, en local y
+con más iteraciones: `-Pjmh.iteraciones=10 -Pjmh.forks=3`, y `-Pjmh.incluir=Mp4Seek` para uno solo.
 
 ### La API pública está congelada
 
@@ -216,6 +259,8 @@ Antes de crear uno:
 
 - Corre la suite **con ffmpeg instalado**. Sin él se omiten los tests de integración, que son los
   únicos que comparan la salida real contra un decodificador de verdad.
+- Si el cambio toca un demuxer, lanza una campaña de fuzzing de unos minutos con semilla nueva, y
+  `./gradlew -p benchmarks verificarLimites` si toca algo de lo que miden los benchmarks.
 - Comprueba que `public-api.txt` refleja la API que vas a publicar.
 - Comprueba que `./gradlew publishToMavenLocal` deja el jar, el jar de fuentes y el POM, y que desde
   `compat/kotlin-1.9`, con su propio wrapper, `sh gradlew run -PkotmpegVersion=<versión>`

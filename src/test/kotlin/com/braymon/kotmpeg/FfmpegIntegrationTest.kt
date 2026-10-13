@@ -2,11 +2,15 @@ package com.braymon.kotmpeg
 
 import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.TrackInfo
+import com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
+import com.braymon.kotmpeg.mp4.Mp4Segment
+import com.braymon.kotmpeg.pipeline.Remuxer
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -332,6 +336,52 @@ class FfmpegIntegrationTest {
         assertDecodesCleanly(out)
     }
 
+    /**
+     * Una captura de pantalla con B-frames que se queda quieta justo entre un B-frame y su
+     * referencia, como una grabación real de una tablet Android. El fMP4 decodificaba ese B-frame
+     * tanto después de mostrarlo como durase la pausa, y FFmpeg, que retrasa la pista entera lo que
+     * mida ese adelanto, leía el vídeo segundos por detrás del audio. Se recrea con un x264 real con
+     * B-frames y cinco segundos de pausa a mitad de un GOP: FFmpeg tiene que leer cada fotograma
+     * donde se escribió, con el margen de un par de fotogramas que da a cualquier B-frame de un fMP4.
+     */
+    @Test
+    fun `a screen pause between a b-frame and its reference keeps fmp4 video where it was written`() {
+        assumeTrue(available, "ffmpeg not installed")
+        val src = makeReference(
+            "pausa-src.mp4",
+            "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-bf", "2", "-g", "30", "-c:a", "aac",
+        )
+        val pauseAtUs = 1_500_000L
+        val pauseUs = 5_000_000L
+        val out = File(dir, "pausa.mp4")
+        val written = ArrayList<Long>()
+        MkvKotlin.openDemuxer(src).use { demuxer ->
+            FragmentedMp4Muxer(out).use { muxer ->
+                val ids = demuxer.tracks.associate { it.id to muxer.addTrack(it) }
+                val videoId = demuxer.tracks.first { it is TrackInfo.Video }.id
+                muxer.start()
+                while (true) {
+                    val packet = demuxer.readPacket() ?: break
+                    val shift = if (packet.trackId == videoId && packet.ptsUs >= pauseAtUs) pauseUs else 0L
+                    if (packet.trackId == videoId) written += packet.ptsUs + shift
+                    muxer.writePacket(
+                        MediaPacket(ids.getValue(packet.trackId), packet.data, ptsUs = packet.ptsUs + shift, isKeyFrame = packet.isKeyFrame),
+                    )
+                }
+            }
+        }
+        val (probe, code) = run(
+            "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+            "-of", "csv=p=0", out.absolutePath,
+        )
+        assertEquals(0, code, "ffprobe failed: $probe")
+        val read = probe.lines().map { it.trim().trimEnd(',') }.filter { it.isNotEmpty() }
+            .map { Math.round(it.toDouble() * 1_000_000) }.sorted()
+        assertEquals(written.size, read.size)
+        val shift = read.zip(written.sorted()).maxOf { (got, expected) -> Math.abs(got - expected) }
+        assertTrue(shift <= 2 * 33_334, "FFmpeg lee el vídeo desplazado $shift µs respecto a donde se escribió")
+    }
+
     /** `start_time` de cada stream según ffprobe, por tipo (`video`, `audio`). */
     private fun streamStartTimes(f: File): Map<String, Double> {
         val (out, code) = run(
@@ -398,5 +448,56 @@ class FfmpegIntegrationTest {
             assertEquals(0.064, starts.getValue("audio"), 0.002, "$name: audio start ${starts["audio"]}")
             assertDecodesCleanly(out)
         }
+    }
+
+    /**
+     * Los segmentos indexados de `FragmentedMp4Muxer` (3.1.0) contra un reproductor real. FFmpeg
+     * lee los `sidx` y los usa para buscar, así que uno mal formado se nota: tiene que decodificar
+     * el archivo sin un solo error, con todos los fotogramas, y buscar en mitad de él. Y una lista
+     * HLS por rangos de bytes montada **solo** con lo que da `onSegment` e `initSegmentSize` tiene que
+     * reproducir el vídeo entero: es lo que haría una app que empaqueta en vivo.
+     */
+    @Test
+    fun `segment indexed fmp4 plays in ffmpeg and as an hls playlist built from its segments`() {
+        assumeTrue(available, "ffmpeg not installed")
+        val src = makeReference(
+            "seg-src.mp4",
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "libx264", "-bf", "2", "-g", "30",
+            "-c:a", "aac", "-b:a", "96k",
+        )
+        val out = File(dir, "segmentado.mp4")
+        val segments = ArrayList<Mp4Segment>()
+        val muxer = FragmentedMp4Muxer(out)
+        muxer.segmentIndex = true
+        muxer.onSegment = { segments += it }
+        MkvKotlin.openDemuxer(src).use { Remuxer.remux(it, muxer) }
+
+        assertDecodesCleanly(out)
+        assertEquals(countFrames(src, "v:0"), countFrames(out, "v:0"), "fotogramas de vídeo")
+        assertEquals(countFrames(src, "a:0"), countFrames(out, "a:0"), "paquetes de audio")
+        val (seekLog, seekCode) = run("ffmpeg", "-v", "error", "-ss", "1.5", "-i", out.absolutePath, "-frames:v", "10", "-f", "null", "-")
+        assertEquals(0, seekCode, "buscar falló: $seekLog")
+        assertTrue(seekLog.isBlank(), "errores al buscar: $seekLog")
+
+        assertTrue(segments.size >= 3, "se esperaba al menos un segmento por GOP de un segundo: ${segments.size}")
+        val playlist = File(dir, "segmentado.m3u8")
+        playlist.writeText(
+            buildString {
+                appendLine("#EXTM3U")
+                appendLine("#EXT-X-VERSION:7")
+                appendLine("#EXT-X-TARGETDURATION:${(segments.maxOf { it.durationUs } + 999_999) / 1_000_000}")
+                appendLine("#EXT-X-PLAYLIST-TYPE:VOD")
+                appendLine("#EXT-X-MAP:URI=\"${out.name}\",BYTERANGE=\"${muxer.initSegmentSize}@0\"")
+                for (segment in segments) {
+                    appendLine("#EXTINF:%.6f,".format(Locale.ROOT, segment.durationUs / 1_000_000.0))
+                    appendLine("#EXT-X-BYTERANGE:${segment.size}@${segment.offset}")
+                    appendLine(out.name)
+                }
+                appendLine("#EXT-X-ENDLIST")
+            },
+        )
+        assertDecodesCleanly(playlist)
+        assertEquals(countFrames(src, "v:0"), countFrames(playlist, "v:0"), "la lista HLS no reproduce todos los fotogramas")
     }
 }

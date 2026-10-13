@@ -51,6 +51,18 @@ class com.braymon.kotmpeg.audio.PcmResampler
   fun getOutputRate(): int
   fun isPassthrough(): boolean
   fun resample(short[]): short[]
+class com.braymon.kotmpeg.audio.PcmStreamMixer
+  constructor(int, int, int)
+  fun addSource$default(PcmStreamMixer, int, int, float, int, Object): int
+  fun addSource(int, int, float): int
+  fun flush(): short[]
+  fun getEmittedFrames(): long
+  fun getMaxLatencyMs(): int
+  fun getOutputChannels(): int
+  fun getOutputRate(): int
+  fun lostFrames(int): long
+  fun read(): short[]
+  fun write(int, short[]): void
 class com.braymon.kotmpeg.codecconfig.AacConfig$Parsed
   constructor(int, int, int, int, int)
   fun getAudioObjectType(): int
@@ -541,6 +553,12 @@ class com.braymon.kotmpeg.mp4.BoxBuilder
   fun u64(long): void
   fun u8(int): void
   fun zeros(int): void
+class com.braymon.kotmpeg.mp4.FileTable
+  constructor(SeekableInput, long, int, int)
+  fun getEntries(): int
+  fun s32(int, int): long
+  fun u32(int, int): long
+  fun u64(int): long
 class com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
   constructor(SeekableOutput, long, long, long)
   constructor(File, long)
@@ -548,7 +566,12 @@ class com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
   fun addTrack(TrackInfo): int
   fun close(): void
   fun getCreationTimeMillis(): Long
+  fun getInitSegmentSize(): long
+  fun getOnSegment(): Function1<Mp4Segment, Unit>
+  fun getSegmentIndex(): boolean
   fun setCreationTimeMillis(Long): void
+  fun setOnSegment(Function1<? super Mp4Segment, Unit>): void
+  fun setSegmentIndex(boolean): void
   fun start(): void
   fun stop(): void
   fun writePacket(MediaPacket): void
@@ -583,12 +606,45 @@ class com.braymon.kotmpeg.mp4.Mp4Muxer
   field TKHD_IN_MOVIE_ONLY: int
   field UINT32_MAX: long
   field VIDEO_TIMESCALE: long
+class com.braymon.kotmpeg.mp4.Mp4Segment
+  constructor(long, long, long, long, long, boolean)
+  fun getDurationUs(): long
+  fun getOffset(): long
+  fun getSequenceNumber(): long
+  fun getSize(): long
+  fun getStartUs(): long
+  fun getStartsWithKeyFrame(): boolean
+  fun toString(): String
+class com.braymon.kotmpeg.mp4.SampleBuffer
+  constructor()
+  fun add(long, int, long, long, boolean, long): void
+  fun clear(): void
+  fun dtsUs(int): long
+  fun durationUs(int): long
+  fun getSize(): int
+  fun isKey(int): boolean
+  fun offset(int): long
+  fun ptsUs(int): long
+  fun size(int): int
+class com.braymon.kotmpeg.mp4.SampleCursor
+  constructor()
+  fun getDtsUs(): long
+  fun getDurationUs(): long
+  fun getIndex(): int
+  fun getKey(): boolean
+  fun getOffset(): long
+  fun getPtsUs(): long
+  fun getSize(): int
+  fun moveTo(int): void
+  fun next(): void
 class com.braymon.kotmpeg.mp4.SampleEntries
   fun writeAudio(BoxBuilder, TrackInfo$Audio): void
   fun writeDisplayMatrix(BoxBuilder, int, int, int): void
   fun writeVisual(BoxBuilder, TrackInfo$Video): void
   field INSTANCE: SampleEntries
   field MAX_SAMPLE_ENTRY_RATE: long
+interface com.braymon.kotmpeg.mp4.SampleSink
+  fun add(long, int, long, long, boolean, long): void
 class com.braymon.kotmpeg.mp4.SampleTable
   constructor()
   fun add(long, int, long, long, boolean, long): void
@@ -603,6 +659,32 @@ class com.braymon.kotmpeg.mp4.SampleTable
   fun offset(int): long
   fun ptsUs(int): long
   fun size(int): int
+class com.braymon.kotmpeg.mp4.StblSamples
+  constructor(int, long, FileTable, FileTable, boolean, FileTable, FileTable, FileTable, FileTable, long, long, long)
+  fun checkpointDtsUs(int): long
+  fun checkpointIndex(int): int
+  fun cursor(): SampleCursor
+  fun firstPositiveDelta(): Long
+  fun getCheckpointCount(): int
+  fun getDtsMonotonic(): boolean
+  fun getSize(): int
+class com.braymon.kotmpeg.mp4.TrackSamples$Companion
+class com.braymon.kotmpeg.mp4.TrackSamples
+  constructor()
+  fun checkpointDtsUs(int): long
+  fun checkpointIndex(int): int
+  fun cursor(): SampleCursor
+  fun firstIndexWithDtsAbove(long, SampleCursor): int
+  fun firstIndexWithDtsAtLeastLinear(long, SampleCursor): int
+  fun firstIndexWithDtsAtLeast(long, SampleCursor): int
+  fun getCheckpointCount(): int
+  fun getDtsMonotonic(): boolean
+  fun getSize(): int
+  fun lastIndexWithDtsAtMostLinear(long, SampleCursor): int
+  fun lastKeyAtOrBefore(int, long, SampleCursor): int
+  field CHECKPOINT_INTERVAL: int
+  field Companion: TrackSamples$Companion
+  field MAX_SAMPLES: int
 class com.braymon.kotmpeg.pipeline.Remuxer
   fun concat$default(Remuxer, List, Muxer, Function1, int, Object): long
   fun concat(List<? extends Demuxer>, Muxer, Function1<? super Long, Unit>): long

@@ -1,0 +1,73 @@
+name: Fuzzing
+
+# Campaña larga de fuzzing sobre los dos demuxers. Va aparte del CI a propósito: usa una semilla
+# nueva en cada ejecución para explorar entradas que nunca se probaron, así que su resultado no es
+# reproducible de un push a otro, y un hallazgo no debe bloquear un commit que no lo causó. El CI
+# normal sí corre una pasada corta y fija del mismo test, que se comporta como cualquier otro.
+#
+# Un hallazgo deja la entrada exacta y su descripción en el artefacto `hallazgos-fuzzing`. Con la
+# semilla y la iteración del `.txt` se reproduce en local; una vez corregido, se fija con un test que
+# construya esa entrada (ver `DemuxerFuzzTest`): el repositorio no guarda archivos de vídeo.
+on:
+  schedule:
+    # Los lunes a las 04:17 UTC. Los flujos programados solo corren sobre la rama por defecto.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      minutos:
+        description: "Duración de la campaña, en minutos"
+        required: false
+        default: "20"
+
+jobs:
+  fuzz:
+    name: Campaña de fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Las semillas de terceros —B-frames, `edts`, fMP4 con y sin `default-base-is-moof`, los `sidx`
+      # de `-movflags dash`, Matroska de FFmpeg— se generan con FFmpeg al empezar. Sin él, el fuzzing
+      # se queda con las semillas de la librería y explora bastante menos.
+      - name: FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # La duración llega por variable de entorno y se valida antes de usarla: interpolar la
+      # entrada del formulario dentro del script permitiría inyectar órdenes en él.
+      - name: Fuzzing
+        env:
+          MINUTOS: ${{ inputs.minutos || '20' }}
+          SEMILLA: ${{ github.run_id }}
+        run: |
+          case "$MINUTOS" in
+            ''|*[!0-9]*) echo "::error::minutos tiene que ser un número entero: '$MINUTOS'"; exit 1 ;;
+          esac
+          echo "Semilla base: $SEMILLA, $MINUTOS minutos"
+          ./gradlew test --tests '*DemuxerFuzzTest*' \
+            -Dkotmpeg.fuzz.seconds=$((MINUTOS * 60)) -Dkotmpeg.fuzz.seed="$SEMILLA"
+
+      - name: Resumen
+        if: always()
+        run: |
+          if [ -f build/fuzz-findings/resumen.txt ]; then
+            { echo '```'; cat build/fuzz-findings/resumen.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Hallazgos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hallazgos-fuzzing
+          path: |
+            build/fuzz-findings/
+            build/reports/tests/
+          if-no-files-found: ignore
