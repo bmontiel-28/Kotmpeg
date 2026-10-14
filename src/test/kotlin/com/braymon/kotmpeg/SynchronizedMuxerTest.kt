@@ -18,7 +18,7 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
- * `MkvKotlin.synchronizedMuxer` con dos hilos productores a la vez, que es como llegan los
+ * `Kotmpeg.synchronizedMuxer` con dos hilos productores a la vez, que es como llegan los
  * paquetes en una app móvil: el codificador de vídeo y el de audio entregan cada uno desde su
  * propio callback. Sin la envoltura los muxers comparten buffer y posición de escritura, y dos
  * escrituras simultáneas se pisan.
@@ -34,12 +34,12 @@ class SynchronizedMuxerTest {
     )
 
     private fun writeFromTwoThreads(file: File, format: ContainerFormat, fragmented: Boolean): Pair<Int, Int> {
-        val muxer = MkvKotlin.synchronizedMuxer(MkvKotlin.createMuxer(file, format, mp4Fragmented = fragmented))
+        val muxer = Kotmpeg.synchronizedMuxer(Kotmpeg.createMuxer(file, format) { this.fragmented = fragmented })
         val videoId = muxer.addTrack(
-            TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0, codecPrivate = avcC),
+            TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) { frameRate = 30.0; codecPrivate = avcC },
         )
         val audioId = muxer.addTrack(
-            TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2)),
+            TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) { codecPrivate = AacConfig.build(48000, 2) },
         )
         muxer.start()
         val videoFrames = 300
@@ -56,7 +56,7 @@ class SynchronizedMuxerTest {
         val audio = pool.submit {
             start.await()
             for (i in 0 until audioFrames) {
-                muxer.writePacket(MediaPacket(audioId, ByteArray(300) { (i * 3 + it).toByte() }, ptsUs = i * 21_333L))
+                muxer.writePacket(MediaPacket(audioId, ByteArray(300) { (i * 3 + it).toByte() }, ptsUs = i * 21_333L, isKeyFrame = false))
             }
         }
         start.countDown()
@@ -77,7 +77,7 @@ class SynchronizedMuxerTest {
         for ((name, format, fragmented) in cases) {
             val file = File(dir, name)
             val (videoFrames, audioFrames) = writeFromTwoThreads(file, format, fragmented)
-            MkvKotlin.openDemuxer(file).use { demuxer ->
+            Kotmpeg.openDemuxer(file).use { demuxer ->
                 val packets = generateSequence { demuxer.readPacket() }.toList()
                 val byTrack = packets.groupBy { it.trackId }
                 val videoTrack = demuxer.tracks.first { it is TrackInfo.Video }.id
@@ -91,8 +91,8 @@ class SynchronizedMuxerTest {
 
     @Test
     fun `wrapping an already synchronized muxer returns the same instance`() {
-        val muxer = MkvKotlin.synchronizedMuxer(MkvKotlin.createMuxer(File(dir, "x.mkv")))
-        assertSame(muxer, MkvKotlin.synchronizedMuxer(muxer))
+        val muxer = Kotmpeg.synchronizedMuxer(Kotmpeg.createMuxer(File(dir, "x.mkv")))
+        assertSame(muxer, Kotmpeg.synchronizedMuxer(muxer))
         muxer.close()
     }
 }

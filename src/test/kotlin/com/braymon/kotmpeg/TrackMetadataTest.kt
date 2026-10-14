@@ -57,15 +57,16 @@ class TrackMetadataTest {
         listOf(byteArrayOf(0x68, 0x11, 0x22)),
     )
 
-    private fun video(frameRate: Double = 60.0, default: Boolean = true) = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240,
-        frameRate = frameRate, codecPrivate = avcC, default = default,
-    )
+    private fun video(frameRate: Double = 60.0, default: Boolean? = true) = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        this.frameRate = frameRate
+        codecPrivate = avcC
+        this.default = default
+    }
 
-    private fun audio(default: Boolean = true) = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 1,
-        codecPrivate = AacConfig.build(48000, 1), default = default,
-    )
+    private fun audio(default: Boolean? = true) = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 1) {
+        codecPrivate = AacConfig.build(48000, 1)
+        this.default = default
+    }
 
     /**
      * Escribe un archivo mínimo pero completo: sin al menos un paquete por pista el muxer no
@@ -74,7 +75,7 @@ class TrackMetadataTest {
      */
     private fun mux(vararg tracks: TrackInfo, dateUtcMillis: Long? = null): File {
         val file = File(dir, "salida-${tracks.size}-$dateUtcMillis.mkv")
-        MkvMuxer(com.braymon.kotmpeg.io.SeekableOutput(file), dateUtcMillis = dateUtcMillis).use { muxer ->
+        MkvMuxer(com.braymon.kotmpeg.io.SeekableOutput(file)) { creationTimeMillis = dateUtcMillis }.use { muxer ->
             val ids = tracks.map { muxer.addTrack(it) }
             muxer.start()
             for ((i, id) in ids.withIndex()) {
@@ -156,14 +157,43 @@ class TrackMetadataTest {
         )
     }
 
+    /**
+     * Sin fijar `default`, el muxer marca la primera pista de cada tipo y ninguna más. Hasta la 3.x
+     * valía `true` para todas, y con varias pistas de audio cada reproductor elegía una distinta.
+     * En MP4 va en el bit `track_enabled` del `tkhd`, y se relee igual.
+     */
+    @Test
+    fun `left to the muxer, only the first track of each type is default`() {
+        val tracks = arrayOf(video(default = null), audio(default = null), audio(default = null))
+        val mkv = mux(*tracks)
+        assertEquals(listOf(0L), trackValues(mkv, MatroskaIds.FLAG_DEFAULT), "solo la segunda pista de audio deja de ser predeterminada")
+        val mp4 = File(dir, "predeterminadas.mp4")
+        Kotmpeg.createMuxer(mp4).use { muxer ->
+            val ids = tracks.map { muxer.addTrack(it) }
+            muxer.start()
+            for (id in ids) muxer.writePacket(MediaPacket(id, ByteArray(8), 0, isKeyFrame = true))
+        }
+        for (file in listOf(mkv, mp4)) {
+            Kotmpeg.openDemuxer(file).use { demuxer ->
+                assertEquals(listOf<Boolean?>(true, true, false), demuxer.tracks.map { it.default }, file.name)
+            }
+        }
+
+        val explicit = mux(video(default = null), audio(default = null), audio(default = true))
+        assertEquals(listOf(0L), trackValues(explicit, MatroskaIds.FLAG_DEFAULT), "con otra marcada a mano, la primera deja de serlo")
+        Kotmpeg.openDemuxer(explicit).use { demuxer ->
+            assertEquals(listOf<Boolean?>(true, false, true), demuxer.tracks.map { it.default })
+        }
+    }
+
     @Test
     fun `the demuxer reads FlagDefault back`() {
         val file = mux(video(), audio(default = true), audio(default = false))
         MkvDemuxer(SeekableInput(file)).use { demuxer ->
             val audios = demuxer.tracks.filterIsInstance<TrackInfo.Audio>()
             assertEquals(2, audios.size)
-            assertTrue(audios[0].default, "la primera pista de audio es la predeterminada")
-            assertFalse(audios[1].default, "la segunda no lo es, y el remux no debe perderlo")
+            assertEquals(true, audios[0].default, "la primera pista de audio es la predeterminada")
+            assertEquals(false, audios[1].default, "la segunda no lo es, y el remux no debe perderlo")
         }
     }
 
@@ -234,10 +264,10 @@ class TrackMetadataTest {
     }
 
     /** El cebado real de un AAC-LC a 48 kHz: 1024 muestras, que son 21 333 µs. */
-    private fun aacWithDelay(delayUs: Long) = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2,
-        codecDelayUs = delayUs, codecPrivate = AacConfig.build(48000, 2),
-    )
+    private fun aacWithDelay(delayUs: Long) = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+        codecDelayUs = delayUs
+        codecPrivate = AacConfig.build(48000, 2)
+    }
 
     @Test
     fun `CodecDelay is written for AAC and not only for Opus`() {
@@ -277,10 +307,10 @@ class TrackMetadataTest {
      */
     @Test
     fun `Opus still takes its delay from the OpusHead and keeps SeekPreRoll`() {
-        val opus = TrackInfo.Audio(
-            codec = AudioCodec.OPUS, sampleRate = 48000, channelCount = 2,
-            codecDelayUs = 99_999, codecPrivate = OpusConfig.buildOpusHead(channelCount = 2),
-        )
+        val opus = TrackInfo.Audio(codec = AudioCodec.OPUS, sampleRate = 48000, channelCount = 2) {
+            codecDelayUs = 99_999
+            codecPrivate = OpusConfig.buildOpusHead(channelCount = 2)
+        }
         val file = mux(opus)
         assertEquals(listOf(6_500_000L), trackValues(file, MatroskaIds.CODEC_DELAY))
         assertEquals(listOf(80_000_000L), trackValues(file, MatroskaIds.SEEK_PRE_ROLL))

@@ -1,6 +1,7 @@
 package com.braymon.kotmpeg.mkv
 
 import com.braymon.kotmpeg.Muxer
+import com.braymon.kotmpeg.MuxerOptions
 import com.braymon.kotmpeg.TimelineGate
 import com.braymon.kotmpeg.codecconfig.AacConfig
 import com.braymon.kotmpeg.codecconfig.DefaultCodecPrivate
@@ -11,6 +12,7 @@ import com.braymon.kotmpeg.io.SeekableOutput
 import com.braymon.kotmpeg.model.AudioCodec
 import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.Timestamps
+import com.braymon.kotmpeg.model.TrackDefaults
 import com.braymon.kotmpeg.model.TrackInfo
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -39,29 +41,28 @@ import java.util.Random
  * **No es seguro entre hilos**: toda la secuencia addTrack/start/writePacket/stop debe
  * ejecutarse desde un solo hilo, o serializarse por fuera. Es lo que hace falta en cuanto hay un
  * hilo por pista, que es el caso normal cuando los paquetes vienen de varios codificadores.
+ *
+ * De [MuxerOptions] usa `maxClusterDurationMs`, `writingApp` y `creationTimeMillis` (el
+ * `DateUTC`); las de MP4 no le afectan.
  */
-public class MkvMuxer(
+public class MkvMuxer internal constructor(
     private val out: SeekableOutput,
-    /** Duración máxima de cluster antes de forzar uno nuevo, en ms. */
-    private val maxClusterDurationMs: Long = 5_000,
-    private val writingApp: String = "Kotmpeg",
-    /**
-     * Fecha de grabación que se escribe como `DateUTC`, en milisegundos desde la época de Unix.
-     * `null` no escribe el elemento.
-     *
-     * Es un parámetro y no una lectura del reloj dentro del muxer para que un test pueda fijarla:
-     * sin eso, dos ejecuciones sobre la misma entrada dan archivos distintos y cualquier
-     * comparación byte a byte se vuelve imposible de escribir.
-     */
-    private val dateUtcMillis: Long? = System.currentTimeMillis(),
+    options: MuxerOptions,
 ) : Muxer {
 
-    public constructor(file: File, maxClusterDurationMs: Long = 5_000) :
-        this(openValidated(file, maxClusterDurationMs), maxClusterDurationMs)
+    /** Escribe en [out], que el muxer cierra al terminar. */
+    public constructor(out: SeekableOutput, options: MuxerOptions.() -> Unit = {}) :
+        this(out, MuxerOptions().apply(options).validatedFor(out))
 
-    init {
-        requireValidClusterDuration(maxClusterDurationMs)
-    }
+    /** Escribe en [file], truncándolo. Las opciones se validan antes de abrirlo. */
+    public constructor(file: File, options: MuxerOptions.() -> Unit = {}) :
+        this(MuxerOptions().apply(options).validated(), file)
+
+    internal constructor(options: MuxerOptions, file: File) : this(SeekableOutput(file), options)
+
+    private val maxClusterDurationMs = options.maxClusterDurationMs
+    private val writingApp = options.writingApp
+    private val dateUtcMillis = options.creationTimeMillis
 
     private val ebml = EbmlWriter(out)
     private val tracks = ArrayList<TrackInfo>()
@@ -109,36 +110,23 @@ public class MkvMuxer(
 
     private companion object {
         /** Espacio fijo reservado al inicio del segmento para el SeekHead final. */
-        const val SEEK_HEAD_RESERVED = 120
+        private const val SEEK_HEAD_RESERVED = 120
         /** TimestampScale de Matroska: 1_000_000 ns = ticks de 1 ms. */
-        const val TIMESTAMP_SCALE_NS = 1_000_000L
+        private const val TIMESTAMP_SCALE_NS = 1_000_000L
 
         /**
          * `DateUTC` cuenta desde 2001-01-01T00:00:00 UTC y no desde la época de Unix, así que
          * cualquier fecha anterior a 2001 es negativa. De ahí que se escriba con signo.
          */
-        const val MATROSKA_EPOCH_MILLIS = 978_307_200_000L
+        private const val MATROSKA_EPOCH_MILLIS = 978_307_200_000L
 
         /**
          * Topes de la retención de arranque. Cinco segundos de diferencia entre pistas es mucho
          * más que la latencia de cualquier codificador; por encima, lo razonable es que una pista
          * no vaya a llegar. Los 16 MB acotan la memoria aunque una sola pista llene ese tiempo.
          */
-        const val START_WAIT_US = 5_000_000L
-        const val START_HELD_BYTES = 16L * 1024 * 1024
-
-        fun requireValidClusterDuration(maxClusterDurationMs: Long) {
-            require(maxClusterDurationMs > 0) { "maxClusterDurationMs debe ser positivo: $maxClusterDurationMs" }
-        }
-
-        /**
-         * Valida **antes** de abrir: si el `require` del `init` fallara con el archivo ya abierto, el
-         * descriptor quedaría huérfano, porque nadie tendría el objeto para cerrarlo.
-         */
-        fun openValidated(file: File, maxClusterDurationMs: Long): SeekableOutput {
-            requireValidClusterDuration(maxClusterDurationMs)
-            return SeekableOutput(file)
-        }
+        private const val START_WAIT_US = 5_000_000L
+        private const val START_HELD_BYTES = 16L * 1024 * 1024
     }
 
     /**
@@ -163,7 +151,7 @@ public class MkvMuxer(
                 track
             }
             is TrackInfo.Audio ->
-                if (track.codecPrivate != null) track else track.copy(codecPrivate = DefaultCodecPrivate.forAudio(track))
+                if (track.codecPrivate != null) track else track.copy { codecPrivate = DefaultCodecPrivate.forAudio(track) }
         }
         tracks.add(complete.withId(trackNumber))
         return trackNumber
@@ -212,7 +200,7 @@ public class MkvMuxer(
         val uid = ByteArray(16).also { random.nextBytes(it) }
         ebml.writeElement(MatroskaIds.SEGMENT_UID, uid)
         ebml.writeUInt(MatroskaIds.TIMESTAMP_SCALE, TIMESTAMP_SCALE_NS)
-        ebml.writeString(MatroskaIds.MUXING_APP, writingApp)
+        ebml.writeString(MatroskaIds.MUXING_APP, "Kotmpeg")
         ebml.writeString(MatroskaIds.WRITING_APP, writingApp)
         dateUtcMillis?.let {
             ebml.writeSInt(MatroskaIds.DATE_UTC, (it - MATROSKA_EPOCH_MILLIS) * 1_000_000L)
@@ -227,7 +215,8 @@ public class MkvMuxer(
     private fun writeTracks() {
         tracksPos = out.position
         val sizePos = ebml.beginMaster(MatroskaIds.TRACKS)
-        for (track in tracks) writeTrackEntry(track)
+        val defaults = TrackDefaults.resolve(tracks)
+        for ((i, track) in tracks.withIndex()) writeTrackEntry(track, defaults[i])
         ebml.endMaster(sizePos)
     }
 
@@ -245,14 +234,14 @@ public class MkvMuxer(
      * describe el bitstream; el `takeIf` es lo que mantiene esa preferencia sin extenderla a los
      * demás códecs, que no tienen ninguna cabecera de la que deducirlo.
      */
-    private fun writeTrackEntry(track: TrackInfo) {
+    private fun writeTrackEntry(track: TrackInfo, default: Boolean) {
         val entryPos = ebml.beginMaster(MatroskaIds.TRACK_ENTRY)
         ebml.writeUInt(MatroskaIds.TRACK_NUMBER, track.id.toLong())
         ebml.writeUInt(MatroskaIds.TRACK_UID, (random.nextLong().and(Long.MAX_VALUE)).coerceAtLeast(1))
         ebml.writeUInt(MatroskaIds.FLAG_LACING, 0)
         ebml.writeString(MatroskaIds.LANGUAGE, track.language)
         track.name?.let { ebml.writeString(MatroskaIds.NAME, it) }
-        if (!track.default) ebml.writeUInt(MatroskaIds.FLAG_DEFAULT, 0)
+        if (!default) ebml.writeUInt(MatroskaIds.FLAG_DEFAULT, 0)
         when (track) {
             is TrackInfo.Video -> {
                 ebml.writeUInt(MatroskaIds.TRACK_TYPE, MatroskaIds.TRACK_TYPE_VIDEO)
@@ -432,7 +421,7 @@ public class MkvMuxer(
         ebml.writeId(MatroskaIds.SIMPLE_BLOCK)
         ebml.writeVintSize(header.size.toLong() + 3L + packet.data.size.toLong())
         out.write(header)
-        out.writeBits(relative and 0xFFFF, 2)
+        out.writeUInt(relative and 0xFFFF, 2)
         out.writeByte(if (isKeyFrame) 0x80 else 0x00)
         out.write(packet.data)
 

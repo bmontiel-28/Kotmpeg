@@ -3,22 +3,22 @@ package com.braymon.kotmpeg.ebml
 import com.braymon.kotmpeg.io.SeekableInput
 
 /** Una cabecera de elemento parseada. [size] es -1 para maestros de tamaño desconocido. */
-public class EbmlElement(
-    public val id: Long,
-    public val size: Long,
+internal class EbmlElement(
+    val id: Long,
+    val size: Long,
     /** Posición absoluta del primer byte de la carga. */
-    public val dataStart: Long,
+    val dataStart: Long,
 ) {
-    public val dataEnd: Long get() = if (size < 0) Long.MAX_VALUE else dataStart + size
+    val dataEnd: Long get() = if (size < 0) Long.MAX_VALUE else dataStart + size
 }
 
 /**
  * Parser EBML de bajo nivel (RFC 8794).
  */
-public class EbmlReader(public val input: SeekableInput) {
+internal class EbmlReader(val input: SeekableInput) {
 
     /** Lee un id de elemento, conservando el bit marcador (así se definen los ids). */
-    public fun readId(): Long {
+    fun readId(): Long {
         val first = input.readByte()
         val length = lengthFromMarker(first, "id de elemento")
         if (length > 4) {
@@ -30,7 +30,7 @@ public class EbmlReader(public val input: SeekableInput) {
     }
 
     /** Lee un VINT de tamaño. Devuelve -1 para el valor reservado "tamaño desconocido". */
-    public fun readVintSize(): Long {
+    fun readVintSize(): Long {
         val first = input.readByte()
         val length = lengthFromMarker(first, "vint de tamaño")
         var value = (first.toLong() and ((1L shl (8 - length)) - 1))
@@ -55,7 +55,7 @@ public class EbmlReader(public val input: SeekableInput) {
     }
 
     /** Lee la cabecera del siguiente elemento en la posición actual. */
-    public fun readElement(): EbmlElement {
+    fun readElement(): EbmlElement {
         val id = readId()
         val size = readVintSize()
         return EbmlElement(id, size, input.position)
@@ -69,12 +69,12 @@ public class EbmlReader(public val input: SeekableInput) {
      * marcas de tiempo, dimensiones) son de 4 bytes o menos — y quien lo consume comprueba
      * `>= 0` antes de usarlo.
      */
-    public fun readUInt(element: EbmlElement): Long {
+    fun readUInt(element: EbmlElement): Long {
         require(element.size in 0..8) { "uint de tamaño ${element.size}" }
-        return input.readBits(element.size.toInt())
+        return input.readUInt(element.size.toInt())
     }
 
-    public fun readSInt(element: EbmlElement): Long {
+    fun readSInt(element: EbmlElement): Long {
         require(element.size in 0..8)
         if (element.size == 0L) return 0
         var v = input.readByte().toLong()
@@ -83,17 +83,17 @@ public class EbmlReader(public val input: SeekableInput) {
         return v
     }
 
-    public fun readFloat(element: EbmlElement): Double = when (element.size) {
+    fun readFloat(element: EbmlElement): Double = when (element.size) {
         0L -> 0.0
         4L -> Float.fromBits(input.readInt32()).toDouble()
         8L -> Double.fromBits(input.readInt64())
         else -> throw EbmlException("tamaño de float inválido ${element.size}")
     }
 
-    public fun readString(element: EbmlElement): String =
+    fun readString(element: EbmlElement): String =
         String(readPayload(element), Charsets.UTF_8).trimEnd('\u0000', ' ')
 
-    public fun readBinary(element: EbmlElement): ByteArray = readPayload(element)
+    fun readBinary(element: EbmlElement): ByteArray = readPayload(element)
 
     /**
      * Lee la carga completa de un elemento. Valida el tamaño antes de truncarlo a Int: un
@@ -114,7 +114,7 @@ public class EbmlReader(public val input: SeekableInput) {
         return input.readBytes(size.toInt())
     }
 
-    public fun skip(element: EbmlElement) {
+    fun skip(element: EbmlElement) {
         if (element.size < 0) throw EbmlException("no se puede saltar un elemento de tamaño desconocido 0x${element.id.toString(16)}")
         input.position = element.dataStart + element.size
     }

@@ -39,8 +39,18 @@ public enum class ContainerFormat {
     MP4;
 
     public companion object {
+        /**
+         * El formato de salida que corresponde a la extensión de [name], o `null` si no hay
+         * ninguno.
+         *
+         * `.webm` devuelve `null` aunque WebM sea un subconjunto de Matroska: solo admite VP8,
+         * VP9 o AV1 con Vorbis u Opus, y esta librería escribe H.264/H.265 con AAC u Opus.
+         * Hasta la 3.x se trataba como MKV y salía un archivo con extensión `.webm`, cabecera
+         * `matroska` y códecs que un navegador no reproduce. Leer un WebM sí se puede: el
+         * demuxer detecta el contenedor por su contenido, no por la extensión.
+         */
         public fun fromFileName(name: String): ContainerFormat? = when (name.substringAfterLast('.').lowercase()) {
-            "mkv", "webm" -> MKV
+            "mkv" -> MKV
             "mp4", "m4a", "m4v", "mov" -> MP4
             else -> null
         }

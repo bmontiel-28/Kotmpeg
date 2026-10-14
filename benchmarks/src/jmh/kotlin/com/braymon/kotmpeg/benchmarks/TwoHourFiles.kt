@@ -1,6 +1,6 @@
 package com.braymon.kotmpeg.benchmarks
 
-import com.braymon.kotmpeg.MkvKotlin
+import com.braymon.kotmpeg.Kotmpeg
 import com.braymon.kotmpeg.Muxer
 import com.braymon.kotmpeg.codecconfig.AacConfig
 import com.braymon.kotmpeg.codecconfig.NalUnits
@@ -26,13 +26,13 @@ internal object TwoHourFiles {
     val plain: File by lazy { write("dos-horas", ContainerFormat.MP4, fragmented = false) }
     val fragmented: File by lazy { write("dos-horas-fragmentado", ContainerFormat.MP4, fragmented = true) }
 
-    private val videoTrack = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 1920, height = 1080, frameRate = 60.0,
-        codecPrivate = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x28, 0x11)), listOf(byteArrayOf(0x68, 0x22))),
-    )
-    private val audioTrack = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2),
-    )
+    private val videoTrack = TrackInfo.Video(codec = VideoCodec.H264, width = 1920, height = 1080) {
+        frameRate = 60.0
+        codecPrivate = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x28, 0x11)), listOf(byteArrayOf(0x68, 0x22)))
+    }
+    private val audioTrack = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+        codecPrivate = AacConfig.build(48000, 2)
+    }
 
     /** Escribe las dos horas en [muxer], intercaladas por tiempo como las entregaría un grabador. */
     fun writeInto(muxer: Muxer) {
@@ -60,7 +60,7 @@ internal object TwoHourFiles {
 
     private fun write(name: String, format: ContainerFormat, fragmented: Boolean): File {
         val file = File.createTempFile(name, ".mp4").apply { deleteOnExit() }
-        writeInto(MkvKotlin.createMuxer(file, format, mp4Fragmented = fragmented))
+        writeInto(Kotmpeg.createMuxer(file, format) { this.fragmented = fragmented })
         return file
     }
 }

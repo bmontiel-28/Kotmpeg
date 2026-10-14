@@ -85,7 +85,43 @@ public class MkvDemuxer(
     private var inflater: Inflater? = null
     private var inflateChunk: ByteArray? = null
 
-    private class Cue(val timeUs: Long, val clusterPosition: Long)
+    /** Un punto del índice: tiempo, posición del cluster y pista (`CueTrack`, 0 si no la declara). */
+    private class Cue(val timeUs: Long, val clusterPosition: Long, val track: Int)
+
+    /**
+     * Lo que queda por decidir tras [seekTo]. Hasta el keyframe de [anchor] con `pts` [landedUs],
+     * los paquetes de las demás pistas se guardan en [held], y los de [anchor] anteriores a él se
+     * descartan sin leer su carga (ver [droppedBySeek]). Llegado el keyframe ([keyFrame]), lo que
+     * sigue se guarda en [after] hasta que cada una de las demás pistas ha dado un paquete
+     * posterior a él ([past]). Hasta entonces no se sabe por dónde empieza: un muxer puede escribir
+     * el paquete de audio que suena en ese instante detrás del keyframe, incluso segundos detrás, y
+     * una pista que no da ninguno posterior puede haber terminado ya (ver [waitedEnough]).
+     */
+    private class SeekFilter(val anchor: Int, val landedUs: Long) {
+        val held = ArrayList<MediaPacket>()
+        var keyFrame: MediaPacket? = null
+        val after = ArrayList<MediaPacket>()
+        val past = HashSet<Int>()
+
+        /** Hasta dónde ha llegado la lectura tras el keyframe: el mayor `pts` leído desde él. */
+        var progressUs = 0L
+
+        /** Por pista, [progressUs] cuando dio su último paquete tras el keyframe. */
+        val heardAtUs = HashMap<Int, Long>()
+
+        /** Por pista, cuánto iba por detrás de [progressUs] su último paquete tras el keyframe. */
+        val behindUs = HashMap<Int, Long>()
+
+        /** Lo que ocupa en memoria lo guardado en [held] y [after] (ver [SEEK_MAX_RETAINED_BYTES]). */
+        var retainedBytes = 0L
+
+        fun retain(packet: MediaPacket) {
+            retainedBytes += packet.data.size + RETAINED_PACKET_OVERHEAD
+        }
+    }
+
+    /** Lo que deja [walkCluster]: el tiempo del cluster, los keyframes de una pista y dónde sigue el archivo. */
+    private class ClusterWalk(val timeUs: Long?, val keyFramesUs: List<Long>, val next: Long)
 
     /**
      * Un `ContentEncoding` de compresión. Solo se conservan los que se saben deshacer —
@@ -99,6 +135,15 @@ public class MkvDemuxer(
     private class BlockHeader(val trackNumber: Int, val relative: Int, val flags: Int, val size: Int)
 
     private val cues = ArrayList<Cue>()
+
+    /** Activo desde un [seekTo] hasta que se decide por dónde empieza cada pista; `null` el resto del tiempo. */
+    private var seekFilter: SeekFilter? = null
+
+    /**
+     * Pistas de vídeo, aparte de la ancla, que tras una búsqueda no tenían ningún keyframe en lo
+     * leído: se descarta lo suyo hasta el siguiente, que es el primero que se puede decodificar.
+     */
+    private val awaitingKeyFrame = HashSet<Int>()
 
     private val pending = ArrayDeque<MediaPacket>()
     private var clusterTimestampTicks = 0L
@@ -140,9 +185,8 @@ public class MkvDemuxer(
      * Lee la cabecera EBML y todo lo que hay por encima del primer Cluster.
      *
      * El índice `Cues` se busca además por la posición que anuncie el `SeekHead` cuando no
-     * apareció en el recorrido. Ese segundo intento va dentro de un `catch` vacío a propósito:
-     * un índice roto solo deshabilita la búsqueda rápida y no es motivo para rechazar un
-     * archivo que por lo demás se lee entero.
+     * apareció en el recorrido. Esté donde esté, un índice roto no rechaza el archivo: ver
+     * [readCuesOrWarn].
      */
     private fun parseHeaders() {
         val ebmlHeader = requireSized(reader.readElement())
@@ -166,7 +210,12 @@ public class MkvDemuxer(
                 MatroskaIds.INFO -> parseInfo(el)
                 MatroskaIds.TRACKS -> parseTracks(el)
                 MatroskaIds.SEEK_HEAD -> parseSeekHead(el)
-                MatroskaIds.CUES -> parseCues(el)
+                MatroskaIds.CUES -> if (el.size < 0) {
+                    skipOrAbort(el)
+                } else {
+                    readCuesOrWarn(el)
+                    input.position = el.dataEnd
+                }
                 MatroskaIds.CLUSTER -> {
                     firstClusterPos = elementStart
                     break
@@ -180,8 +229,9 @@ public class MkvDemuxer(
             try {
                 input.position = segmentDataStart + cuesPosFromSeekHead
                 val el = reader.readElement()
-                if (el.id == MatroskaIds.CUES) parseCues(el)
-            } catch (_: Exception) {
+                if (el.id == MatroskaIds.CUES) readCuesOrWarn(el)
+            } catch (e: Exception) {
+                warn("el SeekHead apunta a un índice Cues que no se puede leer (${e.message}): $NO_INDEX")
             }
             input.position = saved
         }
@@ -521,28 +571,30 @@ public class MkvDemuxer(
     ): TrackInfo? {
         return when (type) {
             MatroskaIds.TRACK_TYPE_VIDEO -> VideoCodec.fromMatroskaId(codecId)?.let { codec ->
-                TrackInfo.Video(
-                    id = number, codec = codec, width = width, height = height,
-                    displayWidth = if (displayWidth > 0) displayWidth else width,
-                    displayHeight = if (displayHeight > 0) displayHeight else height,
-                    frameRate = if (defaultDurNs > 0) 1e9 / defaultDurNs else 0.0,
-                    rotationDegrees = rotationDegrees,
-                    color = color,
-                    codecPrivate = codecPrivate, language = language, name = name,
-                    default = default,
-                )
+                TrackInfo.Video(codec, width, height) {
+                    this.displayWidth = if (displayWidth > 0) displayWidth else width
+                    this.displayHeight = if (displayHeight > 0) displayHeight else height
+                    frameRate = if (defaultDurNs > 0) 1e9 / defaultDurNs else 0.0
+                    this.rotationDegrees = rotationDegrees
+                    this.color = color
+                    this.codecPrivate = codecPrivate
+                    this.language = language
+                    this.name = name
+                    this.default = default
+                }.withId(number)
             }
             MatroskaIds.TRACK_TYPE_AUDIO -> AudioCodec.fromMatroskaId(codecId)?.let { codec ->
                 require(sampleRate <= MAX_SAMPLE_RATE_HZ) {
                     "frecuencia de audio imposible: $sampleRate"
                 }
-                TrackInfo.Audio(
-                    id = number, codec = codec,
-                    sampleRate = sampleRate.toInt(), channelCount = channels, bitDepth = bitDepth,
-                    codecDelayUs = codecDelayNs / 1000,
-                    codecPrivate = codecPrivate, language = language, name = name,
-                    default = default,
-                )
+                TrackInfo.Audio(codec, sampleRate.toInt(), channels) {
+                    this.bitDepth = bitDepth
+                    codecDelayUs = codecDelayNs / 1000
+                    this.codecPrivate = codecPrivate
+                    this.language = language
+                    this.name = name
+                    this.default = default
+                }.withId(number)
             }
             else -> null
         }
@@ -593,7 +645,13 @@ public class MkvDemuxer(
         val hdr = if (hasMastering || maxCll > 0 || maxFall > 0) {
             HdrStaticInfo(rX, rY, gX, gY, bX, bY, wX, wY, lumMax, lumMin, maxCll, maxFall)
         } else null
-        return ColorInfo(primaries, transfer, matrix, fullRange, hdr)
+        return ColorInfo {
+            this.primaries = primaries
+            this.transfer = transfer
+            this.matrix = matrix
+            this.fullRange = fullRange
+            this.hdr = hdr
+        }
     }
 
     /** Mapea el PoseRoll de una Projection rectangular de vuelta a rotación 0/90/180/270. */
@@ -616,6 +674,24 @@ public class MkvDemuxer(
         }
     }
 
+    /**
+     * Lee el índice [cuesElement] sin dejar que lo tumbe: si está roto se descarta **entero**
+     * —uno a medias podría mandar una búsqueda a un sitio equivocado— y se avisa por `onWarning`.
+     *
+     * El archivo se sigue leyendo completo y las búsquedas funcionan, solo que recorriendo los
+     * clusters. Hasta la 3.x el fallo se tragaba en silencio, y quien veía búsquedas lentas en un
+     * archivo concreto no tenía nada que lo explicara; y si el índice roto estaba delante de los
+     * clusters, se rechazaba el archivo entero.
+     */
+    private fun readCuesOrWarn(cuesElement: EbmlElement) {
+        try {
+            parseCues(cuesElement)
+        } catch (e: Exception) {
+            cues.clear()
+            warn("índice Cues ilegible (${e.message}): $NO_INDEX")
+        }
+    }
+
     private fun parseCues(cuesElement: EbmlElement) {
         val cuesEl = requireSized(cuesElement)
         while (input.position < cuesEl.dataEnd) {
@@ -624,6 +700,7 @@ public class MkvDemuxer(
             requireSized(point)
             var timeTicks = -1L
             var clusterPos = -1L
+            var track = 0L
             while (input.position < point.dataEnd) {
                 val el = reader.readElement()
                 when (el.id) {
@@ -632,6 +709,7 @@ public class MkvDemuxer(
                         val p = reader.readElement()
                         when (p.id) {
                             MatroskaIds.CUE_CLUSTER_POSITION -> clusterPos = reader.readUInt(p)
+                            MatroskaIds.CUE_TRACK -> track = reader.readUInt(p)
                             else -> skipOrAbort(p)
                         }
                     }
@@ -639,7 +717,7 @@ public class MkvDemuxer(
                 }
             }
             if (timeTicks >= 0 && clusterPos >= 0) {
-                cues.add(Cue(ticksToUs(timeTicks), clusterPos))
+                cues.add(Cue(ticksToUs(timeTicks), clusterPos, track.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()))
             }
         }
     }
@@ -647,8 +725,203 @@ public class MkvDemuxer(
     private fun ticksToUs(ticks: Long): Long = Timestamps.rescaleFloor(ticks, timestampScaleNs, 1000)
 
     override fun readPacket(): MediaPacket? {
-        while (pending.isEmpty()) {
-            if (!advance()) return null
+        while (true) {
+            while (pending.isEmpty()) {
+                if (!advance()) return releaseHeld()
+            }
+            val packet = pending.poll()
+            val filter = seekFilter
+            if (filter == null) {
+                if (packet.trackId !in awaitingKeyFrame) return packet
+                if (!packet.isKeyFrame) continue
+                awaitingKeyFrame.remove(packet.trackId)
+                return packet
+            }
+            val keyFrame = filter.keyFrame
+            if (keyFrame != null) {
+                filter.after += packet
+                filter.retain(packet)
+                if (packet.ptsUs > keyFrame.ptsUs) filter.past += packet.trackId
+                if (packet.ptsUs > filter.progressUs) filter.progressUs = packet.ptsUs
+                filter.heardAtUs[packet.trackId] = filter.progressUs
+                filter.behindUs[packet.trackId] = filter.progressUs - packet.ptsUs
+                if (settled(filter) || waitedEnough(filter, keyFrame)) land(filter, keyFrame)
+            } else if (packet.ptsUs - filter.landedUs > SEEK_LOOKAHEAD_US || filter.retainedBytes > SEEK_MAX_RETAINED_BYTES) {
+                giveUp(filter, packet)
+            } else if (packet.trackId != filter.anchor) {
+                filter.held += packet
+                filter.retain(packet)
+            } else if (packet.isKeyFrame && packet.ptsUs >= filter.landedUs) {
+                filter.keyFrame = packet
+                filter.progressUs = packet.ptsUs
+                for (held in filter.held) if (held.ptsUs > packet.ptsUs) filter.past += held.trackId
+                if (settled(filter)) land(filter, packet)
+            }
+        }
+    }
+
+    /**
+     * Si ya se sabe por dónde empieza cada pista: todas, salvo la ancla, han dado un paquete
+     * posterior al keyframe. Siguen, y como el audio va en orden, ninguno de los que faltan por
+     * leer suena en él.
+     */
+    private fun settled(filter: SeekFilter): Boolean =
+        trackMap.keys.all { number -> number == filter.anchor || number in filter.past }
+
+    /**
+     * Si se deja de esperar a las pistas que aún no han pasado el keyframe ([settled] no se
+     * cumple): todas ellas llevan un rato sin dar nada —han terminado o tienen un hueco—, o la
+     * lectura va ya [SEEK_LOOKAHEAD_US] por delante del keyframe, o lo guardado llega a
+     * [SEEK_MAX_RETAINED_BYTES].
+     *
+     * Una pista que sigue dando paquetes, aunque sean anteriores al keyframe, no ha terminado: va
+     * por detrás en el archivo. Es lo que pasa cuando el muxer intercala por tiempo de
+     * decodificación un vídeo con B-frames cuyo DTS va segundos por detrás del PTS, como en algunas
+     * grabaciones de Android: el audio que suena en un keyframe queda escrito esos segundos más
+     * adelante. Hasta ahora se dejaba de esperar en cuanto lo leído pasaba un segundo del keyframe,
+     * y el audio empezaba esos segundos antes que la imagen.
+     *
+     * Por eso «un rato» es [SEEK_SETTLE_US] más lo que la pista iba por detrás en su último
+     * paquete ([SeekFilter.behindUs]). Una pista intercalada a milisegundos, como casi todas, se da
+     * por terminada tras un segundo sin noticias. Una que va segundos por detrás puede pasar un
+     * tramo sin paquetes sin haber terminado: al final de esas mismas grabaciones el codificador
+     * vacía de golpe más de un segundo de fotogramas seguidos, sin audio entre ellos.
+     */
+    private fun waitedEnough(filter: SeekFilter, keyFrame: MediaPacket): Boolean {
+        if (filter.retainedBytes > SEEK_MAX_RETAINED_BYTES) return true
+        val read = filter.progressUs - keyFrame.ptsUs
+        if (read > SEEK_LOOKAHEAD_US) return true
+        if (read <= SEEK_SETTLE_US) return false
+        return trackMap.keys.all { number ->
+            val silentUs = filter.progressUs - (filter.heardAtUs[number] ?: keyFrame.ptsUs)
+            number == filter.anchor || number in filter.past ||
+                silentUs - SEEK_SETTLE_US > (filter.behindUs[number] ?: 0L)
+        }
+    }
+
+    /**
+     * Se sabe ya por dónde empieza cada pista tras una búsqueda: lo leído de las demás pistas, antes
+     * y después del [keyFrame], se recorta con el criterio de `Mp4Demuxer`, y todo vuelve a la cola
+     * en el orden del archivo.
+     *
+     * - Una pista de audio empieza en su último paquete que no empieza después del keyframe: el
+     *   que suena en ese instante. Como la lectura empezó un cluster antes del suyo (ver
+     *   [scanForKeyFrame]) y siguió hasta pasar el keyframe en todas las demás pistas (ver
+     *   [SeekFilter]), ese paquete está entre lo leído tanto si el muxer lo dejó en el cluster
+     *   anterior como si lo escribió detrás del keyframe.
+     * - Otra pista de vídeo empieza en su último keyframe no posterior. Si no hay ninguno entre lo
+     *   leído —el suyo está más atrás—, se descarta lo suyo hasta el siguiente ([awaitingKeyFrame]):
+     *   nunca sale primero un fotograma que no se puede decodificar.
+     * - Una pista que ya ha terminado en ese instante no entrega nada de lo leído (ver
+     *   [endedBefore]; [atEnd] dice si la lectura llegó al final del archivo). Si luego vuelve
+     *   —tenía un hueco—, sigue desde ahí, y si es de vídeo, desde su siguiente keyframe.
+     */
+    private fun land(filter: SeekFilter, keyFrame: MediaPacket, atEnd: Boolean = false) {
+        seekFilter = null
+        val read = ArrayList<MediaPacket>(filter.held.size + 1 + filter.after.size)
+        read.addAll(filter.held)
+        read.add(keyFrame)
+        read.addAll(filter.after)
+        val startAt = HashMap<Int, Int>()
+        for ((i, packet) in read.withIndex()) {
+            if (packet.trackId == filter.anchor) continue
+            if (trackMap[packet.trackId] is TrackInfo.Video) {
+                if (packet.isKeyFrame && packet.ptsUs <= keyFrame.ptsUs) startAt[packet.trackId] = i
+            } else if (packet.ptsUs <= keyFrame.ptsUs || packet.trackId !in startAt) {
+                startAt[packet.trackId] = i
+            }
+        }
+        for ((number, track) in trackMap) {
+            if (number == filter.anchor) continue
+            if (number !in filter.past && endedBefore(number, track, read, keyFrame.ptsUs, atEnd)) {
+                startAt[number] = read.size
+                if (track is TrackInfo.Video) awaitingKeyFrame += number
+            } else if (track is TrackInfo.Video && number !in startAt) {
+                awaitingKeyFrame += number
+            }
+        }
+        val rest = ArrayList(pending)
+        pending.clear()
+        for ((i, packet) in read.withIndex()) if (i >= (startAt[packet.trackId] ?: 0)) pending.add(packet)
+        pending.addAll(rest)
+    }
+
+    /**
+     * Si la pista [number], que no dio ningún paquete posterior al keyframe en lo leído, ya ha
+     * terminado en [keyFrameUs]: lo último suyo que se leyó deja de presentarse antes. Es el
+     * criterio de `Mp4Demuxer`, con lo que Matroska permite saber:
+     *
+     * - En audio, un hueco es silencio, así que no dar nada en el segundo que se lee tras el
+     *   keyframe ([SEEK_SETTLE_US]) basta. La duración de un bloque es opcional; si no la declara,
+     *   se toma la distancia a su paquete anterior, porque los paquetes de un códec de audio duran
+     *   lo mismo.
+     * - En vídeo, un fotograma se muestra hasta el siguiente aunque su duración diga otra cosa —una
+     *   captura de pantalla se queda quieta lo que haga falta—, y la de un MP4 lo refleja porque es
+     *   la distancia al siguiente. Aquí solo se sabe que no hay siguiente al llegar al final del
+     *   archivo ([atEnd]), y solo entonces, y con la duración declarada, se da por terminada. Una
+     *   pista de vídeo que termina antes que el archivo, lejos de su final, se sigue entregando
+     *   desde su último keyframe.
+     */
+    private fun endedBefore(number: Int, track: TrackInfo, read: List<MediaPacket>, keyFrameUs: Long, atEnd: Boolean): Boolean {
+        if (track is TrackInfo.Video && !atEnd) return false
+        var latest: MediaPacket? = null
+        var previous: MediaPacket? = null
+        for (packet in read) {
+            if (packet.trackId != number) continue
+            if (latest == null || packet.ptsUs >= latest.ptsUs) {
+                previous = latest
+                latest = packet
+            }
+        }
+        if (latest == null || latest.ptsUs >= keyFrameUs) return false
+        val durationUs = when {
+            latest.durationUs > 0 -> latest.durationUs
+            track is TrackInfo.Audio && previous != null -> latest.ptsUs - previous.ptsUs
+            else -> return false
+        }
+        return keyFrameUs - latest.ptsUs >= durationUs
+    }
+
+    /**
+     * Si [header] es un bloque de la pista ancla anterior al keyframe de una búsqueda en curso, que
+     * se va a descartar de todos modos: así no se lee su carga. La lectura tras buscar empieza un
+     * cluster antes que el del keyframe, y sin esto se leerían sus fotogramas para tirarlos. Lo
+     * que llega después del keyframe se entrega entero, como sin búsqueda.
+     */
+    private fun droppedBySeek(header: BlockHeader): Boolean {
+        val filter = seekFilter ?: return false
+        return filter.keyFrame == null && header.trackNumber == filter.anchor &&
+            ticksToUs(clusterTimestampTicks + header.relative) < filter.landedUs
+    }
+
+    /**
+     * El keyframe de una búsqueda no llega —un cue que apunta mal, un archivo dañado— y los paquetes
+     * ya van [SEEK_LOOKAHEAD_US] por delante del destino: se deja de filtrar y se entrega todo desde
+     * aquí, guardado incluido. Sin este tope, un keyframe que no existe haría guardar en memoria
+     * todo lo que queda del archivo.
+     */
+    private fun giveUp(filter: SeekFilter, packet: MediaPacket) {
+        seekFilter = null
+        val rest = ArrayList(pending)
+        pending.clear()
+        pending.addAll(filter.held)
+        pending.add(packet)
+        pending.addAll(rest)
+    }
+
+    /**
+     * El archivo se acabó con una búsqueda por decidir. Si el keyframe llegó, se recorta como
+     * siempre con lo que haya ([land]); si no, se entrega lo guardado tal cual. `null` si no queda
+     * nada.
+     */
+    private fun releaseHeld(): MediaPacket? {
+        val filter = seekFilter ?: return null
+        val keyFrame = filter.keyFrame
+        if (keyFrame != null) {
+            land(filter, keyFrame, atEnd = true)
+        } else {
+            seekFilter = null
+            pending.addAll(filter.held)
         }
         return pending.poll()
     }
@@ -756,7 +1029,7 @@ public class MkvDemuxer(
         if (length > 8 || el.size < length + 3) return null
         var trackNumber = (first and (mask - 1)).toLong()
         repeat(length - 1) { trackNumber = (trackNumber shl 8) or input.readByte().toLong() }
-        val relative = input.readBits(2).toInt().toShort().toInt()
+        val relative = input.readUInt(2).toInt().toShort().toInt()
         val flags = input.readByte()
         if (trackNumber !in 1..Int.MAX_VALUE) return null
         return BlockHeader(trackNumber.toInt(), relative, flags, length + 3)
@@ -774,7 +1047,7 @@ public class MkvDemuxer(
         requireBlockPayload(el)
         val header = readBlockHeader(el)
         val track = header?.let { trackFor(it.trackNumber) }
-        if (header == null || track == null) {
+        if (header == null || track == null || droppedBySeek(header)) {
             input.position = el.dataEnd
             return
         }
@@ -798,7 +1071,7 @@ public class MkvDemuxer(
                     header = readBlockHeader(el)
                     track = header?.let { trackFor(it.trackNumber) }
                     val current = header
-                    if (current != null && track != null) {
+                    if (current != null && track != null && !droppedBySeek(current)) {
                         payload = input.readBytes((el.size - current.size).toInt())
                     } else {
                         input.position = el.dataEnd
@@ -939,73 +1212,155 @@ public class MkvDemuxer(
     }
 
     /**
-     * Las cues se ordenan por tiempo al abrir, así que el último punto en o antes de
-     * [timestampUs] se encuentra por bisección en vez de recorrer el índice entero.
+     * Se coloca en el último keyframe de la pista ancla —la primera de vídeo, o la primera si no
+     * hay vídeo— con `pts <= `[timestampUs], y devuelve su `pts`. Es el mismo contrato que
+     * `Mp4Demuxer`:
+     *
+     * - Con índice, el último cue de esa pista en o antes del destino, por bisección, y se recorren
+     *   las cabeceras de los bloques desde el cue anterior hasta el destino (ver
+     *   [scanForKeyFrame]): un cue no tiene por qué marcar cada keyframe —FFmpeg solo marca el
+     *   primero de cada cluster—, ni su cluster empezar en él.
+     * - Sin índice, o con un destino anterior al primer cue, lo mismo desde el primer cluster.
+     *   Antes del primer cue se tomaba ese cue tal cual —su cluster y su tiempo—, y eso fallaba
+     *   de dos maneras: se leía desde su cluster y no desde el anterior, perdiendo el audio que
+     *   ya sonaba en el keyframe, y su tiempo no tiene por qué ser el del keyframe. Con tiempos
+     *   negativos no lo es nunca —`CueTime` no tiene signo y el muxer lo acota a 0—: buscar antes
+     *   del principio devolvía 0 y entregaba desde el siguiente keyframe, un segundo más tarde.
+     *
+     * La lectura empieza **un cluster antes** que el del keyframe y, pasado este, sigue hasta que
+     * cada una de las demás pistas da un paquete posterior, para que el de audio que suena en ese
+     * instante esté entre lo leído tanto si el muxer lo dejó en el cluster anterior como si lo
+     * escribió detrás del keyframe, y para saber qué pista ha terminado ya; lo de la pista ancla
+     * anterior al keyframe se descarta sin leer su carga. Las demás pistas siguen por tiempo de
+     * presentación, como en MP4 (ver [land]).
+     *
+     * Hasta la 3.x se devolvía el tiempo del cue o, sin índice, el del cluster, y se leía desde el
+     * principio de ese cluster: con un archivo cuyos clusters no empiezan en keyframe —los de
+     * otros muxers, o cualquiera sin índice— salían primero fotogramas que no se pueden
+     * decodificar, y el tiempo devuelto no era el de ningún keyframe.
      */
     override fun seekTo(timestampUs: Long): Long {
         pending.clear()
+        seekFilter = null
         eof = false
         clusterEnd = -1
-        val cue = lastCueAtOrBefore(timestampUs) ?: cues.firstOrNull()
-        if (cue != null) {
-            input.position = segmentDataStart + cue.clusterPosition
-            return cue.timeUs
-        }
-        if (firstClusterPos < 0) {
+        val anchor = seekAnchor
+        if (anchor == null || firstClusterPos < 0) {
             eof = true
             return 0L
         }
-        val (pos, timeUs) = scanForCluster(timestampUs)
-        input.position = pos
-        return timeUs
+        awaitingKeyFrame.clear()
+        val index = lastCueIndexAtOrBefore(anchorCues, timestampUs)
+        val known = anchorCues.getOrNull(index)?.let { segmentDataStart + it.clusterPosition to it.timeUs }
+        val from = anchorCues.getOrNull(index - 1)?.let { segmentDataStart + it.clusterPosition } ?: firstClusterPos
+        val (position, landedUs) = scanForKeyFrame(from, timestampUs, anchor, known) ?: (firstClusterPos to 0L)
+        input.position = position
+        seekFilter = SeekFilter(anchor, landedUs)
+        return landedUs
     }
 
-    private fun lastCueAtOrBefore(timestampUs: Long): Cue? {
+    /** La pista ancla de [seekTo]: la primera de vídeo, o la primera si no hay vídeo. */
+    private val seekAnchor: Int? by lazy { (trackList.firstOrNull { it is TrackInfo.Video } ?: trackList.firstOrNull())?.id }
+
+    /** Los cues de [seekAnchor], ya ordenados; todos si ninguno declara esa pista. */
+    private val anchorCues: List<Cue> by lazy { cues.filter { it.track == seekAnchor }.ifEmpty { cues } }
+
+    /** Índice del último cue de [sorted] en o antes de [timestampUs], o -1 si no hay ninguno. */
+    private fun lastCueIndexAtOrBefore(sorted: List<Cue>, timestampUs: Long): Int {
         var low = 0
-        var high = cues.size
+        var high = sorted.size
         while (low < high) {
             val mid = (low + high) ushr 1
-            if (cues[mid].timeUs <= timestampUs) low = mid + 1 else high = mid
+            if (sorted[mid].timeUs <= timestampUs) low = mid + 1 else high = mid
         }
-        return if (low > 0) cues[low - 1] else null
+        return low - 1
     }
 
     /**
-     * Localiza por escaneo lineal el último cluster que empieza en o antes de
-     * [timestampUs]. Devuelve (posición absoluta, marca de tiempo real); ante un archivo
-     * truncado o un cluster de tamaño desconocido se queda con el mejor hallado hasta ahí.
+     * El último keyframe de [anchor] con `pts <= `[timestampUs], recorriendo desde [from] los
+     * clusters y las cabeceras de sus bloques, sin leer las cargas; [known] es el que ya se sabe
+     * que hay, el de un cue. Si no aparece ninguno antes del destino, el primero que aparezca.
+     * Devuelve (dónde empezar a leer, `pts`) —el cluster anterior al del keyframe, o el suyo si es
+     * el primero recorrido—, o `null` si no se encuentra ningún keyframe legible de esa pista.
+     *
+     * Para en el primer cluster posterior al destino, así que desde un cue cuesta lo que ocupen
+     * los bloques hasta el siguiente, y sin índice lo que ocupen hasta el destino. Ante un archivo
+     * truncado se queda con lo mejor que haya encontrado.
      */
-    private fun scanForCluster(timestampUs: Long): Pair<Long, Long> {
+    private fun scanForKeyFrame(from: Long, timestampUs: Long, anchor: Int, known: Pair<Long, Long>?): Pair<Long, Long>? {
         val saved = input.position
-        var bestPos = firstClusterPos
-        var bestUs = 0L
+        val anchorIsAudio = trackMap[anchor] is TrackInfo.Audio
+        var best: Pair<Long, Long>? = known
+        var first: Pair<Long, Long>? = known
+        var previous = -1L
         try {
-            var pos = firstClusterPos
-            while (pos < segmentEnd) {
-                input.position = pos
-                if (input.remaining <= 0) break
-                val el = reader.readElement()
-                if (el.size < 0) break
-                if (el.id != MatroskaIds.CLUSTER) { pos = el.dataEnd; continue }
-                var timeUs = -1L
-                while (input.position < el.dataEnd) {
-                    val child = reader.readElement()
-                    if (child.id == MatroskaIds.CLUSTER_TIMESTAMP) {
-                        timeUs = ticksToUs(reader.readUInt(child))
-                        break
-                    }
-                    if (child.size < 0) break
-                    reader.skip(child)
+            var pos = from
+            while (pos in 0 until segmentEnd && pos < input.length) {
+                val walk = walkCluster(pos, anchor, anchorIsAudio)
+                val past = walk.timeUs != null && walk.timeUs > timestampUs
+                if (past && best != null) break
+                val readFrom = if (previous >= 0) previous else pos
+                for (key in walk.keyFramesUs) {
+                    if (first == null) first = readFrom to key
+                    if (key <= timestampUs) best = readFrom to key
                 }
-                if (timeUs > timestampUs) break
-                if (timeUs >= 0) { bestPos = pos; bestUs = timeUs }
-                pos = el.dataEnd
+                if (past && first != null) break
+                if (walk.timeUs != null) previous = pos
+                pos = walk.next
             }
         } catch (_: Exception) {
         } finally {
             input.position = saved
         }
-        return bestPos to bestUs
+        return best ?: first
+    }
+
+    /**
+     * Recorre el elemento que empieza en [start] sin entregar nada. Si es un cluster, devuelve su
+     * tiempo y los `pts` de los keyframes de [anchor] en el orden del archivo; en todo caso, dónde
+     * empieza el elemento siguiente, o -1 si no se puede saber.
+     *
+     * Admite clusters de tamaño desconocido —los de una grabación cortada antes de cerrarse—, que
+     * terminan donde empieza el siguiente cluster. El criterio de keyframe es el de [emitBlock].
+     */
+    private fun walkCluster(start: Long, anchor: Int, anchorIsAudio: Boolean): ClusterWalk {
+        input.position = start
+        val el = reader.readElement()
+        if (el.id != MatroskaIds.CLUSTER) return ClusterWalk(null, emptyList(), if (el.size >= 0) el.dataEnd else -1)
+        val end = if (el.size >= 0) minOf(el.dataEnd, segmentEnd) else segmentEnd
+        var ticks: Long? = null
+        val keys = ArrayList<Long>()
+        while (input.position < end && input.remaining > 0) {
+            val childStart = input.position
+            val child = reader.readElement()
+            if (el.size < 0 && child.id == MatroskaIds.CLUSTER) return ClusterWalk(ticks?.let(::ticksToUs), keys, childStart)
+            if (child.size < 0) return ClusterWalk(ticks?.let(::ticksToUs), keys, -1)
+            var header: BlockHeader? = null
+            var key = false
+            when (child.id) {
+                MatroskaIds.CLUSTER_TIMESTAMP -> ticks = reader.readUInt(child)
+                MatroskaIds.SIMPLE_BLOCK -> {
+                    header = readBlockHeader(child)
+                    key = anchorIsAudio || (header != null && (header.flags and 0x80) != 0)
+                }
+                MatroskaIds.BLOCK_GROUP -> {
+                    var referenced = false
+                    while (input.position < child.dataEnd) {
+                        val part = reader.readElement()
+                        if (part.size < 0) break
+                        when (part.id) {
+                            MatroskaIds.BLOCK -> header = readBlockHeader(part)
+                            MatroskaIds.REFERENCE_BLOCK -> referenced = true
+                        }
+                        input.position = part.dataEnd
+                    }
+                    key = !referenced
+                }
+            }
+            input.position = child.dataEnd
+            if (key && header != null && header.trackNumber == anchor) keys += ticksToUs((ticks ?: 0L) + header.relative)
+        }
+        return ClusterWalk(ticks?.let(::ticksToUs), keys, if (el.size >= 0) el.dataEnd else -1)
     }
 
     override fun close() {
@@ -1036,6 +1391,38 @@ public class MkvDemuxer(
          * fuera cualquier campo corrupto.
          */
         private const val MAX_SAMPLE_RATE_HZ = 768_000.0
+
+        /**
+         * Cuánto puede adelantarse lo leído tras [seekTo] al keyframe esperado antes de dejar de
+         * esperarlo, y, llegado el keyframe, a él antes de dejar de esperar a una pista que va por
+         * detrás en el archivo (ver [waitedEnough]). Ese keyframe está en el cluster en el que se
+         * cae, así que en un archivo sano llega mucho antes; y una pista va como mucho unos pocos
+         * segundos por detrás. Si va más, empieza antes del keyframe.
+         */
+        private const val SEEK_LOOKAHEAD_US = 10_000_000L
+
+        /**
+         * Cuánto se sigue leyendo tras el keyframe de una búsqueda sin que una pista que no lo ha
+         * pasado dé ningún paquete, antes de darla por terminada o en un hueco. Un muxer intercala
+         * las pistas a pocos milisegundos unas de otras, así que en un archivo normal se decide en
+         * unos pocos paquetes.
+         */
+        private const val SEEK_SETTLE_US = 1_000_000L
+
+        /**
+         * Lo más que se guarda en memoria mientras se decide por dónde empieza cada pista tras
+         * [seekTo], contando cada paquete como su carga más [RETAINED_PACKET_OVERHEAD]: 64 MiB, diez
+         * segundos de vídeo a unos 50 Mbit/s. En un archivo sano mandan los topes de tiempo; este
+         * cubre uno dañado cuyos tiempos dejan de avanzar, que sin él haría guardar todo lo que
+         * queda del archivo antes de entregar el primer paquete.
+         */
+        private const val SEEK_MAX_RETAINED_BYTES = 64L * 1024 * 1024
+
+        /** Lo que ocupa un `MediaPacket` guardado además de su carga, redondeado por arriba. */
+        private const val RETAINED_PACKET_OVERHEAD = 64L
+
+        /** Lo que supone para quien lee perder el índice, en los avisos. */
+        private const val NO_INDEX = "se ignora, y las búsquedas recorrerán los clusters en vez de saltar"
 
         private const val LACING_NONE = 0
         private const val LACING_XIPH = 1

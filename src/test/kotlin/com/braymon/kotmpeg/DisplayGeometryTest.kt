@@ -128,7 +128,7 @@ class DisplayGeometryTest {
     )
 
     private fun readVideo(file: File): TrackInfo.Video =
-        MkvKotlin.openDemuxer(file).use { it.tracks.first() as TrackInfo.Video }
+        Kotmpeg.openDemuxer(file).use { it.tracks.first() as TrackInfo.Video }
 
     /**
      * **`DisplayUnit` es quien dice si el par de presentación son píxeles.**
@@ -233,14 +233,14 @@ class DisplayGeometryTest {
         )
 
         val aMkv = File(dir, "convertido.mkv")
-        MkvKotlin.remux(source, aMkv)
+        Kotmpeg.remux(source, aMkv)
         assertEquals(
             DISPLAY_W to CODED_H, readVideo(aMkv).let { it.displayWidth to it.displayHeight },
             "el MKV de salida heredó el 16x9, y ahí ya no hay vuelta atrás",
         )
 
         val aMp4 = File(dir, "convertido.mp4")
-        MkvKotlin.remux(source, aMp4)
+        Kotmpeg.remux(source, aMp4)
         assertEquals(
             DISPLAY_W to CODED_H, readVideo(aMp4).let { it.displayWidth to it.displayHeight },
             "el tkhd del MP4 de salida declara el tamaño de presentación equivocado",
@@ -275,7 +275,7 @@ class DisplayGeometryTest {
                 Ebml.float(MatroskaIds.SAMPLING_FREQUENCY, 24_000.0),
                 Ebml.float(MatroskaIds.OUTPUT_SAMPLING_FREQUENCY, declarada),
             )
-            val tracks = MkvKotlin.openDemuxer(file).use { it.tracks }
+            val tracks = Kotmpeg.openDemuxer(file).use { it.tracks }
             assertEquals(1, tracks.size, "$nombre: la pista desapareció")
             assertEquals(esperada, (tracks.first() as TrackInfo.Audio).sampleRate, nombre)
         }
@@ -321,7 +321,7 @@ class DisplayGeometryTest {
 
         for (destino in listOf("ida-y-vuelta.mp4", "ida-y-vuelta.mkv")) {
             val out = File(dir, destino)
-            MkvKotlin.remux(origen, out)
+            Kotmpeg.remux(origen, out)
             assertEquals(
                 DISPLAY_W to CODED_H, readVideo(out).let { it.displayWidth to it.displayHeight },
                 "$destino: la geometría no sobrevivió a la conversión",
@@ -402,16 +402,17 @@ class DisplayGeometryTest {
         displayHeight: Int = CODED_H,
         rotation: Int = 0,
     ) {
-        val track = TrackInfo.Video(
-            codec = VideoCodec.H264, width = CODED_W, height = CODED_H,
-            displayWidth = displayWidth, displayHeight = displayHeight,
-            frameRate = 30.0, rotationDegrees = rotation,
+        val track = TrackInfo.Video(codec = VideoCodec.H264, width = CODED_W, height = CODED_H) {
+            this.displayWidth = displayWidth
+            this.displayHeight = displayHeight
+            frameRate = 30.0
+            rotationDegrees = rotation
             codecPrivate = NalUnits.buildAvcC(
                 listOf(byteArrayOf(0x67, 0x64, 0x00, 0x1F, 0x11, 0x22, 0x33)),
                 listOf(byteArrayOf(0x68, 0x11, 0x22)),
-            ),
-        )
-        MkvKotlin.createMuxer(target, format).use { muxer ->
+            )
+        }
+        Kotmpeg.createMuxer(target, format).use { muxer ->
             val id = muxer.addTrack(track)
             muxer.start()
             for (i in 0 until 10) {

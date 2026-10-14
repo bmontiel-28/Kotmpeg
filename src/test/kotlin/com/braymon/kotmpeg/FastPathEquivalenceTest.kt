@@ -14,6 +14,7 @@ import com.braymon.kotmpeg.mp4.Mp4Muxer
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
+import java.io.FileInputStream
 import java.io.RandomAccessFile
 import java.math.BigInteger
 import kotlin.random.Random
@@ -21,6 +22,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 /**
  * Las optimizaciones de la 3.0 cambian **cómo** se calcula algo, nunca **qué** sale. Cada test
@@ -114,9 +116,9 @@ class FastPathEquivalenceTest {
         )
         val file = File(dir, "seek.mp4")
         Mp4Muxer(file).use { muxer ->
-            val video = muxer.addTrack(TrackInfo.Video(codec = VideoCodec.H264, width = 64, height = 64, codecPrivate = avcC))
+            val video = muxer.addTrack(TrackInfo.Video(codec = VideoCodec.H264, width = 64, height = 64) { codecPrivate = avcC })
             val audio = muxer.addTrack(
-                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2)),
+                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) { codecPrivate = AacConfig.build(48000, 2) },
             )
             muxer.start()
             val order = intArrayOf(0, 3, 1, 2)
@@ -128,15 +130,15 @@ class FastPathEquivalenceTest {
                     )
                 }
                 for (a in 0 until 7) {
-                    muxer.writePacket(MediaPacket(audio, ByteArray(8), ptsUs = (gop * 7 + a) * 22_857L))
+                    muxer.writePacket(MediaPacket(audio, ByteArray(8), ptsUs = (gop * 7 + a) * 22_857L, isKeyFrame = false))
                 }
             }
         }
-        val (videoId, all) = MkvKotlin.openDemuxer(file).use { demuxer ->
+        val (videoId, all) = Kotmpeg.openDemuxer(file).use { demuxer ->
             demuxer.tracks.first { it is TrackInfo.Video }.id to generateSequence { demuxer.readPacket() }.toList()
         }
         val videoPackets = all.filter { it.trackId == videoId }
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             for (target in listOf(-5_000L, 0L, 79_999L, 80_000L, 1_234_567L, 3_000_000L, 6_399_999L, 99_000_000L)) {
                 var expected = 0
                 for ((index, packet) in videoPackets.withIndex()) {
@@ -170,13 +172,29 @@ class FastPathEquivalenceTest {
         assertEquals(0L, Timestamps.rescaleRounded(499_999, 1, 1_000_000))
     }
 
+    /**
+     * Un descriptor de solo lectura y vacío: Java no sabe que no admite escrituras hasta que el
+     * sistema rechaza la primera, así que el constructor lo acepta y el fallo llega al vaciar el
+     * buffer al cerrar. Un `RandomAccessFile` en `"r"` ya no sirve para provocarlo: desde la
+     * 4.0.0 se rechaza al construir.
+     */
     @Test
     fun `closing an output releases the descriptor even when the last flush fails`() {
-        val file = File(dir, "solo-lectura.bin").apply { writeBytes(ByteArray(10)) }
-        val readOnly = RandomAccessFile(file, "r")
-        val output = SeekableOutput(readOnly)
+        val file = File(dir, "solo-lectura.bin").apply { writeBytes(ByteArray(0)) }
+        val readOnly = FileInputStream(file)
+        val output = SeekableOutput(readOnly.fd)
         output.write(ByteArray(100) { 1 })
-        runCatching { output.close() }
-        assertFalse(readOnly.channel.isOpen, "el canal quedó abierto tras un flush fallido")
+        assertTrue(runCatching { output.close() }.isFailure, "el último vaciado tenía que fallar")
+        assertFalse(readOnly.fd.valid(), "el descriptor quedó abierto tras un flush fallido")
+    }
+
+    /** Con contenido que truncar, el mismo destino de solo lectura falla al abrir, y tampoco se queda abierto. */
+    @Test
+    fun `an output that cannot be truncated is released when the constructor fails`() {
+        val file = File(dir, "solo-lectura-lleno.bin").apply { writeBytes(ByteArray(10)) }
+        val readOnly = RandomAccessFile(file, "r")
+        assertTrue(runCatching { SeekableOutput(readOnly) }.isFailure, "truncar un destino de solo lectura no puede salir bien")
+        assertFalse(readOnly.channel.isOpen, "el canal quedó abierto tras fallar el constructor")
+        assertEquals(10L, file.length())
     }
 }

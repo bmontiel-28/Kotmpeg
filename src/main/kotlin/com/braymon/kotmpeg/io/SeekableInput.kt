@@ -17,7 +17,7 @@ import java.nio.channels.FileChannel
  *
  * ```kotlin
  * contentResolver.openFileDescriptor(uri, "r")!!.use { pfd ->
- *     MkvKotlin.openDemuxer(SeekableInput(pfd.fileDescriptor), ContainerFormat.MP4).use { ... }
+ *     Kotmpeg.openDemuxer(SeekableInput(pfd.fileDescriptor)).use { ... }
  * }
  * ```
  *
@@ -110,19 +110,25 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
         return out
     }
 
-    /** Lee [count] bytes big-endian como valor sin signo (count <= 8). */
-    public fun readBits(count: Int): Long {
-        require(count in 0..8) { "solo se pueden leer de 0 a 8 bytes como entero: $count" }
-        if (count == 0) return 0L
+    /**
+     * Lee [byteCount] bytes big-endian como entero sin signo (de 0 a 8).
+     *
+     * Hasta la 3.x se llamaba `readBits`, aunque lo que cuenta son **bytes**: `readBits(2)` leía
+     * dos bytes, no dos bits, y el nombre invitaba a pasarle un número de bits sin que nada
+     * fallara.
+     */
+    public fun readUInt(byteCount: Int): Long {
+        require(byteCount in 0..8) { "solo se pueden leer de 0 a 8 bytes como entero: $byteCount" }
+        if (byteCount == 0) return 0L
         val idx = fill(pos)
-        if (bufferLen - idx >= count) {
+        if (bufferLen - idx >= byteCount) {
             var v = 0L
-            for (k in 0 until count) v = (v shl 8) or (buffer[idx + k].toLong() and 0xFF)
-            pos += count
+            for (k in 0 until byteCount) v = (v shl 8) or (buffer[idx + k].toLong() and 0xFF)
+            pos += byteCount
             return v
         }
         var v = 0L
-        repeat(count) { v = (v shl 8) or readByte().toLong() }
+        repeat(byteCount) { v = (v shl 8) or readByte().toLong() }
         return v
     }
 
@@ -141,8 +147,8 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
         }
     }
 
-    public fun readInt32(): Int = readBits(4).toInt()
-    public fun readInt64(): Long = readBits(8)
+    public fun readInt32(): Int = readUInt(4).toInt()
+    public fun readInt64(): Long = readUInt(8)
 
     public fun skip(count: Long) {
         require(count >= 0)

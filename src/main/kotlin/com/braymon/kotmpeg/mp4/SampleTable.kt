@@ -51,40 +51,6 @@ internal class SampleTable {
 
     fun isEmpty(): Boolean = size == 0
 
-    /**
-     * Si los DTS nunca retroceden, lo que permite buscar por bisección.
-     *
-     * Este método y los dos de búsqueda eran del demuxer, que desde la 3.1.0 ya no los usa. Siguen
-     * aquí solo porque la clase, aunque `internal`, figura en `public-api.txt`, y quitar una línea
-     * del volcado exige la versión mayor según CONTRIBUTING. Se retiran en la próxima mayor.
-     */
-    fun dtsIsMonotonic(): Boolean {
-        for (i in 1 until size) if (dtsUs(i) < dtsUs(i - 1)) return false
-        return true
-    }
-
-    /** Primer índice con `dts >= value` (o [size] si no hay); exige DTS monótonos. */
-    fun firstIndexWithDtsAtLeast(value: Long): Int {
-        var low = 0
-        var high = size
-        while (low < high) {
-            val mid = (low + high) ushr 1
-            if (dtsUs(mid) < value) low = mid + 1 else high = mid
-        }
-        return low
-    }
-
-    /** Primer índice con `dts > value` (o [size] si no hay); exige DTS monótonos. */
-    fun firstIndexWithDtsAbove(value: Long): Int {
-        var low = 0
-        var high = size
-        while (low < high) {
-            val mid = (low + high) ushr 1
-            if (dtsUs(mid) <= value) low = mid + 1 else high = mid
-        }
-        return low
-    }
-
     private fun addPage() {
         if (pages == offsets.size) {
             val capacity = pages * 2

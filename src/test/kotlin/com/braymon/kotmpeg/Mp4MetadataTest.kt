@@ -58,17 +58,20 @@ class Mp4MetadataTest {
         listOf(byteArrayOf(0x68, 0x11, 0x22)),
     )
 
-    private fun video(name: String? = null, default: Boolean = true) = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0,
-        codecPrivate = avcC, name = name, default = default,
-    )
+    private fun video(name: String? = null, default: Boolean = true) = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        frameRate = 30.0
+        codecPrivate = avcC
+        this.name = name
+        this.default = default
+    }
 
     private fun audio(name: String? = null, default: Boolean = true, delayUs: Long = 0) =
-        TrackInfo.Audio(
-            codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2,
-            codecPrivate = AacConfig.build(48000, 2), name = name, default = default,
-            codecDelayUs = delayUs,
-        )
+        TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+            codecPrivate = AacConfig.build(48000, 2)
+            this.name = name
+            this.default = default
+            codecDelayUs = delayUs
+        }
 
     private fun escribir(muxer: com.braymon.kotmpeg.Muxer, tracks: List<TrackInfo>) {
         val ids = tracks.map { muxer.addTrack(it) }
@@ -88,16 +91,14 @@ class Mp4MetadataTest {
 
     private fun mp4(vararg tracks: TrackInfo, fecha: Long? = FECHA_MILLIS): File {
         val file = File(dir, "plano-${tracks.size}-$fecha.mp4")
-        val muxer = Mp4Muxer(file)
-        muxer.creationTimeMillis = fecha
+        val muxer = Mp4Muxer(file) { creationTimeMillis = fecha }
         escribir(muxer, tracks.toList())
         return file
     }
 
     private fun fmp4(vararg tracks: TrackInfo, fecha: Long? = FECHA_MILLIS): File {
         val file = File(dir, "frag-${tracks.size}-$fecha.mp4")
-        val muxer = FragmentedMp4Muxer(file)
-        muxer.creationTimeMillis = fecha
+        val muxer = FragmentedMp4Muxer(file) { creationTimeMillis = fecha }
         escribir(muxer, tracks.toList())
         return file
     }
@@ -144,6 +145,30 @@ class Mp4MetadataTest {
         }
         recorrer(0, datos.size, 0)
         return salida
+    }
+
+    /**
+     * `writingApp` va en `udta` > `meta` > `ilst` > `©too`, donde lo escribe FFmpeg y de donde
+     * `ffprobe` saca el `encoder`. Hasta la 3.x solo llegaba al `WritingApp` de Matroska. Vacío, no
+     * se escribe nada.
+     */
+    @Test
+    fun `the writing app is tagged in plain and fragmented mp4`() {
+        val muxers = listOf<Pair<String, (File) -> com.braymon.kotmpeg.Muxer>>(
+            "plano" to { f -> Mp4Muxer(f) { writingApp = "Grabadora 2.1 — ñ" } },
+            "frag" to { f -> FragmentedMp4Muxer(f) { writingApp = "Grabadora 2.1 — ñ" } },
+        )
+        for ((name, create) in muxers) {
+            val file = File(dir, "app-$name.mp4")
+            escribir(create(file), listOf(video()))
+            val meta = cajas(file, "moov/udta/meta").single()
+            val latin = String(meta, Charsets.ISO_8859_1)
+            assertTrue("mdir" in latin && "\u00A9too" in latin, "$name: falta el hdlr o la etiqueta")
+            assertTrue("Grabadora 2.1 — ñ" in String(meta, Charsets.UTF_8), "$name: el texto no va en UTF-8")
+        }
+        val bare = File(dir, "sin-app.mp4")
+        escribir(Mp4Muxer(bare) { writingApp = "" }, listOf(video()))
+        assertTrue(cajas(bare, "moov/udta").isEmpty(), "con writingApp vacío no debe haber udta en el moov")
     }
 
     private fun ByteArray.u32(at: Int): Long =

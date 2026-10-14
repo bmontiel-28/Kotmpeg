@@ -27,14 +27,14 @@ class RoundTripTest {
     private val fakePps = byteArrayOf(0x68, 0x11, 0x22)
     private val avcC = NalUnits.buildAvcC(listOf(fakeSps), listOf(fakePps))
 
-    private fun videoTrack() = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0, codecPrivate = avcC,
-    )
+    private fun videoTrack() = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        frameRate = 30.0
+        codecPrivate = avcC
+    }
 
-    private fun audioTrack() = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2,
-        codecPrivate = AacConfig.build(48000, 2),
-    )
+    private fun audioTrack() = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+        codecPrivate = AacConfig.build(48000, 2)
+    }
 
     /** 30 fps video with a B-frame pattern (IBBP..), pts != dts, plus interleaved audio. */
     private data class Synthetic(val packets: List<MediaPacket>, val videoId: Int, val audioId: Int)
@@ -85,7 +85,7 @@ class RoundTripTest {
      * timescale (±12 us) - same quantization FFmpeg applies.
      */
     private fun verify(file: File, synthetic: Synthetic, ptsToleranceUs: Long) {
-        val demuxer = MkvKotlin.openDemuxer(file)
+        val demuxer = Kotmpeg.openDemuxer(file)
         val tracks = demuxer.tracks
         assertEquals(2, tracks.size, "expected 2 tracks")
         val video = tracks.filterIsInstance<TrackInfo.Video>().single()
@@ -132,26 +132,26 @@ class RoundTripTest {
     @Test
     fun `mkv round trip`() {
         val file = File(dir, "test.mkv")
-        val synthetic = writeSynthetic(MkvKotlin.createMuxer(file), withDts = false)
-        assertEquals(ContainerFormat.MKV, MkvKotlin.detectFormat(file))
+        val synthetic = writeSynthetic(Kotmpeg.createMuxer(file), withDts = false)
+        assertEquals(ContainerFormat.MKV, Kotmpeg.detectFormat(file))
         verify(file, synthetic, ptsToleranceUs = 500)
     }
 
     @Test
     fun `mp4 round trip with explicit dts`() {
         val file = File(dir, "test.mp4")
-        val synthetic = writeSynthetic(MkvKotlin.createMuxer(file), withDts = true)
-        assertEquals(ContainerFormat.MP4, MkvKotlin.detectFormat(file))
+        val synthetic = writeSynthetic(Kotmpeg.createMuxer(file), withDts = true)
+        assertEquals(ContainerFormat.MP4, Kotmpeg.detectFormat(file))
         verify(file, synthetic, ptsToleranceUs = 12)
     }
 
     @Test
     fun `mp4 round trip with derived dts`() {
         val file = File(dir, "test-derived.mp4")
-        val synthetic = writeSynthetic(MkvKotlin.createMuxer(file), withDts = false)
+        val synthetic = writeSynthetic(Kotmpeg.createMuxer(file), withDts = false)
         verify(file, synthetic, ptsToleranceUs = 12)
 
-        val demuxer = MkvKotlin.openDemuxer(file)
+        val demuxer = Kotmpeg.openDemuxer(file)
         val videoId = demuxer.tracks.first { it is TrackInfo.Video }.id
         var lastDts = Long.MIN_VALUE
         while (true) {
@@ -168,7 +168,7 @@ class RoundTripTest {
     fun `mp4 faststart places moov before mdat and stays readable`() {
         val file = File(dir, "faststart.mp4")
         val synthetic = writeSynthetic(
-            MkvKotlin.createMuxer(file, mp4FastStart = true),
+            Kotmpeg.createMuxer(file) { fastStart = true },
             withDts = true,
         )
         val order = ArrayList<String>()
@@ -191,7 +191,7 @@ class RoundTripTest {
     fun `fragmented mp4 round trip with b-frames`() {
         val file = File(dir, "frag.mp4")
         val synthetic = writeSynthetic(
-            MkvKotlin.createMuxer(file, mp4Fragmented = true),
+            Kotmpeg.createMuxer(file) { fragmented = true },
             withDts = false,
         )
         val order = ArrayList<String>()
@@ -217,7 +217,7 @@ class RoundTripTest {
     @Test
     fun `fragmented mp4 audio only uses duration-based fragments`() {
         val file = File(dir, "frag-audio.mp4")
-        val muxer = MkvKotlin.createMuxer(file, mp4Fragmented = true)
+        val muxer = Kotmpeg.createMuxer(file) { fragmented = true }
         val audioId = muxer.addTrack(audioTrack())
         muxer.start()
         val rnd = Random(3)
@@ -232,7 +232,7 @@ class RoundTripTest {
         }
         muxer.stop()
 
-        val demuxer = MkvKotlin.openDemuxer(file)
+        val demuxer = Kotmpeg.openDemuxer(file)
         val track = demuxer.tracks.single() as TrackInfo.Audio
         assertEquals(AudioCodec.AAC, track.codec)
         val got = ArrayList<MediaPacket>()
@@ -248,19 +248,19 @@ class RoundTripTest {
     @Test
     fun `remux mkv to mp4 and back`() {
         val mkv = File(dir, "a.mkv")
-        val synthetic = writeSynthetic(MkvKotlin.createMuxer(mkv), withDts = false)
+        val synthetic = writeSynthetic(Kotmpeg.createMuxer(mkv), withDts = false)
         val mp4 = File(dir, "b.mp4")
-        MkvKotlin.remux(mkv, mp4)
+        Kotmpeg.remux(mkv, mp4)
         val back = File(dir, "c.mkv")
-        MkvKotlin.remux(mp4, back)
+        Kotmpeg.remux(mp4, back)
         verify(back, synthetic, ptsToleranceUs = 500)
     }
 
     @Test
     fun `mkv seek uses cues`() {
         val file = File(dir, "seek.mkv")
-        writeSynthetic(MkvKotlin.createMuxer(file), withDts = false)
-        val demuxer = MkvKotlin.openDemuxer(file)
+        writeSynthetic(Kotmpeg.createMuxer(file), withDts = false)
+        val demuxer = Kotmpeg.openDemuxer(file)
         val pos = demuxer.seekTo(2_000_000)
         assertTrue(pos in 0..2_000_000, "seek position $pos")
         val p = demuxer.readPacket()

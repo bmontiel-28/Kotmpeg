@@ -105,13 +105,13 @@ class FfmpegIntegrationTest {
             "-c:a", "aac", "-b:a", "128k",
         )
 
-        val srcDemux = MkvKotlin.openDemuxer(src)
+        val srcDemux = Kotmpeg.openDemuxer(src)
         assertEquals(3, srcDemux.tracks.size, "expected video + 2 audio tracks")
         assertEquals(2, srcDemux.tracks.filterIsInstance<TrackInfo.Audio>().size)
         srcDemux.close()
 
         val out = File(dir, "out.mkv")
-        val packets = MkvKotlin.remux(src, out)
+        val packets = Kotmpeg.remux(src, out)
         assertTrue(packets > 100, "too few packets: $packets")
 
         assertEquals(listOf("h264", "aac", "aac"), ffprobeStreams(out))
@@ -133,7 +133,7 @@ class FfmpegIntegrationTest {
         )
 
         val out = File(dir, "out.mp4")
-        val packets = MkvKotlin.remux(src, out)
+        val packets = Kotmpeg.remux(src, out)
         assertTrue(packets > 100, "too few packets: $packets")
 
         assertEquals(listOf("hevc", "opus"), ffprobeStreams(out))
@@ -153,9 +153,9 @@ class FfmpegIntegrationTest {
             "-c:a", "aac", "-b:a", "128k",
         )
         val mp4 = File(dir, "sync.mp4")
-        MkvKotlin.remux(src, mp4)
+        Kotmpeg.remux(src, mp4)
         val mkv = File(dir, "sync2.mkv")
-        MkvKotlin.remux(mp4, mkv)
+        Kotmpeg.remux(mp4, mkv)
 
         assertDecodesCleanly(mp4)
         assertDecodesCleanly(mkv)
@@ -182,7 +182,7 @@ class FfmpegIntegrationTest {
             "-c:a", "aac", "-b:a", "128k",
         )
         val out = File(dir, "fs-out.mp4")
-        MkvKotlin.remux(src, out, mp4FastStart = true)
+        Kotmpeg.remux(src, out) { fastStart = true }
         assertEquals(listOf("h264", "aac"), ffprobeStreams(out))
         assertDecodesCleanly(out)
         assertEquals(countFrames(src, "v:0"), countFrames(out, "v:0"))
@@ -198,7 +198,7 @@ class FfmpegIntegrationTest {
             "-c:a", "aac", "-b:a", "128k",
         )
         val out = File(dir, "frag-out.mp4")
-        MkvKotlin.remux(src, out, mp4Fragmented = true)
+        Kotmpeg.remux(src, out) { fragmented = true }
         assertEquals(listOf("h264", "aac"), ffprobeStreams(out))
         assertDecodesCleanly(out)
         assertEquals(countFrames(src, "v:0"), countFrames(out, "v:0"), "video frames preserved")
@@ -215,12 +215,12 @@ class FfmpegIntegrationTest {
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "frag_keyframe+empty_moov",
         )
-        val srcDemux = MkvKotlin.openDemuxer(src)
+        val srcDemux = Kotmpeg.openDemuxer(src)
         assertEquals(2, srcDemux.tracks.size, "fMP4 tracks detected")
         srcDemux.close()
 
         val out = File(dir, "fffrag-out.mkv")
-        val packets = MkvKotlin.remux(src, out)
+        val packets = Kotmpeg.remux(src, out)
         assertTrue(packets > 100, "too few packets: $packets")
         assertEquals(listOf("h264", "aac"), ffprobeStreams(out))
         assertDecodesCleanly(out)
@@ -239,7 +239,7 @@ class FfmpegIntegrationTest {
             "-color_primaries", "bt2020", "-color_trc", "smpte2084",
             "-colorspace", "bt2020nc", "-color_range", "tv",
         )
-        val demux = MkvKotlin.openDemuxer(src)
+        val demux = Kotmpeg.openDemuxer(src)
         val video = demux.tracks.single() as TrackInfo.Video
         val color = video.color
         demux.close()
@@ -249,7 +249,7 @@ class FfmpegIntegrationTest {
         assertEquals(9, color.matrix, "bt2020nc matrix")
 
         val out = File(dir, "color-out.mp4")
-        MkvKotlin.remux(src, out)
+        Kotmpeg.remux(src, out)
         val (info, code) = run(
             "ffprobe", "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=color_primaries,color_transfer,color_space",
@@ -265,10 +265,10 @@ class FfmpegIntegrationTest {
         assumeTrue(available, "ffmpeg not installed")
         val src = makeReference("rot-src.mkv", "-map", "0:v", "-c:v", "libx264")
         val out = File(dir, "rot-out.mp4")
-        val demux = MkvKotlin.openDemuxer(src)
+        val demux = Kotmpeg.openDemuxer(src)
         val srcTrack = demux.tracks.single() as TrackInfo.Video
-        val muxer = MkvKotlin.createMuxer(out)
-        val id = muxer.addTrack(srcTrack.copy(rotationDegrees = 90))
+        val muxer = Kotmpeg.createMuxer(out)
+        val id = muxer.addTrack(srcTrack.copy { rotationDegrees = 90 })
         muxer.start()
         while (true) {
             val p = demux.readPacket() ?: break
@@ -300,7 +300,7 @@ class FfmpegIntegrationTest {
         val a = segment("part1.mp4")
         val b = segment("part2.mp4")
         val out = File(dir, "joined.mkv")
-        val packets = MkvKotlin.concat(listOf(a, b), out)
+        val packets = Kotmpeg.concat(listOf(a, b), out)
         assertTrue(packets > 200, "few packets: $packets")
         assertDecodesCleanly(out)
         assertEquals(
@@ -322,7 +322,7 @@ class FfmpegIntegrationTest {
             "-c:a", "aac",
         )
         val out = File(dir, "probe-out.mp4")
-        MkvKotlin.remux(src, out)
+        Kotmpeg.remux(src, out)
 
         val (info, code) = run(
             "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -355,7 +355,7 @@ class FfmpegIntegrationTest {
         val pauseUs = 5_000_000L
         val out = File(dir, "pausa.mp4")
         val written = ArrayList<Long>()
-        MkvKotlin.openDemuxer(src).use { demuxer ->
+        Kotmpeg.openDemuxer(src).use { demuxer ->
             FragmentedMp4Muxer(out).use { muxer ->
                 val ids = demuxer.tracks.associate { it.id to muxer.addTrack(it) }
                 val videoId = demuxer.tracks.first { it is TrackInfo.Video }.id
@@ -380,6 +380,93 @@ class FfmpegIntegrationTest {
         assertEquals(written.size, read.size)
         val shift = read.zip(written.sorted()).maxOf { (got, expected) -> Math.abs(got - expected) }
         assertTrue(shift <= 2 * 33_334, "FFmpeg lee el vídeo desplazado $shift µs respecto a donde se escribió")
+    }
+
+    /**
+     * Lo que motiva `nonNegativeCompositionOffsets`: con desfases firmados FFmpeg retrasa la pista
+     * de vídeo lo que mida el mayor desfase negativo, uno o dos fotogramas con B-frames. Con
+     * desfases sin signo y la lista de edición, cada fotograma tiene que leerse donde se escribió,
+     * con el redondeo de un tic de 90 kHz.
+     */
+    @Test
+    fun `unsigned composition offsets put every fmp4 frame where it was written`() {
+        assumeTrue(available, "ffmpeg not installed")
+        val src = makeReference(
+            "sin-signo-src.mp4",
+            "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-bf", "2", "-g", "30", "-c:a", "aac",
+        )
+        val written = Kotmpeg.openDemuxer(src).use { demuxer ->
+            val videoId = demuxer.tracks.first { it is TrackInfo.Video }.id
+            generateSequence { demuxer.readPacket() }.filter { it.trackId == videoId }.map { it.ptsUs }.toList().sorted()
+        }
+        val shifts = listOf(false, true).associateWith { nonNegative ->
+            val out = File(dir, "sin-signo-$nonNegative.mp4")
+            Kotmpeg.remux(src, out) {
+                fragmented = true
+                nonNegativeCompositionOffsets = nonNegative
+            }
+            assertDecodesCleanly(out)
+            val (probe, code) = run(
+                "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+                "-of", "csv=p=0", out.absolutePath,
+            )
+            assertEquals(0, code, "ffprobe failed: $probe")
+            val read = probe.lines().map { it.trim().trimEnd(',') }.filter { it.isNotEmpty() }
+                .map { Math.round(it.toDouble() * 1_000_000) }.sorted()
+            assertEquals(written.size, read.size)
+            read.zip(written).maxOf { (got, expected) -> Math.abs(got - expected) }
+        }
+        assertTrue(shifts.getValue(true) <= 12, "sin signo, FFmpeg lee el vídeo desplazado ${shifts.getValue(true)} µs")
+        assertTrue(shifts.getValue(false) > 12, "con signo FFmpeg ya no desplaza el vídeo (${shifts.getValue(false)} µs): revisar la documentación de la opción")
+    }
+
+    /**
+     * Un MKV de FFmpeg con un keyframe cada cinco fotogramas y clusters de diez: uno de cada dos
+     * keyframes cae a mitad de cluster. Su cue apunta al cluster, que empieza con el keyframe
+     * anterior y cuatro fotogramas más. Tras buscar, lo primero que sale de vídeo tiene que ser
+     * el keyframe pedido, en el tiempo devuelto; hasta la 3.x salía el del principio del cluster.
+     */
+    @Test
+    fun `an mkv whose keyframes fall mid cluster seeks onto the keyframe`() {
+        assumeTrue(available, "ffmpeg not installed")
+        val src = File(dir, "mitad-cluster.mkv")
+        val (log, code) = run(
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=30:duration=4",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
+            "-c:v", "libx264", "-bf", "0", "-g", "5", "-c:a", "aac", src.absolutePath,
+        )
+        assertEquals(0, code, "ffmpeg failed: $log")
+        Kotmpeg.openDemuxer(src).use { demuxer ->
+            val videoId = demuxer.tracks.first { it is TrackInfo.Video }.id
+            val keyFrames = generateSequence { demuxer.readPacket() }.filter { it.trackId == videoId && it.isKeyFrame }.map { it.ptsUs }.toList()
+            assertTrue(keyFrames.size >= 3, "keyframes: $keyFrames")
+            for (target in listOf(1_250_000L, 2_500_000L)) {
+                val landed = demuxer.seekTo(target)
+                assertEquals(keyFrames.last { it <= target }, landed, "seekTo($target)")
+                val first = generateSequence { demuxer.readPacket() }.first { it.trackId == videoId }
+                assertTrue(first.isKeyFrame, "tras seekTo($target) sale primero un fotograma que no es keyframe (${first.ptsUs} µs)")
+                assertEquals(landed, first.ptsUs)
+            }
+        }
+    }
+
+    /** `writingApp` es el `encoder` que muestra ffprobe en MP4 y fMP4, como el de FFmpeg. */
+    @Test
+    fun `the writing app is the encoder ffprobe reports`() {
+        assumeTrue(available, "ffmpeg not installed")
+        val src = makeReference("app-src.mp4", "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-c:a", "aac")
+        for (fragmented in listOf(false, true)) {
+            val out = File(dir, "app-$fragmented.mp4")
+            Kotmpeg.remux(src, out) {
+                this.fragmented = fragmented
+                writingApp = "Grabadora 2.1"
+            }
+            val (probe, code) = run("ffprobe", "-v", "error", "-show_entries", "format_tags=encoder", "-of", "csv=p=0", out.absolutePath)
+            assertEquals(0, code, "ffprobe failed: $probe")
+            assertEquals("Grabadora 2.1", probe.trim(), "fragmentado: $fragmented")
+            assertDecodesCleanly(out)
+        }
     }
 
     /** `start_time` de cada stream según ffprobe, por tipo (`video`, `audio`). */
@@ -415,7 +502,7 @@ class FfmpegIntegrationTest {
         val uptimeUs = 3L * 24 * 3600 * 1_000_000
         class Arrival(val atUs: Long, val trackId: Int, val packet: MediaPacket)
         val arrivals = ArrayList<Arrival>()
-        val sourceTracks = MkvKotlin.openDemuxer(src).use { demux ->
+        val sourceTracks = Kotmpeg.openDemuxer(src).use { demux ->
             val videoId = demux.tracks.first { it is TrackInfo.Video }.id
             while (true) {
                 val p = demux.readPacket() ?: break
@@ -434,7 +521,7 @@ class FfmpegIntegrationTest {
 
         for ((name, fragmented) in listOf("order.mkv" to false, "order.mp4" to false, "order-frag.mp4" to true)) {
             val out = File(dir, name)
-            val muxer = MkvKotlin.synchronizedMuxer(MkvKotlin.createMuxer(out, mp4Fragmented = fragmented))
+            val muxer = Kotmpeg.synchronizedMuxer(Kotmpeg.createMuxer(out) { this.fragmented = fragmented })
             val ids = sourceTracks.associate { it.id to muxer.addTrack(it) }
             muxer.start()
             for (a in arrivals) {
@@ -468,10 +555,11 @@ class FfmpegIntegrationTest {
         )
         val out = File(dir, "segmentado.mp4")
         val segments = ArrayList<Mp4Segment>()
-        val muxer = FragmentedMp4Muxer(out)
-        muxer.segmentIndex = true
-        muxer.onSegment = { segments += it }
-        MkvKotlin.openDemuxer(src).use { Remuxer.remux(it, muxer) }
+        val muxer = FragmentedMp4Muxer(out) {
+            segmentIndex = true
+            onSegment = { segments += it }
+        }
+        Kotmpeg.openDemuxer(src).use { Remuxer.remux(it, muxer) }
 
         assertDecodesCleanly(out)
         assertEquals(countFrames(src, "v:0"), countFrames(out, "v:0"), "fotogramas de vídeo")
@@ -488,7 +576,7 @@ class FfmpegIntegrationTest {
                 appendLine("#EXT-X-VERSION:7")
                 appendLine("#EXT-X-TARGETDURATION:${(segments.maxOf { it.durationUs } + 999_999) / 1_000_000}")
                 appendLine("#EXT-X-PLAYLIST-TYPE:VOD")
-                appendLine("#EXT-X-MAP:URI=\"${out.name}\",BYTERANGE=\"${muxer.initSegmentSize}@0\"")
+                appendLine("#EXT-X-MAP:URI=\"${out.name}\",BYTERANGE=\"${segments.first().initSegmentSize}@0\"")
                 for (segment in segments) {
                     appendLine("#EXTINF:%.6f,".format(Locale.ROOT, segment.durationUs / 1_000_000.0))
                     appendLine("#EXT-X-BYTERANGE:${segment.size}@${segment.offset}")

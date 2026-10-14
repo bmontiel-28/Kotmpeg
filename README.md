@@ -11,22 +11,23 @@ pantalla, audio del sistema y micrófono —mezclados en una pista o cada uno en
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10. Sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
 
-**Versión: 3.1.0**
+**Versión: 4.0.0**
 
-- **La `3.1.0` solo añade, y no te pide nada si usas la `3.0.0`.** Trae
-  [`PcmStreamMixer`](#mezclar-en-streaming-con-pcmstreammixer), la mezcla de micrófono y sistema
-  según llegan; [segmentos indexados con `sidx`](#segmentos-para-hls-y-dash) en el fMP4, con un
-  aviso por segmento para empaquetar HLS o DASH en vivo; y `Mp4Demuxer` deja de cargar el mapa de
-  muestras al abrir: [la memoria ya no crece con la duración](#memoria-al-leer-archivos-largos).
-  Corrige además dos fallos de `MkvDemuxer` con bloques comprimidos que encontró el fuzzing de los
-  demuxers, nuevo en esta versión.
-- **Si ya usas la `2.1.1`, tu código no cambia.** La `3.0.0` no quita ni modifica ninguna firma
-  pública —ni siquiera hace falta recompilar—: solo añade. Lo que la hace mayor son unos pocos
-  cambios de **comportamiento**, todos correcciones, que el [CHANGELOG](CHANGELOG.md) explica uno a
-  uno con lo que hay que revisar.
+- **La `4.0.0` es la versión que cierra todo lo pendiente, y cambia la API.** La fachada se llama
+  `Kotmpeg` (antes `MkvKotlin`); las opciones de escritura van en un bloque
+  ([`MuxerOptions`](#opciones-de-escritura)) en vez de en parámetros sueltos; y `TrackInfo` y
+  `ColorInfo` se construyen con los datos obligatorios y un bloque para el resto. Así, lo que se
+  añada en adelante —una opción, un campo de pista— ya no rompe a nadie.
+- **Y corrige comportamientos**: el cebado del audio llega igual desde MP4 que desde MKV, `seekTo`
+  coloca las demás pistas por tiempo de presentación y cae siempre en un keyframe, `concat` rechaza
+  segmentos con cabeceras distintas, `.webm` ya no produce un archivo que nadie reproduce, el
+  muxer elige solo la pista predeterminada de cada tipo, una pista que arranca tarde o se pausa da
+  en fMP4 los mismos tiempos que en MP4 plano, y un `remux` o `concat` que no puede salir bien deja
+  intacta la salida que ya existía. El [CHANGELOG](CHANGELOG.md) da, para cada cambio, el paso exacto de
+  migración.
 - La API pública está congelada: romperla exige subir la mayor. No depende de que nadie se acuerde
   — `PublicApiTest` compara la superficie pública contra un volcado versionado y falla si se mueve.
-- El análisis técnico de la `3.0` y la `3.1`, con mediciones antes/después, está en
+- El análisis técnico de cada versión mayor, con mediciones antes/después, está en
   [`ANALISIS.md`](ANALISIS.md).
 
 La librería **no codifica ni decodifica**: empaqueta y desempaqueta streams que ya vienen
@@ -38,13 +39,13 @@ antes de codificar. Todo el alcance, con lo que queda fuera y por qué, está en
 
 ```kotlin
 // Convertir MKV ↔ MP4 sin recodificar. Milisegundos, sin pérdida de calidad.
-MkvKotlin.remux(File("entrada.mkv"), File("salida.mp4"))
+Kotmpeg.remux(File("entrada.mkv"), File("salida.mp4"))
 
 // Unir segmentos ya codificados, tampoco recodifica.
-MkvKotlin.concat(listOf(File("p1.mkv"), File("p2.mkv")), File("completo.mp4"))
+Kotmpeg.concat(listOf(File("p1.mkv"), File("p2.mkv")), File("completo.mp4"))
 
 // Inspeccionar un archivo, como ffprobe.
-MkvKotlin.openDemuxer(File("clip.mp4")).use { d ->
+Kotmpeg.openDemuxer(File("clip.mp4")).use { d ->
     println("${d.durationUs / 1000} ms, ${d.tracks.size} pistas")
     d.tracks.forEach { println("${it.id}: ${it.name} (${it.language}) default=${it.default}") }
 }
@@ -54,13 +55,13 @@ Y el nivel bajo, cuando ya tienes paquetes codificados (por ejemplo, de `MediaCo
 quieres el contenedor:
 
 ```kotlin
-val muxer = MkvKotlin.synchronizedMuxer(MkvKotlin.createMuxer(File("grabacion.mp4"), mp4Fragmented = true))
-val pantalla = muxer.addTrack(TrackInfo.Video(codec = VideoCodec.H264, width = 1080, height = 2400, codecPrivate = avcC))
-val audio = muxer.addTrack(TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2, codecPrivate = asc))
+val muxer = Kotmpeg.synchronizedMuxer(Kotmpeg.createMuxer(File("grabacion.mp4")) { fragmented = true })
+val pantalla = muxer.addTrack(TrackInfo.Video(VideoCodec.H264, 1080, 2400) { codecPrivate = avcC })
+val audio = muxer.addTrack(TrackInfo.Audio(AudioCodec.AAC, 48_000, 2) { codecPrivate = asc })
 muxer.start()
 // Desde el callback de cada codificador, en su propio hilo:
 muxer.writePacket(MediaPacket(pantalla, NalUnits.annexBToLengthPrefixed(salidaH264), ptsUs, isKeyFrame = esIdr))
-muxer.writePacket(MediaPacket(audio, salidaAac, ptsUs))
+muxer.writePacket(MediaPacket(audio, salidaAac, ptsUs, isKeyFrame = true))
 // Al terminar:
 muxer.stop()
 ```
@@ -199,16 +200,16 @@ val cola = mezclador.flush()
 ### Cada fuente en su pista
 
 Una pista por fuente, con nombre y **exactamente una predeterminada** (si no, cada reproductor elige
-una distinta):
+una distinta). Desde la `4.0.0` eso sale solo: si no fijas `default`, el muxer marca la primera
+pista de cada tipo y ninguna más, así que basta con añadir primero la que deba sonar:
 
 ```kotlin
-val mezcla = muxer.addTrack(TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2,
-    codecPrivate = ascMezcla, name = "Mezcla", default = true))
-val microfono = muxer.addTrack(TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 1,
-    codecPrivate = ascMicro, name = "Micrófono", default = false))
-val sistema = muxer.addTrack(TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2,
-    codecPrivate = ascSistema, name = "Audio del sistema", default = false))
+val mezcla = muxer.addTrack(TrackInfo.Audio(AudioCodec.AAC, 48_000, 2) { codecPrivate = ascMezcla; name = "Mezcla" })
+val microfono = muxer.addTrack(TrackInfo.Audio(AudioCodec.AAC, 48_000, 1) { codecPrivate = ascMicro; name = "Micrófono" })
+val sistema = muxer.addTrack(TrackInfo.Audio(AudioCodec.AAC, 48_000, 2) { codecPrivate = ascSistema; name = "Audio del sistema" })
 ```
+
+Con `default = true` en otra pista, esa pasa a ser la predeterminada y la primera deja de serlo.
 
 El nombre, el idioma y la pista predeterminada sobreviven en MKV, MP4 y fMP4, y al convertir entre
 ellos. Cada pista puede empezar en su propio instante: el desfase entre pistas se conserva.
@@ -248,8 +249,8 @@ Toda la superficie de plataforma que usa —`java.io.File`, `RandomAccessFile`, 
 No es una suposición: `AndroidApiCompatibilityTest` recorre cada clase compilada contra la firma
 oficial de la API 26 de Android y falla si aparece una sola llamada del JDK que allí no exista. Así
 se encontró que `OpusConfig` usaba una sobrecarga de `ByteBuffer.position(int)` que Android no
-tiene. La cota de 26 la pone `java.nio.file`, que se usa en la sustitución atómica de
-`mp4FastStart`.
+tiene, y en la `4.0.0`, que `ByteBuffer.clear()` y `limit(int)` devuelven allí `Buffer`. La cota de
+26 la pone `java.nio.file`, que se usa en la sustitución atómica de `fastStart`.
 
 Lo que conviene saber al integrarla:
 
@@ -258,13 +259,13 @@ Lo que conviene saber al integrarla:
   formato del contenedor, y la configuración de códec (`avcC`/`hvcC`/ASC/OpusHead) viaja en
   `TrackInfo.codecPrivate`.
 - **Los codificadores entregan desde hilos distintos.** Envuelve el muxer con
-  `MkvKotlin.synchronizedMuxer(...)` y llama a `writePacket` desde cada callback.
+  `Kotmpeg.synchronizedMuxer(...)` y llama a `writePacket` desde cada callback.
 - **Las marcas de tiempo de `MediaCodec` se pasan tal cual**, aunque cuenten desde el arranque del
   dispositivo, y **en el orden en que lleguen**: los tres muxers empiezan la línea de tiempo en el
   paquete más temprano de todas las pistas, aunque no sea el primero en llegar (lo normal cuando el
   codificador de vídeo tarda más que el de audio).
-- **El audio no necesita `isKeyFrame`**: AAC y Opus se escriben siempre como muestras
-  independientes.
+- **`isKeyFrame` es obligatorio**, para que un keyframe no se quede sin marcar por olvido. En audio
+  da igual lo que pases: AAC y Opus se escriben siempre como muestras independientes.
 - **Puedes reutilizar tu buffer** entre paquetes: ningún muxer guarda una referencia al
   `ByteArray` de un `MediaPacket` después de `writePacket`: cuando tienen que retener muestras —el
   fMP4 hasta cerrar cada fragmento, el MKV y el fMP4 al arrancar— guardan una copia.
@@ -272,11 +273,14 @@ Lo que conviene saber al integrarla:
   los tres contenedores; el vídeo sin `avcC`/`hvcC` se rechaza en `addTrack`, también en MKV, porque
   los reproductores de Android no pueden abrirlo.
 - **`SeekableInput`/`SeekableOutput` aceptan un `FileDescriptor` ya abierto**, así que un
-  `ParcelFileDescriptor` de `ContentResolver` sirve directamente para MediaStore/SAF.
-- **Para grabaciones largas, `mp4Fragmented = true` o MKV**: sobreviven a que se mate el proceso y
-  no acumulan índice en memoria. En un móvil con poca RAM, `MkvKotlin.createFragmentedMp4Muxer(file,
-  maxFragmentBytes = 16L * 1024 * 1024)` acota lo que retiene cada fragmento. `SeekableOutput.sync()`
-  fuerza además los datos al disco si la app quiere protegerse de un corte de batería.
+  `ParcelFileDescriptor` de `ContentResolver` sirve directamente para MediaStore/SAF. Ábrelo en
+  `"rw"`: `SeekableOutput` trunca el destino al abrirlo, y con `fastStart` necesita leerlo para
+  recolocar el índice en el sitio. Si no se puede leer —el `"w"` que se usa por defecto—, el muxer
+  lo rechaza al construirse, antes de grabar nada.
+- **Para grabaciones largas, `fragmented = true` o MKV**: sobreviven a que se mate el proceso y
+  no acumulan índice en memoria. En un móvil con poca RAM, `maxFragmentBytes = 16L * 1024 * 1024`
+  acota lo que retiene cada fragmento. `SeekableOutput.sync()` fuerza además los datos al disco si
+  la app quiere protegerse de un corte de batería.
 
 ## Cómo añadirla a tu proyecto
 
@@ -295,7 +299,7 @@ dependencyResolutionManagement {
 
 // build.gradle.kts — qué bajar
 dependencies {
-    implementation("com.github.bmontiel-28:Kotmpeg:3.1.0")
+    implementation("com.github.bmontiel-28:Kotmpeg:4.0.0")
 }
 ```
 
@@ -321,7 +325,7 @@ aquí sale uno. Escribirla con punto antes de `Kotmpeg` da un `Could not find`.
 // settings.gradle.kts
 dependencyResolutionManagement { repositories { mavenLocal(); mavenCentral() } }
 // build.gradle.kts
-dependencies { implementation("com.braymon:kotmpeg-core:3.1.0") }
+dependencies { implementation("com.braymon:kotmpeg-core:4.0.0") }
 ```
 
 Las dos opciones publican el jar y un jar de fuentes, así que el IDE deja navegar el código y leer
@@ -337,7 +341,7 @@ el KDoc. **No son intercambiables**: cada coordenada solo resuelve en su reposit
 hilos**, y es intencional: serializar por dentro costaría rendimiento en el 100 % de los casos.
 
 Si varios productores escriben al mismo archivo —lo normal en cuanto hay vídeo y audio en hilos
-distintos—, envuelve el muxer con `MkvKotlin.synchronizedMuxer`, que serializa cada operación con
+distintos—, envuelve el muxer con `Kotmpeg.synchronizedMuxer`, que serializa cada operación con
 un único cerrojo. Un `PcmResampler` por fuente, usado desde el hilo de esa fuente. `PcmMixer` no
 tiene estado y se puede llamar desde cualquier hilo. `PcmStreamMixer` es la excepción a propósito:
 es seguro entre hilos, porque existe precisamente para recibir cada fuente desde su hilo.
@@ -350,10 +354,10 @@ las tablas del `moov` no se pueden escribir hasta conocer el archivo entero. Cad
 llenarse: dos horas a 60 fps con audio AAC (~770 000 muestras) son unos **34 MB** antes de `stop()`
 (54 MB en la `2.x`).
 
-Para grabaciones largas usa **`mp4Fragmented = true`** o **MKV**: vacían a disco según avanzan y
+Para grabaciones largas usa **`fragmented = true`** o **MKV**: vacían a disco según avanzan y
 sobreviven a un corte de proceso. El fMP4 sí retiene las muestras de **un** fragmento —su `moof` va
-delante de ellas—, como mucho un GOP, 10 s o 64 MB; los dos límites se ajustan con
-`MkvKotlin.createFragmentedMp4Muxer`.
+delante de ellas—, como mucho un GOP, 10 s o 64 MB; los dos límites son las opciones
+`maxFragmentDurationUs` y `maxFragmentBytes`.
 
 Al **arrancar**, el MKV y el fMP4 retienen además los paquetes que lleguen hasta que todas las
 pistas han entregado el primero, para empezar la línea de tiempo en el más temprano. En la práctica
@@ -361,11 +365,18 @@ es la diferencia de latencia entre codificadores, unos cientos de milisegundos; 
 16 MB en MKV y los mismos dos límites del fragmento en fMP4, por si una pista no llega a producir
 nada.
 
-**`mp4FastStart` cuesta el doble de disco.** El archivo se cierra primero completo, con su `moov` al
-final; recolocarlo al principio es reescribirlo entero a un temporal en el mismo directorio, forzar
-ese temporal al disco y sustituir con él el original. Para una salida de 4 GiB, cuenta con algo más
-de 8 GiB libres. **Pase lo que pase, lo escrito no se pierde**: si la reescritura falla, el original
-queda intacto y reproducible, sin inicio rápido, y `stop()` lanza explicándolo.
+**`fastStart` sobre un `File` cuesta el doble de disco.** El archivo se cierra primero completo, con
+su `moov` al final; recolocarlo al principio es reescribirlo entero a un temporal en el mismo
+directorio, forzar ese temporal al disco y sustituir con él el original. Para una salida de 4 GiB,
+cuenta con algo más de 8 GiB libres. **Pase lo que pase, lo escrito no se pierde**: si la
+reescritura falla, el original queda intacto y reproducible, sin inicio rápido, y `stop()` lanza
+explicándolo.
+
+Sobre un `SeekableOutput` —un descriptor de `MediaStore`, donde no hay ruta para un temporal— el
+`moov` se inserta delante desplazando los datos **en el sitio**, de 1 MiB en 1 MiB desde el final:
+no necesita disco extra, pero tampoco tiene esa red, y si el proceso muere a mitad del
+desplazamiento el archivo queda inservible. El resultado es el mismo archivo, byte a byte, que por
+ruta.
 
 ## Memoria al *leer* archivos largos
 
@@ -384,11 +395,16 @@ medido en la misma máquina:
 La diferencia crece con la duración: con la `3.0.0` diez horas eran más de 140 MB, que en el heap
 de un móvil es un `OutOfMemoryError`; ahora son del orden de 2,5 MB. A cambio, buscar y leer cuestan
 algo más, pero siguen en microsegundos por operación, muy por debajo de lo que cuesta leer los datos
-de un vídeo real. El resultado es idéntico al de la `3.0.0`: mismos paquetes y mismo destino en
-cada `seekTo`.
+de un vídeo real. Los paquetes son idénticos a los de la `3.0.0`; dónde quedan las demás pistas tras
+`seekTo` cambió en la `4.0.0` (ver [sincronización](#cómo-se-garantiza-la-sincronización)).
+
+En la `4.0.0`, `seekTo` en MP4 plano dejó de retroceder por la tabla de muestras para colocar el
+audio, que era la mitad de su coste. Medido en la misma máquina y sesión contra la `3.1.0`: de 27,5
+a 15,5 µs, y buscar y leer el primer paquete, de 150 a 111 µs. Son otra máquina y otra sesión que
+las de la tabla, así que vale la proporción, no las cifras absolutas.
 
 `MkvDemuxer` nunca tuvo este coste: Matroska se recorre cluster a cluster y el índice `Cues` solo se
-consulta al buscar.
+consulta al buscar. Si ese índice está roto se avisa por `onWarning` y se busca recorriendo clusters.
 
 ## Errores y avisos
 
@@ -401,7 +417,7 @@ Un archivo **truncado** —la grabación se interrumpió— no es fatal en ning�
 el último paquete completo, el stream termina limpio y el corte se avisa por `onWarning`.
 
 ```kotlin
-MkvKotlin.remux(entrada, salida, onWarning = { println("aviso: $it") })
+Kotmpeg.remux(entrada, salida, onWarning = { println("aviso: $it") })
 ```
 
 La política es que un archivo dañado produzca **un error claro o un fin de stream**, nunca un
@@ -414,6 +430,38 @@ y sobre millones en una campaña semanal del CI. Está descrita en [`SECURITY.md
 
 # Referencia técnica
 
+## Opciones de escritura
+
+Los tres muxers y la fachada reciben las opciones en un bloque de `MuxerOptions`. Cada muxer usa las
+de su formato e ignora las demás, así que el mismo bloque sirve aunque sea la extensión la que
+decida el contenedor, y un valor imposible se rechaza **antes** de abrir el archivo:
+
+```kotlin
+Kotmpeg.createMuxer(File("clip.mp4")) {
+    fragmented = true
+    maxFragmentBytes = 16L * 1024 * 1024
+}
+Mp4Muxer(SeekableOutput(pfd.fileDescriptor)) { fastStart = true }
+```
+
+| Opción | Por defecto | Contenedor | Qué hace |
+|---|---|---|---|
+| `fastStart` | `false` | MP4 | Pone el `moov` delante de los datos al cerrar (`-movflags +faststart`) |
+| `fragmented` | `false` | MP4, en la fachada | MP4 fragmentado en vez de plano; excluye `fastStart`. `Mp4Muxer` la rechaza |
+| `fragmentDurationUs` | 2 s | fMP4 | Longitud de fragmento cuando no hay vídeo que corte por keyframes |
+| `maxFragmentDurationUs` | 10 s | fMP4 | Corte forzoso aunque no llegue ningún keyframe |
+| `maxFragmentBytes` | 64 MB | fMP4 | Memoria máxima retenida por fragmento; con `segmentIndex`, como mucho 1 GiB |
+| `segmentIndex` | `false` | fMP4 | Un `sidx` por pista y fragmento (`-movflags dash`) |
+| `onSegment` | — | fMP4 | Aviso por cada fragmento escrito, para HLS o DASH en vivo |
+| `nonNegativeCompositionOffsets` | `false` | fMP4 | Desfases de composición sin signo y lista de edición, para que FFmpeg sincronice exacto |
+| `maxClusterDurationMs` | 5000 | MKV | Duración máxima de un cluster |
+| `creationTimeMillis` | ahora | todos | Fecha de creación; `null` la omite, para una salida idéntica byte a byte |
+| `writingApp` | `"Kotmpeg"` | todos | El `WritingApp` de Matroska y la etiqueta `©too` de MP4, el `encoder` de ffprobe; vacía, no se escribe en MP4 |
+
+Hasta la `3.x` eran parámetros con valor por defecto, una función aparte para el fMP4 con límites y
+propiedades del muxer que había que asignar antes de `start()`. Una opción nueva era una firma
+nueva; ahora es una propiedad más del bloque.
+
 ## Matriz de soporte
 
 | | MKV | MP4 |
@@ -425,11 +473,12 @@ y sobre millones en una campaña semanal del CI. Está descrita en [`SECURITY.md
 | Opus | ✅ (OpusHead, CodecDelay/SeekPreRoll) | ✅ (`Opus` + dOps) |
 | N pistas de audio (mezcla, micrófono, sistema…) | ✅ ilimitadas | ✅ ilimitadas |
 | Idioma, nombre y pista predeterminada | ✅ (`Language`, `Name`, `FlagDefault`) | ✅ (`mdhd`, `udta`/`name`, bit `track_enabled` del `tkhd`) |
+| Aplicación que escribe el archivo | ✅ (`WritingApp`) | ✅ (`©too`, el `encoder` de ffprobe) |
 | B-frames (pts≠dts) | ✅ | ✅ (ctts + edit lists, DTS derivado automáticamente) |
 | Vídeo de frecuencia variable (captura de pantalla) | ✅ | ✅ (duraciones exactas también entre fragmentos fMP4) |
-| Índice de búsqueda | ✅ Cues + SeekHead | ✅ stss/stco completos |
+| Índice de búsqueda | ✅ Cues + SeekHead (y sin índice, recorriendo clusters) | ✅ stss/stco completos |
 | Archivos > 4 GiB | ✅ | ✅ (mdat de 64 bits + co64) |
-| Inicio rápido / progresivo | ✅ (por diseño del formato) | ✅ `mp4FastStart` (= `-movflags +faststart`) |
+| Inicio rápido / progresivo | ✅ (por diseño del formato) | ✅ `fastStart` (= `-movflags +faststart`), por ruta o sobre un descriptor |
 | Fragmentado / a prueba de cortes | ✅ (por diseño del formato) | ✅ fMP4 lectura y escritura (= `frag_keyframe+empty_moov`) |
 | Segmentos indexados para HLS/DASH | — | ✅ un `sidx` por pista y fragmento (= `-movflags dash`) y aviso por segmento |
 | Rotación de pantalla | ✅ (`Projection`/PoseRoll) | ✅ (matriz `tkhd`, visible en ffprobe) |
@@ -442,18 +491,19 @@ y sobre millones en una campaña semanal del CI. Está descrita en [`SECURITY.md
 
 | FFmpeg | Kotmpeg Core |
 |---|---|
-| `ffmpeg -i in.mp4 -c copy out.mkv` (remux) | `MkvKotlin.remux(in, out)` |
-| Demuxer `concat` (unir segmentos sin recodificar) | `MkvKotlin.concat(inputs, output)` |
-| `-movflags +faststart` | `createMuxer(..., mp4FastStart = true)` |
-| `-movflags frag_keyframe+empty_moov` (fMP4) | `createMuxer(..., mp4Fragmented = true)` |
-| `-movflags dash` (un `sidx` por pista y fragmento) | `FragmentedMp4Muxer(file).apply { segmentIndex = true }` |
+| `ffmpeg -i in.mp4 -c copy out.mkv` (remux) | `Kotmpeg.remux(in, out)` |
+| Demuxer `concat` (unir segmentos sin recodificar) | `Kotmpeg.concat(inputs, output)` |
+| `-movflags +faststart` | `createMuxer(file) { fastStart = true }` |
+| `-movflags frag_keyframe+empty_moov` (fMP4) | `createMuxer(file) { fragmented = true }` |
+| `-movflags dash` (un `sidx` por pista y fragmento) | `createMuxer(file) { fragmented = true; segmentIndex = true }` |
+| `-movflags delay_moov` sin `negative_cts_offsets` | `createMuxer(file) { fragmented = true; nonNegativeCompositionOffsets = true }` |
 | `-map` (selección de pistas) | `remux(..., trackFilter = { id -> ... })` |
-| `-metadata:s:a:0 language=spa` / `title=` | `TrackInfo.Audio(language = "spa", name = "Micrófono")` |
-| `-disposition:a:1 0` | `TrackInfo.Audio(default = false)` |
-| `-display_rotation` / matriz de rotación | `TrackInfo.Video(rotationDegrees = 90)` |
-| `-color_primaries/-color_trc/-colorspace/-color_range` + HDR10 | `TrackInfo.Video(color = ColorInfo(...))` |
+| `-metadata:s:a:0 language=spa` / `title=` | `TrackInfo.Audio(...) { language = "spa"; name = "Micrófono" }` |
+| `-disposition:a:1 0` | `TrackInfo.Audio(...) { default = false }` |
+| `-display_rotation` / matriz de rotación | `TrackInfo.Video(...) { rotationDegrees = 90 }` |
+| `-color_primaries/-color_trc/-colorspace/-color_range` + HDR10 | `TrackInfo.Video(...) { color = ColorInfo.hdr10(hdr) }` |
 | ffprobe (inspección) | `openDemuxer(file).tracks` / `durationUs` |
-| Seek por índice | `Demuxer.seekTo(us)` (Cues / stss, por bisección) |
+| Seek por índice | `Demuxer.seekTo(us)` (Cues / stss, por bisección; cae siempre en un keyframe) |
 | Filtro `amix` / `pan` | `PcmMixer` (mezcla saturada con ganancias, mono↔estéreo) y `PcmStreamMixer` (en vivo, fuentes con formato y ritmo distintos) |
 | `-ar` / `-ac` sobre PCM | `PcmResampler` (remuestreo lineal en streaming, fase exacta) |
 
@@ -468,8 +518,11 @@ fragmento completo se reproduce sin más. La duración del último fotograma de 
 del keyframe que abre el siguiente, así que el vídeo de frecuencia variable de una captura de
 pantalla no desalinea los tiempos. Los B-frames van por `trun` v1 con offsets de composición
 firmados, como en CMAF, y lo que un B-frame se decodifica después de mostrarse queda acotado aunque
-una pausa de la pantalla caiga entre él y su referencia. El demuxer lee fMP4 propio y de FFmpeg,
-con su lista de edición igual que en un MP4 plano.
+una pausa de la pantalla caiga entre él y su referencia. FFmpeg retrasa la pista de vídeo entera lo
+que mida el mayor de esos offsets negativos, uno o dos fotogramas; si el archivo va a pasar por
+FFmpeg, `nonNegativeCompositionOffsets = true` los escribe sin signo (`trun` v0) con una lista de
+edición que los compensa, y la cabecera espera al primer fragmento para conocer el desfase. El
+demuxer lee fMP4 propio y de FFmpeg, con su lista de edición igual que en un MP4 plano.
 
 ## Segmentos para HLS y DASH
 
@@ -480,14 +533,14 @@ escribe solo hacia delante —el fragmento entero está en memoria antes de escr
 índice se calcula sin volver atrás—, y por tanto igual de resistente a cortes. Cuesta 52 bytes por
 pista y fragmento.
 
-`onSegment` avisa de cada fragmento en cuanto está en disco, con su posición, su tamaño y su
-duración, y `initSegmentSize` da el tamaño de la cabecera: es todo lo que hace falta para mantener
+`onSegment` avisa de cada fragmento en cuanto está en disco, con su posición, su tamaño, su
+duración y el tamaño de la cabecera (`initSegmentSize`): es todo lo que hace falta para mantener
 una lista HLS en vivo mientras se graba, sin releer el archivo.
 
 ```kotlin
 val lista = StringBuilder()
-val muxer = FragmentedMp4Muxer(File(dir, "grabacion.mp4")).apply {
-    segmentIndex = true                       // antes de start()
+val muxer = FragmentedMp4Muxer(File(dir, "grabacion.mp4")) {
+    segmentIndex = true
     onSegment = { s ->
         lista.append("#EXTINF:%.3f,\n".format(Locale.ROOT, s.durationUs / 1e6))
         lista.append("#EXT-X-BYTERANGE:${s.size}@${s.offset}\ngrabacion.mp4\n")
@@ -495,7 +548,7 @@ val muxer = FragmentedMp4Muxer(File(dir, "grabacion.mp4")).apply {
 }
 // addTrack, start(), writePacket… La lista empieza con #EXTM3U, #EXT-X-VERSION:7 (la que admite
 // fMP4), #EXT-X-TARGETDURATION con la duración máxima redondeada hacia arriba, y
-// #EXT-X-MAP:URI="grabacion.mp4",BYTERANGE="${muxer.initSegmentSize}@0"; al cerrar, #EXT-X-ENDLIST.
+// #EXT-X-MAP:URI="grabacion.mp4",BYTERANGE="${s.initSegmentSize}@0"; al cerrar, #EXT-X-ENDLIST.
 ```
 
 Así lo prueba el CI: una lista montada solo con esos avisos tiene que reproducir en FFmpeg todos los
@@ -509,8 +562,9 @@ Todo el proyecto es un único módulo Gradle, bajo `src/main/kotlin/com/braymon/
 ```
 com/braymon/kotmpeg/
 │
-├── MkvKotlin.kt         Fachada: createMuxer / openDemuxer / detectFormat / remux / concat /
+├── Kotmpeg.kt           Fachada: createMuxer / openDemuxer / detectFormat / remux / concat /
 │                        synchronizedMuxer.
+├── MuxerOptions.kt      Opciones de escritura de los tres muxers y de la fachada.
 ├── Muxer.kt             Interfaces Muxer y Demuxer.
 ├── TimelineGate.kt      Retención de arranque: origen común de los muxers que escriben en vivo.
 │
@@ -537,17 +591,18 @@ contenedor.
 
 | Clase / objeto | Para qué |
 |---|---|
-| `MkvKotlin` | Fachada: `createMuxer` (con `mp4FastStart`/`mp4Fragmented`), `createFragmentedMp4Muxer` (con límites de memoria), `openDemuxer`, `detectFormat`, `remux`, `concat`, `synchronizedMuxer` |
+| `Kotmpeg` | Fachada: `createMuxer`, `openDemuxer`, `detectFormat`, `remux`, `concat`, `synchronizedMuxer` |
+| `MuxerOptions` | Las opciones de escritura, en el bloque de los muxers y de la fachada: `fastStart`, `fragmented`, límites del fMP4, `segmentIndex`, `onSegment`, `nonNegativeCompositionOffsets`, `maxClusterDurationMs`, `creationTimeMillis`, `writingApp` |
 | `Muxer` / `Demuxer` | Interfaces de escritura/lectura de contenedores |
 | `MkvMuxer` / `MkvDemuxer` | Matroska directo (si no quieres pasar por la fachada) |
 | `Mp4Muxer` / `FragmentedMp4Muxer` / `Mp4Demuxer` | ISO BMFF plano, fMP4 y lectura de ambos |
-| `Mp4Segment` | Un fragmento ya escrito, tal como lo avisa `FragmentedMp4Muxer.onSegment`: posición, tamaño, inicio y duración |
-| `MediaPacket`, `TrackInfo.Video/Audio`, `VideoCodec`, `AudioCodec`, `ContainerFormat` | Modelo de datos canónico (nombre, idioma y pista predeterminada por pista; rotación y color en vídeo) |
+| `Mp4Segment` | Un fragmento ya escrito, tal como lo avisa `onSegment`: posición, tamaño, inicio, duración y tamaño de la cabecera |
+| `MediaPacket`, `TrackInfo.Video/Audio`, `VideoCodec`, `AudioCodec`, `ContainerFormat` | Modelo de datos canónico (nombre, idioma y pista predeterminada por pista; rotación y color en vídeo; cebado en audio). Las pistas se construyen con los datos obligatorios y un bloque, y `copy { }` cambia lo que se quiera |
 | `ColorInfo` / `HdrStaticInfo` | Color BT.709/BT.2020, rango, PQ/HLG y HDR10 estático |
 | `PcmMixer` / `PcmResampler` | Audio de grabación: mezcla saturada con ganancias, mono↔estéreo, remuestreo en streaming |
 | `PcmStreamMixer` | Mezcla en vivo de micrófono y sistema: cada fuente en su formato y desde su hilo, entrega alineada, segura entre hilos |
 | `Remuxer` | Copia de streams demuxer→muxer con filtro/progreso y `concat` de segmentos |
-| `NalUnits`, `HevcSpsInfo`, `BitReader` | Annex-B ↔ ISO, avcC/hvcC, parser de SPS HEVC |
+| `NalUnits` | Annex-B ↔ ISO, avcC/hvcC |
 | `AacConfig`, `OpusConfig` | AudioSpecificConfig y OpusHead/dOps |
 | `SeekableInput` / `SeekableOutput` | E/S buffered con seek/patch sobre `File`, `RandomAccessFile` o un `FileDescriptor`; `sync()` para forzar los datos al almacenamiento |
 
@@ -561,6 +616,19 @@ contenedor.
   siempre es el más temprano.
 - **MKV**: `TimestampScale` estándar de 1 ms, clusters alineados a keyframe con `Cues` para
   búsqueda exacta; los bloques llevan PTS.
+- **Cebado del audio**: los tiempos de los paquetes no lo descuentan, y su duración va en
+  `TrackInfo.Audio.codecDelayUs`. Es lo que define Matroska para `CodecDelay` y, desde la `4.0.0`,
+  lo que entregan los dos demuxers: el mismo AAC llega con los mismos tiempos desde un MP4, un fMP4
+  o un MKV, y pasa de uno a otro sin desfase.
+- **Búsqueda**: `seekTo` cae en el último keyframe del vídeo no posterior al destino —también en un
+  MKV cuyos clusters no empiezan en keyframe, o sin índice—, y las demás pistas siguen desde ese
+  instante de presentación: el audio, en el paquete que suena en él, y otra pista de vídeo, en su
+  propio último keyframe no posterior. Un recorte que empiece ahí tiene imagen y sonido desde el
+  principio. En MKV se lee desde el cluster anterior al del keyframe, que es donde el muxer pudo
+  dejar ese audio, y se sigue hasta pasar el keyframe en cada una de las demás pistas, por si lo
+  escribió detrás; si el keyframe de otra pista de vídeo queda aún más atrás, empieza en el
+  siguiente, nunca en un fotograma que no se puede decodificar. Una pista que ya ha terminado en
+  ese instante no entrega nada; en MKV, de una de vídeo solo se sabe cerca del final del archivo.
 - **MP4**: `stts` desde DTS, `ctts` para el offset de composición, `stss` para keyframes y **edit
   lists** que alinean el inicio de presentación a cero y compensan el cebado del codificador.
 - **Fuentes sin DTS** (los encoders por hardware y MKV solo dan PTS): el muxer MP4 deriva un DTS
@@ -581,6 +649,7 @@ Todas son decisiones de alcance, no carencias pendientes:
 | Subtítulos y capítulos | ❌ (las pistas ajenas se ignoran limpiamente al leer) | Los flujos objetivo no los generan ni los consumen; añadirlos es posible sobre la misma base. |
 | Otros códecs (VP9, AV1, MP3, ProRes…) | ❌ | Alcance deliberado: los cuatro con soporte universal en MKV/MP4 y aceleración garantizada por hardware. |
 | Otros contenedores (AVI, MPEG-TS, MOV antiguos…) | ❌ | La librería nace exactamente para MKV y MP4/fMP4. (Los WebM se pueden *leer* porque son Matroska.) |
+| Escribir WebM | ❌ (`.webm` se rechaza con un error que lo explica) | WebM solo admite VP8/VP9/AV1 con Vorbis/Opus, y aquí se escribe H.264/H.265 con AAC/Opus: el resultado no lo reproduciría un navegador. Usa `.mkv`. |
 | Protocolos de red (RTMP, SRT, HLS push, RTSP…) | ❌ | Capa distinta. El fMP4 de esta librería es el insumo directo de cualquier empaquetador o emisor. |
 | Herramienta de línea de comandos | ❌ (es una librería) | El objetivo es integrarse con una API tipada. |
 | SIMD / ensamblador | ❌ | La JVM no da acceso a eso; el trabajo es sobre todo E/S y copia de buffers. |
@@ -598,7 +667,7 @@ Todas son decisiones de alcance, no carencias pendientes:
 ./gradlew test
 ```
 
-239 tests. Necesitan **JDK 17+**; si además tienes **ffmpeg** en el `PATH`, se ejecuta también la
+275 tests. Necesitan **JDK 17+**; si además tienes **ffmpeg** en el `PATH`, se ejecuta también la
 suite de integración, que genera archivos con FFmpeg real, los reescribe con esta librería en ambas
 direcciones y valida el resultado con `ffprobe` y una decodificación completa sin errores. Sin
 ffmpeg esos tests se omiten solos (`assumeTrue`).
@@ -627,7 +696,7 @@ Kotlin 1.9 no funciona con Gradle 9; se lanza desde su carpeta:
 ```bash
 ./gradlew publishToMavenLocal
 cd compat/kotlin-1.9
-sh gradlew run -PkotmpegVersion=3.1.0
+sh gradlew run -PkotmpegVersion=4.0.0
 ```
 
 En Windows, el último paso es el mismo con `.\gradlew.bat` en lugar de `sh gradlew`.

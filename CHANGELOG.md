@@ -67,6 +67,283 @@ nada.
 
 ---
 
+## [4.0.0] — 2026-10-19
+
+La versión que cierra todo lo pendiente, para que la siguiente no arrastre nada. **Rompe la API**,
+a propósito y una sola vez: la fachada cambia de nombre, las opciones de escritura pasan a un bloque
+y el modelo de pistas deja de ser `data class`. Las tres cosas tienen el mismo fin: que añadir
+después una opción o un campo **no vuelva a romper a nadie**. Y corrige comportamientos de lectura,
+búsqueda y concatenación que daban resultados distintos según el contenedor.
+
+**Hay que recompilar y tocar código.** Cada punto de abajo dice exactamente qué cambiar; casi todo
+es mecánico.
+
+### Cambios incompatibles (de API)
+
+- **`MkvKotlin` se llama `Kotmpeg`.** El nombre venía de cuando la librería solo escribía Matroska.
+  - *Qué hacer:* sustituir `MkvKotlin` por `Kotmpeg` en llamadas e imports
+    (`com.braymon.kotmpeg.Kotmpeg`). Las funciones son las mismas salvo lo que se dice abajo.
+
+- **Las opciones de escritura van en un bloque, `MuxerOptions`.** Antes eran parámetros con valor
+  por defecto de la fachada y de los constructores, más propiedades del muxer que había que asignar
+  antes de `start()`. Cada opción nueva cambiaba la firma JVM —de ahí que existiera
+  `createFragmentedMp4Muxer` solo para dos límites—, y una propiedad se podía asignar cuando ya no
+  tenía efecto. Ahora todo se fija al construir, y un valor imposible se rechaza antes de abrir el
+  archivo. *Qué hacer*, según lo que uses:
+
+  | Hasta la 3.x | Desde la 4.0.0 |
+  |---|---|
+  | `createMuxer(file, mp4FastStart = true)` | `Kotmpeg.createMuxer(file) { fastStart = true }` |
+  | `createMuxer(file, mp4Fragmented = true, mp4FragmentDurationUs = d)` | `Kotmpeg.createMuxer(file) { fragmented = true; fragmentDurationUs = d }` |
+  | `createMuxer(output, format, mp4Fragmented = true)` | `Kotmpeg.createMuxer(output, format) { fragmented = true }` |
+  | `createFragmentedMp4Muxer(file, maxFragmentBytes = n)` | `Kotmpeg.createMuxer(file) { fragmented = true; maxFragmentBytes = n }` |
+  | `remux(a, b, mp4FastStart = true)` / `concat(…, mp4Fragmented = true)` | `Kotmpeg.remux(a, b) { fastStart = true }` / `Kotmpeg.concat(…) { fragmented = true }` |
+  | `Mp4Muxer(file, fastStart = true)` | `Mp4Muxer(file) { fastStart = true }` |
+  | `MkvMuxer(file, maxClusterDurationMs = n)` | `MkvMuxer(file) { maxClusterDurationMs = n }` |
+  | `MkvMuxer(out, n, writingApp = "App", dateUtcMillis = t)` | `MkvMuxer(out) { maxClusterDurationMs = n; writingApp = "App"; creationTimeMillis = t }` |
+  | `FragmentedMp4Muxer(file, d, maxD, maxBytes)` | `FragmentedMp4Muxer(file) { fragmentDurationUs = d; maxFragmentDurationUs = maxD; maxFragmentBytes = maxBytes }` |
+  | `muxer.creationTimeMillis = t` (antes de `start()`) | `{ creationTimeMillis = t }` al construir |
+  | `muxer.segmentIndex = true`, `muxer.onSegment = { … }` | `{ segmentIndex = true; onSegment = { … } }` al construir |
+  | `muxer.initSegmentSize` | `segment.initSegmentSize`, en cada `Mp4Segment` que llega a `onSegment` |
+
+  En `remux` y `concat` el bloque es el último parámetro, detrás de `onWarning`: si pasabas
+  `trackFilter`, `onProgress` u `onWarning` por posición, ahora van con nombre o en el mismo orden
+  que antes sin los dos `mp4…`.
+
+  `fragmented` la interpreta la fachada para elegir el muxer. `Mp4Muxer`, que solo escribe MP4
+  plano, la rechaza con `IllegalArgumentException` en vez de ignorarla: quien la pide espera un fMP4.
+
+- **`TrackInfo.Video`, `TrackInfo.Audio` y `ColorInfo` ya no son `data class`.** Se construyen con
+  los datos obligatorios y un bloque para el resto, y `copy` recibe un bloque. Una `data class`
+  cambia la firma de su constructor y de `copy` con cada campo nuevo; un bloque, no.
+  - *Qué hacer:*
+    - `TrackInfo.Video(codec = c, width = w, height = h, codecPrivate = avcC, frameRate = 30.0)`
+      pasa a `TrackInfo.Video(c, w, h) { codecPrivate = avcC; frameRate = 30.0 }`. Los tres
+      primeros se pueden seguir pasando con nombre. Igual en `TrackInfo.Audio(codec, sampleRate,
+      channelCount) { … }`.
+    - `pista.copy(rotationDegrees = 90)` pasa a `pista.copy { rotationDegrees = 90 }`.
+    - `ColorInfo(primaries = 1, transfer = 1, matrix = 1)` pasa a
+      `ColorInfo { primaries = 1; transfer = 1; matrix = 1 }`. `ColorInfo.hdr10()` y
+      `ColorInfo.bt709()` no cambian.
+    - Desaparecen `component1()…componentN()`: la desestructuración `val (a, b) = pista` ya no
+      compila.
+    - El `id` ya no se pasa: lo asigna el muxer en `addTrack`, que es lo que hacía siempre con el que
+      se le pasara. `withId` deja de ser público por lo mismo.
+  - `HdrStaticInfo` sigue siendo `data class`: sus doce campos son exactamente los de SMPTE ST 2086
+    y CTA-861.3, y no van a crecer.
+
+- **`TrackInfo.default` es `Boolean?` y vale `null` por defecto**: lo decide el muxer (ver abajo).
+  - *Qué hacer:* donde se lea como `Boolean` —`if (pista.default)`, `count { it.default }`—, escribir
+    `pista.default == true`. Los demuxers siempre lo devuelven resuelto, nunca `null`.
+
+- **`MediaPacket.isKeyFrame` no tiene valor por defecto.** Un keyframe que no se marcaba por olvido
+  daba un archivo sin puntos de búsqueda, sin ningún error.
+  - *Qué hacer:* pasar `isKeyFrame` en cada `MediaPacket`. En audio el valor da igual: los muxers
+    tratan todo paquete de audio como punto de acceso.
+
+- **`SeekableInput.readBits` y `SeekableOutput.writeBits` se llaman `readUInt` y `writeUInt`.**
+  Cuentan **bytes**, no bits, y el nombre llevaba a error.
+  - *Qué hacer:* renombrar; los argumentos son los mismos.
+
+- **Salen de la API las piezas internas** que el compilador publicaba sin querer: `EbmlReader`,
+  `EbmlWriter`, `EbmlElement`, `MatroskaIds`, `BoxBuilder`, `HevcSpsInfo`, `BitReader`, las
+  constantes de los objetos compañeros de los tres muxers, y los constructores de
+  `AacConfig.Parsed` y `OpusConfig.Parsed` (los crean `AacConfig.parse` y
+  `OpusConfig.parseOpusHead`). `EbmlException` sigue siendo pública, porque es lo que lanzan los
+  demuxers.
+  - *Qué hacer:* nada, salvo que usaras alguna directamente; en ese caso, abre un issue con el caso
+    de uso.
+
+### Cambios incompatibles (de comportamiento, no de API)
+
+- **El cebado del audio llega igual desde MP4 que desde MKV.** `Mp4Demuxer` restaba de los tiempos
+  de los paquetes la edición inicial de una pista de audio —el cebado del codificador— y devolvía
+  `codecDelayUs = 0`; `MkvDemuxer` dejaba los tiempos tal cual y devolvía el cebado en
+  `codecDelayUs`, que es lo que define Matroska. El mismo AAC llegaba 21 ms antes desde un MP4, y
+  pasarlo a MKV y de vuelta lo desplazaba. Ahora los dos siguen la convención de Matroska: los
+  paquetes con sus tiempos y el cebado en `codecDelayUs`. En vídeo no cambia nada: la edición inicial
+  de un vídeo con B-frames se sigue restando.
+  - *Qué revisar:* si presentabas el audio de un MP4 con los tiempos tal como llegaban, ahora tienes
+    que descontar `codecDelayUs`, como ya hacías —o debías— con un MKV. `remux` y `concat` lo
+    resuelven solos.
+
+- **`seekTo` coloca las demás pistas por tiempo de presentación, y cae siempre en un keyframe.**
+  - En MP4, las demás pistas se colocaban por tiempo de **decodificación**, como hace el demuxer de
+    FFmpeg. Con las grabaciones de Android con B-frames, cuyo DTS va hasta varios segundos por
+    detrás del PTS, el audio empezaba esos segundos antes que la imagen. Ahora una pista de audio
+    empieza en el paquete que suena en el instante del keyframe, y otra de vídeo en su propio último
+    keyframe no posterior.
+  - En MKV, se devolvía el tiempo del cue —o, sin índice, el del cluster— y se leía desde el
+    principio del cluster. En un archivo cuyos clusters no empiezan en keyframe —los de FFmpeg, que
+    además solo indexa el primer keyframe de cada cluster— salían primero fotogramas que no se
+    pueden decodificar, y el tiempo devuelto no era el del último keyframe. Ahora se busca ese
+    keyframe recorriendo las cabeceras de los bloques desde el cue anterior, y se lee desde el
+    cluster previo al suyo, de modo que las demás pistas quedan como en MP4: el audio empieza en el
+    paquete que suena en el instante del keyframe, tanto si el muxer lo dejó en el cluster
+    anterior como si lo escribió detrás del keyframe —incluso segundos detrás, como queda al
+    intercalar por tiempo de decodificación un vídeo cuyo DTS va segundos por detrás del PTS—, y
+    otra pista de vídeo en su último keyframe no posterior —o, si queda más atrás de lo que se lee,
+    en el siguiente—, nunca en un fotograma que no se puede decodificar. Lo anterior se descarta.
+    Lo que se guarda mientras tanto tiene un tope de diez segundos de lectura y 64 MiB; pasado,
+    la pista empieza antes. Un destino anterior al primer cue se
+    busca igual, desde el primer cluster; en un archivo que empieza en tiempos negativos —Matroska
+    los admite y el índice no, que los guarda como cero— se cae en su primer keyframe y se
+    devuelve su tiempo, no cero.
+  - En los dos, una pista que ya ha terminado en el instante del keyframe —un micrófono que se
+    cortó antes que el vídeo— no entrega nada. Se colocaba en su último paquete o su último
+    keyframe, y lo primero que salía tras buscar era sonido o imagen de segundos antes. En MKV,
+    de una pista de vídeo solo se puede saber cerca del final del archivo: un fotograma se muestra
+    hasta el siguiente, y una captura de pantalla quieta no se distingue de una pista acabada.
+  - *Qué revisar:* el valor que devuelve `seekTo` puede ser otro que antes —el correcto—, y los
+    primeros paquetes de las demás pistas tras buscar son otros.
+
+- **En MP4 fragmentado, una pista que arranca tarde o se pausa se decodifica desde donde suena.**
+  `FragmentedMp4Muxer` empezaba el tiempo de decodificación de todas las pistas en cero, y cada
+  fragmento seguía donde acabó el anterior; lo que faltaba iba en los desfases de composición. Se
+  presentaba donde debía, pero un audio que entra medio segundo tarde —un micrófono que se conecta
+  después— quedaba con el DTS medio segundo por detrás del PTS; y uno que se calla justo cuando se
+  cierra un fragmento, con el DTS por detrás lo que durara la pausa, desde ahí hasta el final,
+  porque la duración del último paquete del fragmento se estima. `seekTo`, que en audio busca por
+  DTS, lo colocaba ese tiempo tarde, y ni la duración de la pista ni la de su lista de edición lo
+  contaban. Ahora cada fragmento se decodifica, como mínimo, desde su primer instante presentado,
+  como en MP4 plano, y el mismo contenido da los mismos tiempos y la misma duración escrito plano o
+  fragmentado: en una grabación de OBS de 85 s, el fMP4 declaraba 7 ms menos. Los fMP4 que ya
+  arrancaban tarde se siguen buscando bien: el demuxer descuenta ese desfase.
+  - *Qué revisar:* el DTS que se lee de una pista así es otro, el que le corresponde. Y si es el
+    vídeo con B-frames el que arranca después que el audio, con desfases firmados FFmpeg lo retrasa
+    ahora uno o dos fotogramas, como a uno que arranca en cero o a sus propios fMP4: antes el
+    arranque tardío lo tapaba. Con `nonNegativeCompositionOffsets` (ver «Añadido») queda exacto.
+  - Un fMP4 ya escrito en el que el audio se pausó justo al cerrar un fragmento se sigue buscando
+    tarde a partir de la pausa: el demuxer solo puede descontar el desfase con que arranca la
+    pista. Pasarlo por `remux` lo reescribe con los tiempos bien.
+
+- **`concat` exige las mismas cabeceras de pista.** Solo comparaba el códec, las dimensiones y la
+  frecuencia y los canales. Ahora compara también `codecPrivate`, la rotación y el color en vídeo, y
+  `codecPrivate` y el cebado en audio, y el error enumera todas las diferencias. La salida lleva una
+  sola cabecera por pista, la de la primera entrada: con otro SPS, la segunda mitad salía corrupta.
+  - *Qué revisar:* segmentos de codificadores o ajustes distintos que antes se unían «bien» ahora
+    lanzan `IllegalArgumentException`. Si el resultado de antes te servía, era por suerte.
+
+- **`.webm` ya no se deduce como Matroska.** `ContainerFormat.fromFileName("x.webm")` devuelve `null`
+  y `createMuxer` lanza explicando que WebM solo admite VP8, VP9 o AV1 con Vorbis u Opus. Salía un
+  archivo con cabecera `matroska` y códecs que un navegador no reproduce.
+  - *Qué hacer:* usar `.mkv`, o pasar `ContainerFormat.MKV` si de verdad quieres esa extensión. Leer
+    un WebM sigue funcionando.
+
+- **El muxer elige la pista predeterminada.** Con `default` sin fijar, es predeterminada la primera
+  pista de cada tipo, salvo que otra del mismo tipo lleve `true`. Antes todas valían `true`, y con
+  varias pistas de audio cada reproductor elegía una distinta. Vale igual para MKV (`FlagDefault`) y
+  MP4 (bit `track_enabled` del `tkhd`).
+  - *Qué revisar:* si querías todas como predeterminadas, pon `default = true` en cada una.
+
+- **`SeekableOutput` trunca el destino en todos sus constructores**, no solo en el de `File`, si trae
+  contenido. Sobre un descriptor abierto en `"rw"`, el contenido anterior quedaba detrás del final, y
+  un MKV lo leía como parte del último cluster.
+  - *Qué revisar:* nada, salvo que escribieras a propósito sobre un archivo que debía conservar su
+    cola, que no es algo que los muxers soporten.
+  - Por lo mismo, un destino de solo lectura —un `RandomAccessFile` en `"r"`, un `FileChannel`
+    abierto solo para leer— se rechaza al construir con `IllegalArgumentException` y un mensaje
+    que dice que se abra en `"rw"`. Fallaba con un `NonWritableChannelException` sin mensaje, al
+    escribir el primer bloque. Un `FileDescriptor` de solo lectura Java no lo distingue: sigue
+    fallando con el error del sistema, al truncarlo o al escribir.
+
+- **El `MuxingApp` de Matroska es siempre `Kotmpeg`**; la opción `writingApp` va al `WritingApp`.
+  Antes los dos llevaban el mismo texto.
+
+- **Opciones imposibles fallan al construir el muxer, no en `start()`.** Es el caso de
+  `segmentIndex` con un `maxFragmentBytes` de más de 1 GiB, que lanzaba `IllegalStateException` en
+  `start()` con el archivo ya creado y ahora lanza `IllegalArgumentException` sin crearlo.
+
+- **Un índice `Cues` ilegible se avisa por `onWarning`.** Se descartaba en silencio, y si estaba
+  delante de los clusters rechazaba el archivo entero. Ahora el archivo se lee y la búsqueda recorre
+  los clusters.
+
+### Añadido
+
+- **`MuxerOptions`**, con todas las opciones de escritura en un sitio y documentadas una a una.
+- **`fastStart` sobre un `SeekableOutput`**, es decir, sobre un descriptor de `MediaStore`/SAF: el
+  `moov` se inserta delante desplazando los datos en el sitio, sin temporal. El resultado es el mismo
+  archivo, byte a byte, que por ruta. Hasta ahora la única opción sin ruta era el MP4 fragmentado.
+  Necesita leer el destino, así que el descriptor va en `"rw"`; uno de solo escritura —el `"w"` que
+  `ContentResolver` da por defecto— se rechaza al construir el muxer, antes de grabar nada.
+- **`nonNegativeCompositionOffsets`** para el MP4 fragmentado: desfases de composición sin signo
+  (`trun` v0) con una lista de edición que los compensa, en vez de los firmados de CMAF. FFmpeg
+  retrasa la pista de vídeo entera lo que mida el mayor desfase negativo —uno o dos fotogramas con
+  B-frames—; con esta opción la sincroniza exacta. La cabecera se escribe con el primer fragmento,
+  que es cuando se conoce el desfase, como `-movflags delay_moov`. Con `segmentIndex`, cada `sidx`
+  da el mismo inicio que el `trun` y el `tfra`.
+- **`Kotmpeg.detectFormat(SeekableInput)`**, que ya existía dentro de la fachada, es pública.
+- **`Mp4Segment.initSegmentSize`**: el tamaño de la cabecera viaja con cada segmento.
+- **`writingApp` también en MP4 y fMP4**, como la etiqueta `©too` (`moov` > `udta` > `meta` >
+  `ilst`), que es donde la escribe FFmpeg y lo que `ffprobe` muestra como `encoder`. Hasta ahora
+  solo llegaba al `WritingApp` de Matroska. Por defecto vale `Kotmpeg`, como FFmpeg pone `Lavf…`;
+  `writingApp = ""` no la escribe.
+
+### Cambiado
+
+- **`seekTo` en MP4, sin coste por colocar el audio.** Colocarlo en el paquete que suena en el
+  keyframe (ver arriba) exige pararse en la última muestra no posterior a él. Avanzar hasta pasarse
+  y retroceder una obligaría, en un MP4 plano, a volver al último punto de control de la tabla de
+  muestras y recorrer hasta 255, y en fMP4 a parsear otra vez hasta tres fragmentos; en vez de eso
+  se mira el tiempo de la siguiente sin moverse, y el cursor de fMP4 guarda también el fragmento
+  anterior. Medido contra la 3.1.0 en la misma máquina y sesión: `seekTo` tarda lo mismo en MP4
+  plano y en fMP4; buscar y leer el primer paquete baja de 97 a 52 µs en una tanda y de 138 a
+  123 µs en otra, y reserva un tercio de memoria (160 bytes frente a 460); y una búsqueda en fMP4
+  reserva 6,2 KB frente a 7,0 KB. Los tiempos dependen de la carga de la máquina, por eso se
+  comparan en la misma sesión; la memoria por operación, no.
+
+### Corregido
+
+- **`remux` y `concat` ya no vacían una salida que existía cuando la llamada no puede salir bien.**
+  La fachada abría el destino —truncándolo— antes de comprobar las entradas: un `concat` de
+  segmentos incompatibles, o un `remux` cuyo `trackFilter` no dejaba ninguna pista o que copiaba un
+  vídeo sin `codecPrivate`, lanzaba `IllegalArgumentException` y dejaba el archivo anterior en 0
+  bytes. Ahora se comprueba antes de abrirlo, con la misma excepción, y el archivo queda como estaba.
+
+### Documentación
+
+- El contrato de `Demuxer.seekTo` dice exactamente dónde queda cada pista en cada contenedor.
+- `TrackInfo.Audio.codecDelayUs` y `MediaPacket.ptsUs` explican la convención del cebado.
+- El ejemplo de `SeekableInput` llamaba a `openDemuxer` con un formato que esa función no recibe.
+- `TrackInfo.default` decía que MP4 no tiene equivalente; se escribe en el bit `track_enabled`
+  del `tkhd`, como hace FFmpeg.
+- El README tiene una sección de [opciones de escritura](README.md#opciones-de-escritura).
+
+### Desarrollo
+
+- `PublicApiTest` deja fuera las clases y los constructores `internal`, preguntándole a los
+  metadatos de Kotlin con `kotlin-reflect` (solo en los tests): un refactor interno ya no mueve el
+  volcado. Con eso se pudo quitar el código muerto que se mantenía solo para no quitar líneas.
+- `PublicApiTest` cubre también los constructores puente de los valores por defecto —los que
+  terminan en `DefaultConstructorMarker`—, que son los que llama el código compilado que omite
+  argumentos, como `Mp4Muxer(file)` sin bloque. Hasta ahora quedaban fuera por ser sintéticos, y
+  quitar el `= {}` de las opciones de un muxer no movía el volcado.
+- Tests nuevos: `CompositionOffsetsTest`, `FastStartInPlaceTest`, `LateStartTrackTest`,
+  `MkvSeekTest`, `ModelAndOptionsTest` y `SeekEndedTrackTest`, y casos nuevos en las suites de
+  `concat`, avisos, `SeekableOutput`, pistas predeterminadas, cebado y metadatos MP4.
+  `MkvSeekTest` comprueba que, tras buscar, el audio empieza en el paquete que suena en el
+  keyframe —esté escrito antes o después de él, incluso segundos después—, una segunda pista de
+  vídeo en un keyframe, que buscar antes del primer cue o en un archivo con tiempos negativos cae
+  en el primer keyframe, y que en un archivo cuyos tiempos se paran no se guarda el resto en
+  memoria;
+  `SeekEndedTrackTest`, que una pista ya terminada no entrega nada en MP4, fMP4 y MKV;
+  `LateStartTrackTest`, que una pista que arranca tarde o se pausa en un corte de fragmento da los
+  mismos tiempos, duración y búsqueda en fMP4 que en MP4 plano, también en un fMP4 escrito como
+  hasta ahora. Otro comprueba que
+  `concat` mantiene cada segmento en sincronía aunque el cebado del segundo se quede dentro, y otro
+  que un `remux` o `concat` rechazado deja intacta la salida que existía. Con FFmpeg, uno comprueba
+  que los desfases sin signo dejan cada fotograma donde se escribió y que los firmados no, otro
+  busca en un MKV con keyframes a mitad de cluster, y otro que `writingApp` es el `encoder` que
+  muestra `ffprobe`. 275 tests en total.
+- El límite de memoria del benchmark `seekFragmented` baja de 32 KB a 10 KB por búsqueda. Una
+  búsqueda en fMP4 reserva unos 6 KB; durante la 4.0.0 llegó a reservar el doble sin que el límite
+  lo detectara (ver «Cambiado»).
+- `AndroidApiCompatibilityTest` cazó dos llamadas nuevas que no existen en Android 8
+  (`ByteBuffer.clear()` y `limit(int)` con su tipo de Java 9); se cambiaron antes de publicar.
+- El build pasa a **Gradle 9.8.1** (era 8.14.5), con el resolvedor de toolchains en la 1.0.0. El
+  único aviso de obsolescencia que queda es del plugin de Kotlin 2.2.10, que se fija a propósito.
+  `compat/kotlin-1.9` sigue en Gradle 8.
+
 ## [3.1.0] — 2026-10-12
 
 Mezcla en vivo del audio de grabación, segmentos indexados para HLS y DASH, lectura de MP4 largos

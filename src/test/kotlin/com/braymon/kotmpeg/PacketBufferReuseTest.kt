@@ -40,16 +40,16 @@ class PacketBufferReuseTest {
     private fun writeWithOneBuffer(muxer: Muxer) {
         val buffer = ByteArray(32)
         muxer.use { m ->
-            val video = m.addTrack(TrackInfo.Video(codec = VideoCodec.H264, width = 64, height = 64, codecPrivate = avcC))
+            val video = m.addTrack(TrackInfo.Video(codec = VideoCodec.H264, width = 64, height = 64) { codecPrivate = avcC })
             val audio = m.addTrack(
-                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2, codecPrivate = AacConfig.build(48_000, 2)),
+                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2) { codecPrivate = AacConfig.build(48_000, 2) },
             )
             m.start()
             for (i in 0 until 60) {
                 buffer.fill((i * 2).toByte())
                 m.writePacket(MediaPacket(video, buffer, ptsUs = i * 33_333L, isKeyFrame = i % 15 == 0))
                 buffer.fill((i * 2 + 1).toByte())
-                m.writePacket(MediaPacket(audio, buffer, ptsUs = i * 33_333L))
+                m.writePacket(MediaPacket(audio, buffer, ptsUs = i * 33_333L, isKeyFrame = false))
             }
             buffer.fill(-1)
         }
@@ -58,15 +58,15 @@ class PacketBufferReuseTest {
     @Test
     fun `reusing one buffer for every packet keeps every container intact`() {
         val outputs = listOf(
-            File(dir, "reuso.mkv").also { writeWithOneBuffer(MkvKotlin.createMuxer(it)) },
-            File(dir, "reuso.mp4").also { writeWithOneBuffer(MkvKotlin.createMuxer(it)) },
-            File(dir, "reuso-frag.mp4").also { writeWithOneBuffer(MkvKotlin.createMuxer(it, mp4Fragmented = true)) },
+            File(dir, "reuso.mkv").also { writeWithOneBuffer(Kotmpeg.createMuxer(it)) },
+            File(dir, "reuso.mp4").also { writeWithOneBuffer(Kotmpeg.createMuxer(it)) },
+            File(dir, "reuso-frag.mp4").also { writeWithOneBuffer(Kotmpeg.createMuxer(it) { fragmented = true }) },
             File(dir, "reuso-frag-limites.mp4").also {
-                writeWithOneBuffer(MkvKotlin.createFragmentedMp4Muxer(it, maxFragmentBytes = 256))
+                writeWithOneBuffer(Kotmpeg.createMuxer(it) { fragmented = true; maxFragmentBytes = 256 })
             },
         )
         for (file in outputs) {
-            MkvKotlin.openDemuxer(file).use { demuxer ->
+            Kotmpeg.openDemuxer(file).use { demuxer ->
                 val videoId = demuxer.tracks.first { it is TrackInfo.Video }.id
                 val packets = generateSequence { demuxer.readPacket() }.toList()
                 assertEquals(120, packets.size, "${file.name}: paquetes perdidos")
@@ -96,8 +96,8 @@ class PacketBufferReuseTest {
 
     @Test
     fun `the facade exposes the fragment retention limits`() {
-        val roomy = File(dir, "holgado.mp4").also { writeWithOneBuffer(MkvKotlin.createFragmentedMp4Muxer(it)) }
-        val tight = File(dir, "ajustado.mp4").also { writeWithOneBuffer(MkvKotlin.createFragmentedMp4Muxer(it, maxFragmentBytes = 256)) }
+        val roomy = File(dir, "holgado.mp4").also { writeWithOneBuffer(Kotmpeg.createMuxer(it) { fragmented = true }) }
+        val tight = File(dir, "ajustado.mp4").also { writeWithOneBuffer(Kotmpeg.createMuxer(it) { fragmented = true; maxFragmentBytes = 256 }) }
         assertEquals(4, countFragments(roomy), "con los valores por defecto se corta un fragmento por GOP")
         assertTrue(countFragments(tight) > 4, "un límite de 256 bytes tiene que cortar más fragmentos que los GOP")
     }
@@ -105,8 +105,8 @@ class PacketBufferReuseTest {
     @Test
     fun `invalid fragment limits are rejected before the file is created`() {
         val target = File(dir, "nunca.mp4")
-        assertFailsWith<IllegalArgumentException> { MkvKotlin.createFragmentedMp4Muxer(target, maxFragmentBytes = 0) }
-        assertFailsWith<IllegalArgumentException> { MkvKotlin.createFragmentedMp4Muxer(target, maxFragmentDurationUs = -1) }
+        assertFailsWith<IllegalArgumentException> { Kotmpeg.createMuxer(target) { fragmented = true; maxFragmentBytes = 0 } }
+        assertFailsWith<IllegalArgumentException> { Kotmpeg.createMuxer(target) { fragmented = true; maxFragmentDurationUs = -1 } }
         assertFalse(target.exists(), "se creó el archivo aunque los parámetros eran inválidos")
     }
 }

@@ -34,15 +34,19 @@ class TrackLanguageRoundTripTest {
     )
 
     private val tracks = listOf(
-        TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240, codecPrivate = avcC, language = "jpn"),
-        TrackInfo.Audio(
-            codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2),
-            language = "spa", name = "Español", default = true,
-        ),
-        TrackInfo.Audio(
-            codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2),
-            language = "eng", name = "Commentary", default = false,
-        ),
+        TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) { codecPrivate = avcC; language = "jpn" },
+        TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+            codecPrivate = AacConfig.build(48000, 2)
+            language = "spa"
+            name = "Español"
+            default = true
+        },
+        TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+            codecPrivate = AacConfig.build(48000, 2)
+            language = "eng"
+            name = "Commentary"
+            default = false
+        },
     )
 
     private fun write(muxer: Muxer) {
@@ -56,10 +60,11 @@ class TrackLanguageRoundTripTest {
         muxer.stop()
     }
 
-    private fun metadataOf(file: File): List<Triple<String, String?, Boolean>> =
-        MkvKotlin.openDemuxer(file).use { demuxer -> demuxer.tracks.map { Triple(it.language, it.name, it.default) } }
+    private fun metadataOf(file: File): List<Triple<String, String?, Boolean?>> =
+        Kotmpeg.openDemuxer(file).use { demuxer -> demuxer.tracks.map { Triple(it.language, it.name, it.default) } }
 
-    private val expected = tracks.map { Triple(it.language, it.name, it.default) }
+    /** La de vídeo no fija `default`: es la única de su tipo, así que el muxer la marca. */
+    private val expected = tracks.map { Triple(it.language, it.name, it.default ?: true) }
 
     @Test
     fun `plain and fragmented mp4 keep language name and default flag`() {
@@ -74,8 +79,8 @@ class TrackLanguageRoundTripTest {
         val source = File(dir, "origen.mkv").also { write(MkvMuxer(it)) }
         val middle = File(dir, "medio.mp4")
         val back = File(dir, "vuelta.mkv")
-        MkvKotlin.remux(source, middle)
-        MkvKotlin.remux(middle, back)
+        Kotmpeg.remux(source, middle)
+        Kotmpeg.remux(middle, back)
         assertEquals(expected, metadataOf(back))
     }
 

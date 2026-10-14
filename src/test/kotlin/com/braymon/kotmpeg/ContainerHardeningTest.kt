@@ -14,6 +14,7 @@ import org.junit.jupiter.api.io.TempDir
 import java.io.File
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
@@ -48,22 +49,21 @@ class ContainerHardeningTest {
         listOf(byteArrayOf(0x68, 0x11, 0x22)),
     )
 
-    private fun videoTrack() = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0,
-        codecPrivate = avcC(),
-    )
+    private fun videoTrack() = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        frameRate = 30.0
+        codecPrivate = avcC()
+    }
 
-    private fun audioTrack() = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2,
-        codecPrivate = AacConfig.build(48000, 2),
-    )
+    private fun audioTrack() = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+        codecPrivate = AacConfig.build(48000, 2)
+    }
 
     private fun payload(i: Int): ByteArray =
         NalUnits.joinLengthPrefixed(listOf(ByteArray(24 + (i % 5) * 4) { (i + it).toByte() }))
 
     /** Escribe un MP4 plano de [frames] fotogramas a 30 fps. */
     private fun writeMp4(target: File, frames: Int, fastStart: Boolean = false) {
-        Mp4Muxer(target, fastStart = fastStart).use { muxer ->
+        Mp4Muxer(target) { this.fastStart = fastStart }.use { muxer ->
             val id = muxer.addTrack(videoTrack())
             muxer.start()
             for (i in 0 until frames) {
@@ -90,7 +90,7 @@ class ContainerHardeningTest {
         val blocker = File(dir, "grabacion.mp4.faststart.tmp")
         assertTrue(blocker.mkdirs(), "no se pudo preparar el bloqueo del temporal")
 
-        val muxer = Mp4Muxer(out, fastStart = true)
+        val muxer = Mp4Muxer(out) { fastStart = true }
         val id = muxer.addTrack(videoTrack())
         muxer.start()
         for (i in 0 until 40) {
@@ -103,7 +103,7 @@ class ContainerHardeningTest {
         )
 
         var packets = 0
-        MkvKotlin.openDemuxer(out).use { demuxer ->
+        Kotmpeg.openDemuxer(out).use { demuxer ->
             assertEquals(1, demuxer.tracks.size)
             while (demuxer.readPacket() != null) packets++
         }
@@ -142,9 +142,23 @@ class ContainerHardeningTest {
         val notAContainer = File(dir, "basura.mp4").also { it.writeBytes(ByteArray(4096) { 0x7A }) }
 
         assertFailsWith<IllegalArgumentException> {
-            MkvKotlin.concat(listOf(good, notAContainer), File(dir, "unido.mkv"))
+            Kotmpeg.concat(listOf(good, notAContainer), File(dir, "unido.mkv"))
         }
         assertTrue(good.delete(), "la primera entrada quedó abierta tras fallar la segunda")
+    }
+
+    /**
+     * Un `.webm` se escribía como Matroska con H.264 y AAC, que ningún navegador reproduce. Ahora
+     * no se deduce de la extensión, y el error explica por qué y qué usar.
+     */
+    @Test
+    fun `a webm output name is refused with an explanation`() {
+        assertEquals(null, ContainerFormat.fromFileName("clip.webm"))
+        assertEquals(ContainerFormat.MKV, ContainerFormat.fromFileName("clip.MKV"))
+        val target = File(dir, "clip.webm")
+        val error = assertFailsWith<IllegalArgumentException> { Kotmpeg.createMuxer(target) }
+        assertTrue(".mkv" in error.message.orEmpty(), "el error no dice qué extensión usar: ${error.message}")
+        assertFalse(target.exists(), "se creó el archivo antes de rechazarlo")
     }
 
     /**
@@ -159,16 +173,16 @@ class ContainerHardeningTest {
         writeMp4(source, frames = 12)
         val sizeBefore = source.length()
 
-        assertFailsWith<IllegalArgumentException> { MkvKotlin.remux(source, source) }
+        assertFailsWith<IllegalArgumentException> { Kotmpeg.remux(source, source) }
         assertEquals(sizeBefore, source.length(), "la entrada no puede haberse tocado")
 
         val indirect = File(dir, "." + File.separator + "origen.mp4")
-        assertFailsWith<IllegalArgumentException> { MkvKotlin.remux(source, indirect) }
+        assertFailsWith<IllegalArgumentException> { Kotmpeg.remux(source, indirect) }
         assertEquals(sizeBefore, source.length())
 
         val other = File(dir, "otro.mp4")
         writeMp4(other, frames = 12)
-        assertFailsWith<IllegalArgumentException> { MkvKotlin.concat(listOf(other, source), source) }
+        assertFailsWith<IllegalArgumentException> { Kotmpeg.concat(listOf(other, source), source) }
         assertEquals(sizeBefore, source.length())
     }
 
@@ -180,8 +194,8 @@ class ContainerHardeningTest {
      */
     @Test
     fun `two identical tracks compare equal even with distinct codecPrivate arrays`() {
-        val a = TrackInfo.Video(codec = VideoCodec.H264, width = 1920, height = 1080, codecPrivate = avcC())
-        val b = TrackInfo.Video(codec = VideoCodec.H264, width = 1920, height = 1080, codecPrivate = avcC())
+        val a = TrackInfo.Video(codec = VideoCodec.H264, width = 1920, height = 1080) { codecPrivate = avcC() }
+        val b = TrackInfo.Video(codec = VideoCodec.H264, width = 1920, height = 1080) { codecPrivate = avcC() }
         assertEquals(a, b)
         assertEquals(a.hashCode(), b.hashCode())
         assertEquals(setOf(a), setOf(a, b), "deberían deduplicarse en un Set")
@@ -191,10 +205,9 @@ class ContainerHardeningTest {
         assertEquals(audioA, audioB)
         assertEquals(audioA.hashCode(), audioB.hashCode())
 
-        val other = TrackInfo.Video(
-            codec = VideoCodec.H264, width = 1920, height = 1080,
-            codecPrivate = avcC().also { it[it.size - 1] = (it[it.size - 1] + 1).toByte() },
-        )
+        val other = TrackInfo.Video(codec = VideoCodec.H264, width = 1920, height = 1080) {
+            codecPrivate = avcC().also { it[it.size - 1] = (it[it.size - 1] + 1).toByte() }
+        }
         assertNotEquals(a, other)
         assertNotEquals(a, a.withId(7))
     }
@@ -220,7 +233,7 @@ class ContainerHardeningTest {
             }
         }
 
-        val first = MkvKotlin.openDemuxer(out).use { it.readPacket() }
+        val first = Kotmpeg.openDemuxer(out).use { it.readPacket() }
         assertEquals(-21_000L, first!!.ptsUs, "el redondeo del pts negativo tiene que ir hacia abajo")
     }
 
@@ -258,7 +271,7 @@ class ContainerHardeningTest {
             muxer.writePacket(MediaPacket(id, payload(0), ptsUs = 0, isKeyFrame = true))
         }
 
-        val durationUs = MkvKotlin.openDemuxer(out).use { it.durationUs }
+        val durationUs = Kotmpeg.openDemuxer(out).use { it.durationUs }
         assertTrue(
             durationUs in 20_000..23_000,
             "la pista debería durar un frame de AAC, no $durationUs us",
@@ -283,7 +296,7 @@ class ContainerHardeningTest {
     @Test
     fun `the fragmented index declares wide entry fields`() {
         val out = File(dir, "frag.mp4")
-        MkvKotlin.createMuxer(out, ContainerFormat.MP4, mp4Fragmented = true).use { muxer ->
+        Kotmpeg.createMuxer(out, ContainerFormat.MP4) { fragmented = true }.use { muxer ->
             val id = muxer.addTrack(videoTrack())
             muxer.start()
             for (i in 0 until 60) {
@@ -299,7 +312,7 @@ class ContainerHardeningTest {
         assertEquals(0x3FL, lengths, "los tres ordinales deben declararse de 4 bytes")
 
         var packets = 0
-        MkvKotlin.openDemuxer(out).use { demuxer -> while (demuxer.readPacket() != null) packets++ }
+        Kotmpeg.openDemuxer(out).use { demuxer -> while (demuxer.readPacket() != null) packets++ }
         assertEquals(60, packets)
     }
 }

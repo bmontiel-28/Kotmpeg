@@ -3,6 +3,8 @@ package com.braymon.kotmpeg
 import org.junit.jupiter.api.Test
 import java.io.File
 import java.lang.reflect.Modifier
+import kotlin.reflect.KVisibility
+import kotlin.reflect.jvm.javaConstructor
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -28,16 +30,18 @@ import kotlin.test.assertTrue
  * Lo que se congela es la **superficie visible desde el bytecode**, que no es idéntica a la API
  * pública de Kotlin. Tres diferencias que conviene conocer para no sorprenderse con el diff:
  *
- * - **Las clases `internal` aparecen.** Kotlin las emite como públicas en el bytecode y la
- *   reflexión no puede distinguirlas de las de verdad públicas, así que figuran en el volcado.
- *   Consecuencia práctica: un refactor interno también mueve el volcado, y regenerarlo entonces
- *   es legítimo. Se prefiere esto a mantener una lista de exclusiones, que podría **ocultar** una
- *   clase el día que pase a ser pública de verdad — un falso negativo es mucho peor que un poco
- *   de ruido.
+ * - **Las clases y los constructores `internal` no aparecen.** Kotlin los emite como públicos en
+ *   el bytecode, y la reflexión de Java no los distingue de los de verdad públicos; los metadatos
+ *   de Kotlin sí, así que se leen con `kotlin-reflect` (ver [isInternal]). Hasta la 3.x figuraban
+ *   en el volcado, y cualquier refactor interno contaba como cambio de API: o se publicaba una
+ *   versión mayor, o se dejaba código muerto para no quitar líneas —que es lo que pasó con
+ *   `SampleTable`—. No es una lista de exclusiones, que podría **ocultar** una clase el día que
+ *   pasara a ser pública: se pregunta al compilador, que es quien decide la visibilidad.
  * - **Los miembros `internal` no aparecen**, porque su nombre sí lleva marca: el compilador les
  *   añade el sufijo del módulo, y [isMangledMember] los descarta.
- * - **Los puentes `$default` sí aparecen**, aunque el compilador los marque como sintéticos. Son
- *   API binaria de verdad; el porqué está en [publicApi].
+ * - **Los puentes de los valores por defecto sí aparecen**, aunque el compilador los marque como
+ *   sintéticos: los métodos `$default` y, desde la 4.0.0, los constructores que terminan en
+ *   `DefaultConstructorMarker`. Son API binaria de verdad; el porqué está en [publicApi].
  *
  * ## Lo que este volcado **no** detecta
  *
@@ -127,6 +131,47 @@ class PublicApiTest {
          */
         fun shortTypeName(typeName: String): String =
             typeName.replace(Regex("""\w+(\.\w+)*\."""), "")
+
+        /**
+         * Si Kotlin declaró [type] `internal` o `private`, o lo anidó dentro de algo que lo es.
+         *
+         * Las fachadas de archivo (`AlgoKt`) y otras clases sintéticas no tienen metadatos de clase,
+         * y `kotlin-reflect` lanza al preguntarles: esas se tratan como públicas, que es lo que dice
+         * su bytecode, para que un fallo aquí nunca **esconda** nada del volcado.
+         */
+        fun isInternal(type: Class<*>): Boolean {
+            var current: Class<*>? = type
+            while (current != null) {
+                val visibility = runCatching { current.kotlin.visibility }.getOrNull()
+                if (visibility == KVisibility.INTERNAL || visibility == KVisibility.PRIVATE) return true
+                current = current.enclosingClass
+            }
+            return false
+        }
+
+        /**
+         * Si [bridge] es el constructor sintético con el que Kotlin resuelve los valores por defecto
+         * de [original]: sus mismos parámetros, una máscara `int` por cada 32 y un
+         * `DefaultConstructorMarker` al final. Así se distingue de otros constructores sintéticos,
+         * como los de acceso a uno privado, que también acaban en el marcador.
+         */
+        fun isDefaultBridgeOf(bridge: java.lang.reflect.Constructor<*>, original: java.lang.reflect.Constructor<*>): Boolean {
+            val n = original.parameterCount
+            val types = bridge.parameterTypes
+            return types.size == n + (n + 31) / 32 + 1 &&
+                types.last().name == "kotlin.jvm.internal.DefaultConstructorMarker" &&
+                types.take(n) == original.parameterTypes.toList() &&
+                types.slice(n until types.size - 1).all { it == Int::class.javaPrimitiveType }
+        }
+
+        /** Constructores que Kotlin declaró `internal`: públicos en el bytecode, pero no API. */
+        fun internalConstructors(type: Class<*>): Set<java.lang.reflect.Constructor<*>> =
+            runCatching {
+                type.kotlin.constructors
+                    .filter { it.visibility == KVisibility.INTERNAL || it.visibility == KVisibility.PRIVATE }
+                    .mapNotNull { it.javaConstructor }
+                    .toSet()
+            }.getOrDefault(emptySet())
     }
 
     /**
@@ -135,7 +180,7 @@ class PublicApiTest {
      * ya empaquetadas, y sostener las dos formas cuesta un `when`.
      */
     private fun classFiles(): List<String> {
-        val source = MkvKotlin::class.java.protectionDomain?.codeSource
+        val source = Kotmpeg::class.java.protectionDomain?.codeSource
             ?: error("no se pudo localizar las clases compiladas del módulo")
         val location = File(source.location.toURI())
         val prefix = "com/braymon/kotmpeg/"
@@ -167,7 +212,9 @@ class PublicApiTest {
      *    compilaciones es un test intermitente, que es la peor forma de fallar porque enseña a
      *    ignorarlo.
      *  - Los puentes [DEFAULT_BRIDGE] **se incluyen** pese a estar marcados como sintéticos,
-     *    exceptuándolos de los dos filtros. Son API binaria de verdad: quien omite un argumento
+     *    exceptuándolos de los dos filtros, y lo mismo los constructores puente (ver
+     *    [isDefaultBridgeOf]), que hasta la 3.x se quedaban fuera: quitar el `= {}` de las
+     *    opciones de un muxer no movía el volcado. Son API binaria de verdad: quien omite un argumento
      *    por defecto desde otro módulo invoca el puente y no el método real, así que quitarle el
      *    valor por defecto a un parámetro no mueve la firma real ni un milímetro y sin esta
      *    excepción el guardián pasaba en verde ante un cambio que da `NoSuchMethodError` a todo
@@ -185,7 +232,7 @@ class PublicApiTest {
                 val type = runCatching { Class.forName(binaryName, false, loader) }
                     .getOrNull() ?: return@forEach
                 if (type.isSynthetic || type.isAnonymousClass || type.isLocalClass) return@forEach
-                if (!Modifier.isPublic(type.modifiers)) return@forEach
+                if (!Modifier.isPublic(type.modifiers) || isInternal(type)) return@forEach
 
                 val kind = when {
                     type.isInterface -> "interface"
@@ -195,8 +242,11 @@ class PublicApiTest {
                 }
                 lines.add("$kind $binaryName")
 
+                val hidden = internalConstructors(type)
+                val visible = type.declaredConstructors.filter { !it.isSynthetic && isVisible(it.modifiers) && it !in hidden }
                 for (c in type.declaredConstructors.sortedBy { c -> c.genericParameterTypes.joinToString { it.typeName } }) {
-                    if (c.isSynthetic || !isVisible(c.modifiers)) continue
+                    if (!isVisible(c.modifiers) || c in hidden) continue
+                    if (c.isSynthetic && visible.none { isDefaultBridgeOf(c, it) }) continue
                     val params = c.genericParameterTypes.joinToString(", ") { shortTypeName(it.typeName) }
                     lines.add("  constructor($params)")
                 }
@@ -238,6 +288,8 @@ class PublicApiTest {
             "class com.braymon.kotmpeg.model.TrackInfo\$Video",
             "class com.braymon.kotmpeg.model.TrackInfo\$Audio",
             "com.braymon.kotmpeg.model.ColorInfo\$Companion",
+            "class com.braymon.kotmpeg.model.TrackInfo\$Video\$Builder",
+            "class com.braymon.kotmpeg.MuxerOptions",
             "com.braymon.kotmpeg.model.VideoCodec",
             "com.braymon.kotmpeg.model.AudioCodec",
         )
@@ -258,7 +310,7 @@ class PublicApiTest {
      * se rompe sin darse cuenta al reordenar. Un guardián cuyo alcance encoge en silencio es peor
      * que no tenerlo.
      *
-     * Los anclajes son la superficie principal de la librería: si `MkvKotlin.remux` pierde un
+     * Los anclajes son la superficie principal de la librería: si `Kotmpeg.remux` pierde un
      * valor por defecto, esto lo dice.
      */
     @Test
@@ -270,10 +322,11 @@ class PublicApiTest {
             "fun remux\$default(",
             "fun concat\$default(",
             "fun createMuxer\$default(",
-            "fun copy\$default(",
         )) {
             assertTrue(bridge in api, "el volcado de API no cubre el puente `$bridge`")
         }
+        val constructorBridges = lines.count { it.startsWith("  constructor(") && it.endsWith("DefaultConstructorMarker)") }
+        assertTrue(constructorBridges >= 6, "el volcado no cubre los constructores puente de los valores por defecto ($constructorBridges)")
 
         val leaked = lines.filter { line ->
             val member = line.substringAfter("fun ", "").substringBefore('(')

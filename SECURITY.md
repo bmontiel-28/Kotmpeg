@@ -4,7 +4,8 @@
 
 | Versión | Soporte |
 |---|---|
-| `3.x` | ✅ |
+| `4.x` | ✅ |
+| `3.x` | ❌ — actualiza a la `4.x`; el CHANGELOG trae la migración paso a paso |
 
 Se da soporte a la última versión publicada de la serie mayor en curso.
 

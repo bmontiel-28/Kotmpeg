@@ -35,7 +35,7 @@ class Mp4SampleIndexTest {
     @TempDir
     lateinit var dir: File
 
-    private class Sample(val pts: Long, val dts: Long, val key: Boolean)
+    private class Sample(val pts: Long, val dts: Long, val key: Boolean, val duration: Long)
 
     /** Las muestras de cada pista en su orden, leídas de principio a fin. */
     private fun readAll(file: File): Pair<List<TrackInfo>, Map<Int, List<Sample>>> =
@@ -43,7 +43,7 @@ class Mp4SampleIndexTest {
             val samples = demuxer.tracks.associate { it.id to ArrayList<Sample>() }
             while (true) {
                 val packet = demuxer.readPacket() ?: break
-                samples.getValue(packet.trackId) += Sample(packet.ptsUs, packet.dtsUs, packet.isKeyFrame)
+                samples.getValue(packet.trackId) += Sample(packet.ptsUs, packet.dtsUs, packet.isKeyFrame, packet.durationUs)
             }
             demuxer.tracks to samples
         }
@@ -51,20 +51,38 @@ class Mp4SampleIndexTest {
     /**
      * El algoritmo de `seekTo` tal como está documentado, sobre arrays: último keyframe con
      * `pts <= destino` entre las muestras del ancla que no empiezan a decodificarse después del
-     * destino, y en las demás pistas la primera muestra que no se decodifica antes que él.
-     * Devuelve el `pts` de destino y la posición de cada pista.
+     * destino; luego, con el `pts` de ese keyframe, lo mismo en las demás pistas de vídeo y, en las
+     * de audio, la última muestra que no empieza después de él. Una pista cuya búsqueda llegó a su
+     * última muestra y que desde ahí no presenta nada en ese instante ni después ya ha terminado, y
+     * queda agotada. Devuelve el `pts` de destino y la posición de cada pista.
      */
     private fun expectedSeek(tracks: List<TrackInfo>, samples: Map<Int, List<Sample>>, t: Long): Pair<Long, Map<Int, Int>> {
+        fun keyFrameAtOrBefore(list: List<Sample>, time: Long): Int {
+            val limit = (list.indexOfFirst { it.dts > time }.let { if (it < 0) list.size else it }).coerceAtMost(list.size - 1)
+            return (limit downTo 0).firstOrNull { list[it].key && list[it].pts <= time } ?: 0
+        }
         val anchor = (tracks.firstOrNull { it is TrackInfo.Video } ?: tracks.first()).id
         val a = samples.getValue(anchor)
-        val limit = (a.indexOfFirst { it.dts > t }.let { if (it < 0) a.size else it }).coerceAtMost(a.size - 1)
-        val target = (limit downTo 0).firstOrNull { a[it].key && a[it].pts <= t } ?: 0
-        val targetDts = a[target].dts
+        val target = keyFrameAtOrBefore(a, t)
+        val targetPts = a[target].pts
+        fun ended(list: List<Sample>, from: Int, time: Long): Boolean =
+            (from until list.size).all { list[it].pts < time && time - list[it].pts >= list[it].duration }
         val positions = tracks.associate { track ->
             val list = samples.getValue(track.id)
-            track.id to if (track.id == anchor) target else list.indexOfFirst { it.dts >= targetDts }.let { if (it < 0) list.size else it }
+            track.id to when {
+                track.id == anchor -> target
+                track is TrackInfo.Video -> {
+                    val limit = (list.indexOfFirst { it.dts > targetPts }.let { if (it < 0) list.size else it }).coerceAtMost(list.size - 1)
+                    val start = keyFrameAtOrBefore(list, targetPts)
+                    if (limit == list.size - 1 && ended(list, start, targetPts)) list.size else start
+                }
+                else -> {
+                    val start = (list.indexOfLast { it.dts <= targetPts }).coerceAtLeast(0)
+                    if (start == list.size - 1 && ended(list, start, targetPts)) list.size else start
+                }
+            }
         }
-        return a[target].pts to positions
+        return targetPts to positions
     }
 
     /** Los siguientes [count] paquetes desde [positions], intercalados como lo hace `readPacket`. */
@@ -95,15 +113,15 @@ class Mp4SampleIndexTest {
      * cada dos segundos, más AAC: 3600 muestras de vídeo, que cruzan una docena de puntos de control.
      */
     private fun write(file: File, format: ContainerFormat, fastStart: Boolean = false, fragmented: Boolean = false): File {
-        val muxer = MkvKotlin.createMuxer(file, format, mp4FastStart = fastStart, mp4Fragmented = fragmented, mp4FragmentDurationUs = 1_000_000)
+        val muxer = Kotmpeg.createMuxer(file, format) { this.fastStart = fastStart; this.fragmented = fragmented; fragmentDurationUs = 1_000_000 }
         val video = muxer.addTrack(
-            TrackInfo.Video(
-                codec = VideoCodec.H264, width = 64, height = 48, frameRate = 60.0,
-                codecPrivate = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x1F, 0x11)), listOf(byteArrayOf(0x68, 0x22))),
-            ),
+            TrackInfo.Video(codec = VideoCodec.H264, width = 64, height = 48) {
+                frameRate = 60.0
+                codecPrivate = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x1F, 0x11)), listOf(byteArrayOf(0x68, 0x22)))
+            },
         )
         val audio = muxer.addTrack(
-            TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2)),
+            TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) { codecPrivate = AacConfig.build(48000, 2) },
         )
         muxer.start()
         val frame = 16_667L
@@ -169,9 +187,9 @@ class Mp4SampleIndexTest {
         val samples = 1_000_000
         for ((name, fragmented) in listOf("millon.mp4" to false, "millon-fragmentado.mp4" to true)) {
             val file = File(dir, name)
-            val muxer = MkvKotlin.createMuxer(file, ContainerFormat.MP4, mp4Fragmented = fragmented)
+            val muxer = Kotmpeg.createMuxer(file, ContainerFormat.MP4) { this.fragmented = fragmented }
             val id = muxer.addTrack(
-                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2)),
+                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) { codecPrivate = AacConfig.build(48000, 2) },
             )
             muxer.start()
             val payload = byteArrayOf(1)

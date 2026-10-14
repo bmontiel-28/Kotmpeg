@@ -28,18 +28,17 @@ class WarningChannelTest {
     @TempDir
     lateinit var dir: File
 
-    private fun videoTrack() = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0,
+    private fun videoTrack() = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        frameRate = 30.0
         codecPrivate = NalUnits.buildAvcC(
             listOf(byteArrayOf(0x67, 0x64, 0x00, 0x1F, 0x11, 0x22, 0x33)),
             listOf(byteArrayOf(0x68, 0x11, 0x22)),
-        ),
-    )
+        )
+    }
 
-    private fun audioTrack() = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2,
-        codecPrivate = AacConfig.build(48000, 2),
-    )
+    private fun audioTrack() = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+        codecPrivate = AacConfig.build(48000, 2)
+    }
 
     /** Tamaños distintos por muestra, para que `stsz` use la tabla y no un tamaño constante. */
     private fun payload(i: Int): ByteArray {
@@ -69,7 +68,7 @@ class WarningChannelTest {
     @Test
     fun `the facade forwards demuxer warnings for a track it cannot interpret`() {
         val file = File(dir, "roto.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val vid = muxer.addTrack(videoTrack())
             val aud = muxer.addTrack(audioTrack())
             muxer.start()
@@ -85,7 +84,7 @@ class WarningChannelTest {
         val broken = File(dir, "roto-patched.mp4").also { it.writeBytes(bytes) }
 
         val warnings = ArrayList<String>()
-        MkvKotlin.openDemuxer(broken, onWarning = { warnings.add(it) }).use { demuxer ->
+        Kotmpeg.openDemuxer(broken, onWarning = { warnings.add(it) }).use { demuxer ->
             assertTrue(
                 demuxer.tracks.any { it is TrackInfo.Video },
                 "el archivo debía degradarse a la pista de vídeo, no perderse entero",
@@ -94,30 +93,62 @@ class WarningChannelTest {
         }
         assertTrue(
             warnings.isNotEmpty(),
-            "la pista descartada no llegó al callback a través de MkvKotlin.openDemuxer",
+            "la pista descartada no llegó al callback a través de Kotmpeg.openDemuxer",
         )
     }
 
     @Test
     fun `the facade still works without a warning callback`() {
         val file = File(dir, "sano.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val vid = muxer.addTrack(videoTrack())
             muxer.start()
             repeat(10) { i -> muxer.writePacket(MediaPacket(vid, payload(i), i * 33_333L, i * 33_333L, true)) }
         }
         var count = 0
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             assertEquals(1, demuxer.tracks.size)
             while (demuxer.readPacket() != null) count++
         }
         assertEquals(10, count)
     }
 
+    /**
+     * Un índice `Cues` roto solo quita la búsqueda rápida: el archivo se lee entero y se puede
+     * buscar. Hasta la 3.x eso pasaba **en silencio**, y unas búsquedas de repente lentas no
+     * tenían explicación.
+     */
+    @Test
+    fun `an unreadable cues index is reported and the file still reads and seeks`() {
+        val file = File(dir, "indice.mkv")
+        Kotmpeg.createMuxer(file, ContainerFormat.MKV).use { muxer ->
+            val vid = muxer.addTrack(videoTrack())
+            muxer.start()
+            repeat(90) { i -> muxer.writePacket(MediaPacket(vid, payload(i), i * 40_000L, i * 40_000L, i % 30 == 0)) }
+        }
+        val bytes = file.readBytes()
+        val cuesId = byteArrayOf(0x1C, 0x53, 0xBB.toByte(), 0x6B)
+        val cues = (bytes.size - 4 downTo 0).first { at -> cuesId.indices.all { bytes[at + it] == cuesId[it] } }
+        val sizeLength = Integer.numberOfLeadingZeros(bytes[cues + 4].toInt() and 0xFF) - 23
+        val firstPoint = cues + 4 + sizeLength
+        assertEquals(0xBB.toByte(), bytes[firstPoint], "el índice no empieza por un CuePoint")
+        bytes[firstPoint + 1] = 0xFF.toByte()
+        val broken = File(dir, "indice-roto.mkv").also { it.writeBytes(bytes) }
+
+        val warnings = ArrayList<String>()
+        Kotmpeg.openDemuxer(broken, onWarning = { warnings.add(it) }).use { demuxer ->
+            assertEquals(90, generateSequence { demuxer.readPacket() }.count(), "no se leyó el archivo entero")
+            assertEquals(30 * 40_000L, demuxer.seekTo(40 * 40_000L), "la búsqueda sin índice no llegó al keyframe")
+            assertEquals(30 * 40_000L, demuxer.readPacket()?.ptsUs)
+        }
+        assertEquals(1, warnings.size, "avisos: $warnings")
+        assertTrue("Cues" in warnings.single(), "el aviso no nombra el índice: $warnings")
+    }
+
     @Test
     fun `the mkv demuxer also reports a track it had to drop`() {
         val file = File(dir, "roto.mkv")
-        MkvKotlin.createMuxer(file, ContainerFormat.MKV).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MKV).use { muxer ->
             val vid = muxer.addTrack(videoTrack())
             val aud = muxer.addTrack(audioTrack())
             muxer.start()
@@ -133,7 +164,7 @@ class WarningChannelTest {
         val broken = File(dir, "roto-patched.mkv").also { it.writeBytes(bytes) }
 
         val warnings = ArrayList<String>()
-        MkvKotlin.openDemuxer(broken, onWarning = { warnings.add(it) }).use { demuxer ->
+        Kotmpeg.openDemuxer(broken, onWarning = { warnings.add(it) }).use { demuxer ->
             assertTrue(demuxer.tracks.any { it is TrackInfo.Video }, "se perdió también el vídeo")
             while (demuxer.readPacket() != null) Unit
         }
@@ -159,11 +190,11 @@ class WarningChannelTest {
         val broken = brokenAudioMp4("remux-in.mp4")
         val warnings = ArrayList<String>()
         val out = File(dir, "remux-out.mkv")
-        val packets = MkvKotlin.remux(broken, out, onWarning = { warnings.add(it) })
+        val packets = Kotmpeg.remux(broken, out, onWarning = { warnings.add(it) })
 
         assertTrue(packets > 0, "el remux no copió nada")
         assertTrue(warnings.isNotEmpty(), "remux() no propagó el aviso de la pista descartada")
-        MkvKotlin.openDemuxer(out).use { assertEquals(1, it.tracks.size) }
+        Kotmpeg.openDemuxer(out).use { assertEquals(1, it.tracks.size) }
     }
 
     @Test
@@ -171,7 +202,7 @@ class WarningChannelTest {
         val a = brokenAudioMp4("concat-a.mp4")
         val b = brokenAudioMp4("concat-b.mp4")
         val warnings = ArrayList<String>()
-        MkvKotlin.concat(listOf(a, b), File(dir, "concat-out.mkv"), onWarning = { warnings.add(it) })
+        Kotmpeg.concat(listOf(a, b), File(dir, "concat-out.mkv"), onWarning = { warnings.add(it) })
         assertTrue(warnings.size >= 2, "concat() solo avisó de ${warnings.size} de 2 entradas")
     }
 
@@ -188,7 +219,7 @@ class WarningChannelTest {
     /** MP4 de dos pistas con el fourcc del `stsd` de audio corrompido: el audio no se puede leer. */
     private fun brokenAudioMp4(name: String): File {
         val src = File(dir, "src-$name")
-        MkvKotlin.createMuxer(src, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(src, ContainerFormat.MP4).use { muxer ->
             val vid = muxer.addTrack(videoTrack())
             val aud = muxer.addTrack(audioTrack())
             muxer.start()
@@ -210,7 +241,7 @@ class WarningChannelTest {
         val perTrack = 24
         val vidId: Int
         val audId: Int
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             vidId = muxer.addTrack(videoTrack())
             audId = muxer.addTrack(audioTrack())
             muxer.start()
@@ -231,7 +262,7 @@ class WarningChannelTest {
 
         val read = ArrayList<MediaPacket>()
         val warnings = ArrayList<String>()
-        MkvKotlin.openDemuxer(broken, onWarning = { warnings.add(it) }).use { demuxer ->
+        Kotmpeg.openDemuxer(broken, onWarning = { warnings.add(it) }).use { demuxer ->
             while (true) read.add(demuxer.readPacket() ?: break)
         }
 

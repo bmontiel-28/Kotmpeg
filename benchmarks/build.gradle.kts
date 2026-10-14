@@ -38,7 +38,7 @@ jmh {
 // así que un límite de tiempo o sería inestable o tan holgado que no detectaría nada. Los bytes por
 // operación, en cambio, son los mismos en cualquier máquina, y son justo lo que retrocede cuando
 // alguien vuelve a cargar en memoria lo que se leía bajo demanda.
-val verificarLimites by tasks.registering {
+tasks.register("verificarLimites") {
     dependsOn("jmh")
     val resultados = layout.buildDirectory.file("results/jmh/results.json")
     val limites = layout.projectDirectory.file("limites.properties")

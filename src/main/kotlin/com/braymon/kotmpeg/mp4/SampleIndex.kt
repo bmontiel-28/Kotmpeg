@@ -35,6 +35,19 @@ internal abstract class SampleCursor {
     abstract fun moveTo(target: Int)
 
     fun next(): Unit = moveTo(index + 1)
+
+    /**
+     * Si se sabe el DTS de la muestra siguiente sin moverse, que da entonces [nextDtsUs]. Es lo que
+     * deja buscar «la última muestra con DTS no posterior» sin pasarse y tener que retroceder, que
+     * en un MP4 plano obliga a recorrer de nuevo desde el punto de control (ver
+     * [TrackSamples.lastIndexWithDtsAtMost]). Son dos miembros y no un `Long?` porque se consulta en
+     * cada paso de una búsqueda, y un `Long?` reservaba un objeto en cada uno allí donde el JIT no
+     * lo eliminaba, como al buscar en fMP4.
+     */
+    open val knowsNextDts: Boolean get() = false
+
+    /** El DTS de la muestra siguiente; solo vale si [knowsNextDts]. */
+    open val nextDtsUs: Long get() = throw IllegalStateException("el DTS de la muestra siguiente no se conoce")
 }
 
 /**
@@ -68,11 +81,46 @@ internal abstract class TrackSamples {
     /** DTS de esa muestra, o `Long.MAX_VALUE` si la pista ya no tiene más. */
     protected abstract fun checkpointDtsUs(c: Int): Long
 
-    /** Primer índice con `dts >= value` (o [size] si no hay); exige DTS monótonos. */
-    fun firstIndexWithDtsAtLeast(value: Long, scan: SampleCursor): Int = firstIndex(scan) { it >= value }
-
     /** Primer índice con `dts > value` (o [size] si no hay); exige DTS monótonos. */
     fun firstIndexWithDtsAbove(value: Long, scan: SampleCursor): Int = firstIndex(scan) { it > value }
+
+    /**
+     * Último índice con `dts <= value`, o 0 si todas empiezan después; exige DTS monótonos, y deja
+     * [scan] en él. Se para mirando el DTS de la siguiente ([SampleCursor.nextDtsUs]) en vez de
+     * avanzar hasta pasarse: retroceder una muestra en un MP4 plano cuesta volver al punto de
+     * control y recorrer hasta [CHECKPOINT_INTERVAL] muestras, y en una búsqueda era la mitad de
+     * su coste. Si el cursor no sabe el DTS siguiente —al final del último fragmento cargado—,
+     * avanza y, si se pasa, vuelve.
+     */
+    fun lastIndexWithDtsAtMost(value: Long, scan: SampleCursor): Int {
+        var low = 0
+        var high = checkpointCount
+        while (low < high) {
+            val mid = (low + high) ushr 1
+            if (checkpointDtsUs(mid) > value) high = mid else low = mid + 1
+        }
+        if (low == 0) {
+            scan.moveTo(0)
+            return 0
+        }
+        var index = checkpointIndex(low - 1)
+        scan.moveTo(index)
+        while (index + 1 < size) {
+            if (scan.knowsNextDts) {
+                if (scan.nextDtsUs > value) return index
+                index++
+                scan.next()
+            } else {
+                scan.next()
+                if (scan.dtsUs > value) {
+                    scan.moveTo(index)
+                    return index
+                }
+                index++
+            }
+        }
+        return index
+    }
 
     private inline fun firstIndex(scan: SampleCursor, reached: (Long) -> Boolean): Int {
         var low = 0
@@ -86,18 +134,6 @@ internal abstract class TrackSamples {
         if (index >= size) return size
         scan.moveTo(index)
         while (!reached(scan.dtsUs)) {
-            index++
-            if (index >= size) return size
-            scan.next()
-        }
-        return index
-    }
-
-    /** El recorrido lineal para cuando los DTS retroceden: primer índice con `dts >= value`. */
-    fun firstIndexWithDtsAtLeastLinear(value: Long, scan: SampleCursor): Int {
-        scan.moveTo(0)
-        var index = 0
-        while (scan.dtsUs < value) {
             index++
             if (index >= size) return size
             scan.next()
@@ -323,6 +359,17 @@ internal class StblSamples(
             get() = keys?.get(index) ?: true
         override val durationUs: Long
             get() = ticksToUs(sampleDelta)
+
+        /**
+         * El DTS de la siguiente es [tick], que ya va una muestra por delante. Si `stts` se ha
+         * agotado, la siguiente tendría DTS 0 —un archivo así no tiene DTS monótonos y no se busca
+         * por bisección—, y no se da por conocido para no adivinar.
+         */
+        override val knowsNextDts: Boolean
+            get() = index + 1 < this@StblSamples.size && (sttsLeft > 0 || sttsNext < stts.entries)
+
+        override val nextDtsUs: Long
+            get() = dtsUs(tick)
 
         private var sttsNext = 0
         private var sttsLeft = 0L

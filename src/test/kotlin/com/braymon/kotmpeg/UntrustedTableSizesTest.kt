@@ -32,18 +32,17 @@ class UntrustedTableSizesTest {
     @TempDir
     lateinit var dir: File
 
-    private fun videoTrack() = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0,
+    private fun videoTrack() = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        frameRate = 30.0
         codecPrivate = NalUnits.buildAvcC(
             listOf(byteArrayOf(0x67, 0x64, 0x00, 0x1F, 0x11, 0x22, 0x33)),
             listOf(byteArrayOf(0x68, 0x11, 0x22)),
-        ),
-    )
+        )
+    }
 
-    private fun audioTrack() = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2,
-        codecPrivate = AacConfig.build(48000, 2),
-    )
+    private fun audioTrack() = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+        codecPrivate = AacConfig.build(48000, 2)
+    }
 
     /** NAL con prefijo de longitud, que es el formato canónico del modelo. */
     private fun payload(i: Int, size: Int = 40): ByteArray {
@@ -52,7 +51,7 @@ class UntrustedTableSizesTest {
     }
 
     private fun writeFragmented(file: File, packets: Int): File {
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4, mp4Fragmented = true).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4) { fragmented = true }.use { muxer ->
             val vid = muxer.addTrack(videoTrack())
             muxer.start()
             repeat(packets) { i ->
@@ -88,7 +87,7 @@ class UntrustedTableSizesTest {
             cut.writeBytes(bytes.copyOf(bytes.size * percent / 100))
 
             val read = ArrayList<MediaPacket>()
-            MkvKotlin.openDemuxer(cut).use { demuxer ->
+            Kotmpeg.openDemuxer(cut).use { demuxer ->
                 while (true) {
                     val p = demuxer.readPacket() ?: break
                     read.add(p)
@@ -108,7 +107,7 @@ class UntrustedTableSizesTest {
     fun `an intact fragmented mp4 still returns every packet`() {
         val full = writeFragmented(File(dir, "intact.mp4"), packets = 60)
         var count = 0
-        MkvKotlin.openDemuxer(full).use { demuxer ->
+        Kotmpeg.openDemuxer(full).use { demuxer ->
             while (demuxer.readPacket() != null) count++
         }
         assertEquals(60, count, "un fMP4 íntegro no puede perder paquetes")
@@ -123,7 +122,7 @@ class UntrustedTableSizesTest {
     @Test
     fun `an inflated stts run length does not stall the parser`() {
         val file = File(dir, "stts.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val vid = muxer.addTrack(videoTrack())
             muxer.start()
             repeat(30) { i ->
@@ -157,7 +156,7 @@ class UntrustedTableSizesTest {
     private fun timeOpening(file: File, repeats: Int): Long {
         val start = System.nanoTime()
         repeat(repeats) {
-            MkvKotlin.openDemuxer(file).use { assertEquals(1, it.tracks.size) }
+            Kotmpeg.openDemuxer(file).use { assertEquals(1, it.tracks.size) }
         }
         return (System.nanoTime() - start) / 1_000_000
     }
@@ -165,7 +164,7 @@ class UntrustedTableSizesTest {
     @Test
     fun `a normal file still gets its timestamps from stts`() {
         val file = File(dir, "normal.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val vid = muxer.addTrack(videoTrack())
             muxer.start()
             repeat(30) { i ->
@@ -174,7 +173,7 @@ class UntrustedTableSizesTest {
                 )
             }
         }
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             for (i in 0 until 30) {
                 val p = assertNotNull(demuxer.readPacket(), "falta el paquete $i")
                 assertTrue(
@@ -242,7 +241,7 @@ class UntrustedTableSizesTest {
     @Test
     fun `an unparseable track is reported through the warning callback`() {
         val file = File(dir, "twotracks.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val vid = muxer.addTrack(videoTrack())
             val aud = muxer.addTrack(audioTrack())
             muxer.start()

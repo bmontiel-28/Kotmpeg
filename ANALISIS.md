@@ -2,7 +2,9 @@
 
 Las secciones 1 a 8 son la revisión que dio lugar a la **3.0.0**. La [sección 9](#9-la-310) es la
 **3.1.0**, que atiende las recomendaciones del §7, con su propio histórico, mediciones y
-observaciones.
+observaciones. La [sección 10](#10-la-400) es la **4.0.0**, que cierra todo lo que quedaba
+abierto —en el código, en la API y en las observaciones de §9.6 y §9.8— para que la siguiente
+versión no arrastre nada.
 
 Revisión del código completo (muxers y demuxers MKV/MP4/fMP4, EBML, E/S, configuración de códecs,
 audio PCM y fachada) con tres objetivos: que no quede ningún fallo conocido sin cubrir, que rinda
@@ -462,14 +464,413 @@ repositorio.
 - **`seekTo` en fMP4** cuesta unos 50 µs porque vuelve a parsear el fragmento de destino. Si algún
   uso lo necesitara más rápido, el siguiente paso sería guardar en cada punto de control el DTS de
   cada muestra del fragmento, que es memoria que ahora no se gasta.
-- **En la próxima versión mayor**, quitar de `SampleTable` los tres métodos que la 3.1.0 dejó sin
-  uso.
+- ~~**En la próxima versión mayor**, quitar de `SampleTable` los tres métodos que la 3.1.0 dejó sin
+  uso~~. **Hecho en la 4.0.0** ([§10.2](#102-una-api-que-ya-no-se-rompe-al-crecer)).
 - La campaña semanal de fuzzing guarda sus hallazgos como artefacto del CI; revisarlos forma parte
   del trabajo de cada versión.
-- **La fachada no expone el `sidx`.** `MkvKotlin.createFragmentedMp4Muxer` y `createMuxer` devuelven
-  la interfaz `Muxer`, así que `segmentIndex` y `onSegment` se usan construyendo
-  `FragmentedMp4Muxer` directamente, como en el README. Cambiar el tipo que devuelven cambiaría su
-  firma, que exige la mayor; si hiciera falta antes, lo compatible es una sobrecarga nueva.
+- ~~**La fachada no expone el `sidx`.**~~ **Resuelto en la 4.0.0**: `segmentIndex` y `onSegment`
+  son opciones de `MuxerOptions`, que la fachada pasa al muxer ([§10.2](#102-una-api-que-ya-no-se-rompe-al-crecer)).
 - **`seekTo` de un MP4 plano ya no es solo memoria**: lee del archivo las páginas de tabla que
   necesita, como ya hacía `readPacket` con los datos. En Android, como cualquier lectura de disco, no
   debe llamarse desde el hilo principal.
+
+## 10. La 4.0.0
+
+Una versión **mayor** con un único fin: que no quede nada pendiente, ni en el código ni en la API, y
+que lo que se añada después no obligue a otra. Rompe la API una sola vez, a propósito, y cada
+ruptura deja la librería en una forma en la que crecer ya no rompe. El CHANGELOG da el paso de
+migración de cada punto; aquí va el porqué.
+
+Se ordenó por prioridad: primero lo que daba **resultados distintos según el contenedor** —lo único
+que un usuario no puede esquivar—, después la forma de la API, y al final lo que solo es nuevo.
+
+### 10.1 Correcciones de comportamiento
+
+1. **El cebado del audio, igual en los tres contenedores.** `MkvDemuxer` seguía la definición de
+   Matroska: los tiempos de los paquetes tal cual y el cebado en `codecDelayUs`. `Mp4Demuxer` restaba
+   de los tiempos la edición inicial de una pista de audio y devolvía `codecDelayUs = 0`. El mismo
+   AAC llegaba así 21 ms antes desde un MP4 que desde un MKV, y quien lo presentara tal cual tenía
+   un desfase distinto según el contenedor. Ahora `Mp4Demuxer` convierte esa edición en
+   `codecDelayUs`, y los muxers la vuelven a escribir como edición o como `CodecDelay`: un AAC
+   escrito en MP4, fMP4 y MKV se relee con los mismos tiempos y el mismo cebado en los tres. En
+   vídeo la edición inicial no es cebado sino el desfase de los B-frames, y se sigue restando.
+
+2. **`seekTo` por tiempo de presentación, y siempre en un keyframe.** Dos fallos distintos con el
+   mismo síntoma —un recorte desde el punto de búsqueda que no empieza con imagen y sonido—:
+   - En **MP4**, las demás pistas se colocaban por tiempo de decodificación, como el demuxer de
+     FFmpeg. Es la observación de §9.6 con la grabación de la tablet: su DTS va 6,68 s por detrás
+     del PTS, y tras buscar el audio empezaba 6,7 s antes que la imagen. Ahora el audio empieza en
+     el paquete que suena en el instante del keyframe, y otra pista de vídeo en su propio último
+     keyframe no posterior. Los límites se siguen localizando por bisección entre los puntos de
+     control del índice bajo demanda.
+   - En **MKV**, se devolvía el tiempo del cue y se leía desde el principio de su cluster, o, sin
+     índice, desde el último cluster anterior al destino. Pero un cue no tiene por qué marcar cada
+     keyframe —FFmpeg solo indexa el primero de cada cluster— ni su cluster empezar en él: en un
+     MKV de FFmpeg con un keyframe cada cinco fotogramas salía primero el keyframe del principio del
+     cluster, que no era el pedido, y sin índice salían fotogramas que no se pueden decodificar.
+     Ahora se recorren las cabeceras de los bloques —sin leer las cargas— desde el cue anterior al
+     destino hasta el último keyframe no posterior a él, y se lee desde el cluster previo al de ese
+     keyframe, porque es ahí donde el muxer pudo dejar el paquete de audio que ya sonaba en ese
+     instante. Pero también puede haberlo escrito detrás del keyframe —OBS lo hace con el que
+     empieza en el mismo milisegundo—, así que, pasado el keyframe, se sigue leyendo hasta que cada
+     una de las demás pistas da un paquete posterior a él: unos pocos paquetes, con un tope de 1 s
+     para una pista que se acabe o tenga un hueco. Todo lo de las demás pistas se retiene hasta entonces y
+     se recorta con el mismo criterio que en MP4: el audio, desde el paquete que suena en el
+     keyframe; otra pista de vídeo, desde su último keyframe no posterior. Lo de la propia pista anterior al
+     keyframe se descarta sin leer su carga. La única diferencia con MP4, donde el índice lleva a
+     cualquier muestra, es la otra pista de vídeo cuyo keyframe queda más atrás del cluster previo:
+     empieza en el siguiente, nunca en un fotograma que no se puede decodificar, y el contrato de
+     `Demuxer.seekTo` lo dice. Si ese keyframe no llega en 10 s de lectura —un bloque dañado—, se
+     deja de retener y se entrega lo leído, para no acumular el resto del archivo en memoria.
+     Esa espera no se corta por tiempo mientras la pista siga dando paquetes, aunque sean
+     anteriores al keyframe: va por detrás en el archivo. Es lo que pasa al intercalar por tiempo
+     de decodificación un vídeo cuyo DTS va segundos por detrás del PTS —la grabación de la tablet
+     de §9.6, pasada a MKV, lleva el audio de cada instante 6,7 s más adelante que su vídeo—, y
+     cortar al segundo hacía empezar el audio hasta 5,6 s antes que la imagen. Por eso el silencio
+     que se le tolera a una pista es un segundo más lo que iba por detrás en su último paquete: al
+     final de esa misma grabación el codificador vacía 1,5 s de fotogramas seguidos, sin audio
+     entre ellos, y no es un hueco del audio. Lo guardado mientras tanto tiene dos topes, diez
+     segundos de lectura y 64 MiB; el segundo cubre un archivo dañado cuyos tiempos dejan de
+     avanzar, que sin él hacía guardar todo lo que quedaba del archivo antes de entregar el primer
+     paquete. Un destino anterior al primer cue se busca igual, desde el primer cluster: leer desde
+     el del primer cue perdía el audio que el muxer había dejado delante. Y en un archivo que empieza en
+     tiempos negativos —Matroska los admite, pero `CueTime` no tiene signo y el muxer guarda el
+     cue del primer keyframe como cero— buscar al principio devolvía cero y entregaba desde el
+     keyframe siguiente; ahora cae en el primero y devuelve su tiempo.
+   - En **los dos**, una pista que ya ha terminado en el instante del keyframe —un micrófono que se
+     cortó antes que el vídeo— no entrega nada. Se colocaba en su último paquete o su último
+     keyframe, y tras buscar salía primero sonido o imagen de segundos antes: el mismo síntoma.
+     En MP4 se sabe sin coste: solo se mira cuando la búsqueda ya llegó a la última muestra de
+     esa pista, y entonces basta recorrer desde su keyframe o su paquete hasta el final. En MKV, que
+     no tiene índice de muestras, se decide con lo leído tras el keyframe: una pista de audio que
+     no da nada en ese segundo y cuyo último paquete dejó de sonar antes, ha terminado o está en un
+     hueco, y en los dos casos no suena nada. En vídeo no se puede decir lo mismo: en Matroska un
+     fotograma se muestra hasta el siguiente, y una captura de pantalla quieta durante segundos no
+     se distingue de una pista acabada hasta llegar al final del archivo. Así que una pista de
+     vídeo se da por terminada solo cuando la lectura llega a ese final; antes, sigue
+     entregándose desde su último keyframe, como hasta ahora.
+
+3. **`concat` compara la cabecera entera.** La salida lleva una sola cabecera por pista, la de la
+   primera entrada, así que cualquier diferencia que viaje en ella llegaba al archivo sin error:
+   otro SPS daba una segunda mitad corrupta, otra rotación una segunda mitad girada. Ahora se
+   comparan también `codecPrivate`, rotación y color en vídeo, y `codecPrivate` y cebado en audio, y
+   el error enumera todas las diferencias, no la primera.
+
+4. **`.webm` ya no se escribe como Matroska.** WebM solo admite VP8, VP9 o AV1 con Vorbis u Opus, y
+   el alcance de códecs de la librería está cerrado en H.264/H.265 con AAC/Opus. Salía un archivo
+   con extensión `.webm`, cabecera `matroska` y códecs que ningún navegador reproduce; ahora la
+   extensión no se deduce y el error lo explica.
+
+5. **Un índice `Cues` roto se avisa.** Se tragaba en silencio, y unas búsquedas de repente lentas no
+   tenían explicación; peor, un `Cues` roto delante de los clusters rechazaba el archivo entero. Ahora
+   el índice se descarta entero —uno a medias podría mandar una búsqueda a un sitio equivocado—, se
+   avisa por `onWarning`, y la búsqueda recorre los clusters.
+
+6. **`SeekableOutput` trunca siempre.** Solo lo hacía el constructor de `File`. Sobre un descriptor
+   abierto en `"rw"` —lo que da `MediaStore`— el contenido anterior quedaba detrás del final, y en
+   Matroska, escrito a prueba de cortes con tamaños desconocidos, se leía como parte del último
+   cluster. Truncar al abrir y no al cerrar mantiene esa garantía también si el proceso muere.
+   De paso, un destino de solo lectura —un `RandomAccessFile` en `"r"`, un `FileChannel` abierto
+   para leer— se rechaza al construir con un mensaje que dice que se abra en `"rw"`: una escritura
+   vacía basta para que Java lo detecte, y antes salía un `NonWritableChannelException` sin
+   mensaje. Un `FileDescriptor` de solo lectura Java no lo distingue, y falla con el error del
+   sistema.
+
+7. **Una sola pista predeterminada por tipo, sin tener que pedirla.** `TrackInfo.default` valía
+   `true` en todas, y con mezcla, micrófono y sistema cada reproductor elegía una. Ahora, sin fijarlo,
+   el muxer marca la primera de cada tipo, salvo que otra lleve `true`; lo resuelven los tres muxers
+   con la misma función, así que el mismo conjunto de pistas sale igual en MKV y en MP4.
+
+8. **En fMP4, una pista que arranca tarde o se pausa se decodifica desde donde suena.**
+   `FragmentedMp4Muxer` empezaba el tiempo de decodificación de todas las pistas en cero, y lo que
+   tardaba una en arrancar —un micrófono que entra medio segundo después que la pantalla— iba en
+   sus desfases de composición. La presentación salía bien, pero el audio quedaba con el DTS medio segundo por
+   detrás del PTS, cuando en audio son iguales. La búsqueda, que coloca el audio por DTS, lo dejaba
+   medio segundo tarde —tras buscar, empezaba en 1,48 s en vez de en el paquete de 0,99 s que
+   sonaba—, y la duración del fMP4 se quedaba corta frente a la del MP4 plano con el mismo
+   contenido (4,000 s frente a 4,033 s), igual que el segmento de su lista de edición si llevaba
+   cebado. Lo mismo pasaba a mitad de pista: cada fragmento seguía donde acabó el anterior, y la
+   duración del último paquete de un fragmento se estima si el siguiente aún no ha llegado. Tras
+   una pausa del micrófono que cruzara un corte, el audio quedaba con el DTS por detrás del PTS lo
+   que durara la pausa, hasta el final; y con duraciones declaradas que no coinciden con los
+   huecos reales —el vídeo de frecuencia variable de OBS—, el desfase se iba acumulando: 7 ms en
+   85 s, que el fMP4 declaraba de menos. Ahora cada fragmento se decodifica, como mínimo, desde su
+   primer instante presentado, como queda en MP4 plano, y los dos dan los mismos tiempos y la misma
+   duración. Los fMP4 ya escritos con un arranque tardío se siguen buscando bien: el demuxer mide en
+   la primera muestra cuánto va la presentación de cada pista por delante de su decodificación
+   —cero en audio, salvo en esos archivos— y lo descuenta al buscar. Una pausa a mitad de pista en
+   un archivo antiguo no se puede descontar así, y se sigue buscando tarde desde ella; pasarlo por
+   `remux` lo reescribe bien. Un efecto que se ve en FFmpeg: si el que arranca tarde es un
+   vídeo con B-frames, con desfases firmados FFmpeg lo retrasa uno o dos fotogramas, como a
+   cualquier vídeo así y a sus propios fMP4 (§10.3); antes el desfase del arranque, positivo, lo
+   tapaba. `nonNegativeCompositionOffsets` lo resuelve como en los demás casos.
+
+9. **La fachada no vacía la salida que no va a escribir.** `remux` y `concat` abrían el destino —lo
+   que lo trunca— antes de comprobar las entradas, y una llamada que no podía salir bien
+   —segmentos incompatibles, un `trackFilter` que no deja ninguna pista, un vídeo sin
+   `codecPrivate`— dejaba en 0 bytes el archivo que ya había. Esas comprobaciones, que hacía
+   `Remuxer` con el muxer ya abierto, están ahora en dos funciones que la fachada llama antes de
+   abrir el destino; la excepción es la misma.
+
+### 10.2 Una API que ya no se rompe al crecer
+
+Kotlin compila los parámetros con valor por defecto y las `data class` a firmas JVM que **cambian con
+cada parámetro o campo nuevo**, y eso es lo que había obligado a remiendos: una función de fábrica
+aparte para el fMP4 con límites, propiedades mutables que había que asignar antes de `start()`, y
+código muerto que se mantenía para no quitar líneas del volcado. Lo que cambia:
+
+- **`MuxerOptions`.** Todas las opciones de escritura en una clase con propiedades `var`, que los
+  muxers y la fachada reciben como bloque (`MuxerOptions.() -> Unit`). Una propiedad nueva añade dos
+  métodos y no cambia ninguna firma. Las opciones se validan **antes** de abrir el archivo, y con un
+  destino ya abierto se cierra si no valen. Cada muxer usa las de su formato e ignora las demás, para
+  que el mismo bloque sirva aunque sea la extensión la que decide. La excepción es `fragmented`, que
+  no es una opción del formato sino la elección del muxer: la fachada la usa para elegir, y
+  `Mp4Muxer` la rechaza, porque ignorarla daría un MP4 plano a quien pidió uno a prueba de cortes.
+- **El modelo con bloque.** `TrackInfo.Video`, `TrackInfo.Audio` y `ColorInfo` se construyen con
+  los datos obligatorios y un bloque, y `copy` recibe otro. `HdrStaticInfo` sigue siendo
+  `data class`: sus doce campos son los de SMPTE ST 2086 y CTA-861.3, que no van a crecer, y lo
+  que se añada a HDR irá en `ColorInfo`. En `copy`, unas dimensiones de presentación iguales a las
+  codificadas siguen a estas si cambian; unas distintas —un vídeo anamórfico— se conservan.
+- **`MediaPacket.isKeyFrame` obligatorio.** Su valor por defecto, `false`, es lo que hizo que la
+  2.x escribiera audio sin un solo punto de acceso y lo que haría que un keyframe olvidado pasara
+  sin error.
+- **`MkvKotlin` pasa a llamarse `Kotmpeg`**, sin alias: un alias sería otra cosa que retirar en la
+  siguiente mayor.
+- **Nombres que decían otra cosa**: `readBits`/`writeBits` contaban bytes y pasan a
+  `readUInt`/`writeUInt`.
+- **Fuera de la API lo que nunca fue API.** Kotlin emite como públicas en el bytecode las clases
+  `internal`, y `PublicApiTest` las congelaba como si fueran API: cualquier refactor interno era un
+  cambio de API. Ahora el test pregunta la visibilidad a los metadatos de Kotlin con
+  `kotlin-reflect` —solo en los tests, no llega al artefacto— y las deja fuera. Con eso se hicieron
+  `internal` las piezas de bajo nivel (`EbmlReader`, `EbmlWriter`, `EbmlElement`, `MatroskaIds`,
+  `BoxBuilder`, `HevcSpsInfo`, `BitReader`), `private` las constantes de los compañeros de los
+  muxers, `internal` los constructores de `AacConfig.Parsed` y `OpusConfig.Parsed`, y se quitó el
+  código muerto de `SampleTable` que pedía §9.8. `public-api.txt` pasa de 693 líneas a 451, y lo que
+  queda es lo que un usuario escribe o lo que llama su código compilado.
+- **El volcado ve los constructores puente.** Con las opciones como último parámetro de los
+  constructores y `= {}` por defecto, lo que llama el código compilado contra `Mp4Muxer(file)`, sin
+  bloque, no es el constructor de dos parámetros sino uno sintético que termina en
+  `DefaultConstructorMarker`, y el test dejaba fuera todo lo sintético: quitar el `= {}` habría sido
+  una ruptura binaria sin que el volcado se moviera. Ahora los reconoce por su forma —los parámetros del original, una máscara
+  `int` por cada 32 y el marcador, lo que los distingue de los de acceso a un constructor privado—
+  y los incluye, como ya hacía con los métodos `$default`. Son dieciséis líneas del volcado.
+
+### 10.3 Lo nuevo
+
+- **Inicio rápido sobre un `SeekableOutput`.** Sin ruta no hay temporal, así que el `moov` se inserta
+  delante desplazando los datos en el sitio, de atrás hacia delante en bloques de 1 MiB. El resultado
+  es el mismo archivo, byte a byte, que por ruta; lo que no tiene es la red de seguridad del
+  temporal, y el KDoc y el README lo dicen. Para leer lo ya escrito sobre un descriptor —cuyo canal
+  de `FileOutputStream` solo escribe— se abre un canal de lectura sobre el mismo descriptor, una
+  sola vez, que se cierra con la salida: abandonado, Android lo denuncia como recurso perdido. Si el
+  descriptor no admite lectura —el `"w"` que `ContentResolver` da por defecto—, el muxer lo rechaza
+  al construirse con un error que dice cómo abrirlo. La primera versión lo descubría al desplazar,
+  en `stop()`, con la grabación entera escrita y sin `moov` en ninguna parte.
+- **Desfases de composición sin signo en fMP4** (`nonNegativeCompositionOffsets`). Cierra la
+  observación de §9.6: FFmpeg retrasa la pista de vídeo de un fMP4 lo que mida su mayor desfase
+  negativo. Con la opción, el `trun` va en versión 0 con desfases desplazados lo que adelante el
+  primer fragmento, y una lista de edición lo compensa. Como ese desfase no se conoce hasta el primer
+  fragmento, la cabecera se escribe con él, igual que `-movflags delay_moov`. Si un fragmento
+  posterior necesitara más —vídeo de frecuencia variable que se espacia—, se adelanta lo justo el
+  tiempo de decodificación de las muestras que se pasarían, con el criterio de
+  `boundReorderOffsets`, sin mover la primera muestra ni el tramo del fragmento. Medido con FFmpeg
+  sobre x264 con B-frames: con desfases firmados el vídeo se lee desplazado; sin signo, cada
+  fotograma donde se escribió, al tic de 90 kHz. El desplazamiento se aplica igual en todo lo que da
+  tiempos de composición —`trun`, `tfra` y, con `segmentIndex`, `sidx`—; sin él en el `sidx`, cada
+  segmento se anunciaba un fotograma antes de lo que empieza.
+- **`writingApp` también en MP4.** Solo llegaba al `WritingApp` de Matroska. Ahora va además en la
+  etiqueta `©too` del `moov` (`udta` > `meta` con su `hdlr` `mdir` > `ilst`), en UTF-8, que es donde
+  la escribe FFmpeg y lo que `ffprobe` muestra como `encoder`, tanto en MP4 plano como en fMP4.
+  Vacía, no se escribe nada. En MKV `ffprobe` no la muestra —su `encoder` sale de las `Tags`—, pero
+  sí `mkvinfo` y MediaInfo, que leen `WritingApp`.
+- `Kotmpeg.detectFormat(SeekableInput)` público, y `initSegmentSize` en cada `Mp4Segment`.
+
+### 10.4 Decisiones cerradas
+
+Tres puntos se cierran **sin cambio**, y conviene dejar escrito por qué:
+
+- **El suelo de Kotlin no sube.** La librería compila con Kotlin 2.2 pero en nivel de lenguaje y de
+  API 2.0, declara `kotlin-stdlib` 2.0.21, y el CI compila y ejecuta con Kotlin 1.9 un consumidor
+  contra cada artefacto. Subirlo no corrige nada y dejaría fuera a las apps que aún no han migrado
+  a Kotlin 2; se reconsiderará el día que la API pública necesite algo que 2.0 no tenga.
+- **`seekTo` en fMP4 se queda como está.** Cuesta decenas de microsegundos porque vuelve a recorrer
+  el fragmento de destino desde su punto de control. Guardar en cada punto el DTS de cada muestra
+  lo bajaría, a cambio de memoria que ahora no se gasta, y una búsqueda va seguida de leer datos de
+  vídeo, que cuesta milisegundos. Los benchmarks lo vigilan por memoria, que es lo que no depende de
+  la máquina.
+
+  En MP4 plano, en cambio, sí había algo que corregir, y lo había introducido la propia 4.0.0: para
+  colocar el audio por tiempo de presentación (§10.1) se buscaba la primera muestra posterior al
+  instante y se retrocedía una, y retroceder en un MP4 plano obliga a volver al punto de control y
+  recorrer hasta 255 muestras. Medido contra la 3.1.0 en la misma máquina y sesión, `seekTo` había
+  pasado de 27,5 a 37,5 µs. Ahora el cursor dice el DTS de la siguiente muestra sin moverse
+  (`knowsNextDts` y `nextDtsUs`) y la búsqueda se para antes de pasarse. En la revisión de cierre,
+  medido de nuevo contra la 3.1.0 en dos tandas de la misma sesión, `seekTo` tarda lo mismo (17,1
+  y 14,7 µs en una; 29,0 y 29,6 µs en otra) y buscar y leer el primer paquete es más rápido —de 97
+  a 52 µs, y de 138 a 123 µs— y reserva un tercio de memoria, 160 bytes frente a 460. Los tiempos
+  absolutos cambian con la carga de la máquina; por eso solo se comparan dentro de una sesión.
+
+  En fMP4, en cambio, ese mismo cambio había doblado la memoria: cada búsqueda reservaba el doble
+  que en la 3.1.0, 13,5 KB frente a 7,0 KB, dentro de su límite pero sin motivo. Los fragmentos se
+  cortan en los keyframes, así que el paquete de audio que suena en uno es casi siempre el último
+  del fragmento anterior. La búsqueda llegaba al final de ese fragmento, cargaba el siguiente para
+  ver que se pasaba y retrocedía una muestra; y el cursor, que solo guardaba un fragmento, tenía
+  que volver a su punto de control y parsear otra vez hasta tres. Ahora guarda también el
+  anterior, y el DTS de la muestra siguiente se pregunta con dos miembros primitivos en vez de un
+  `Long?`, que reservaba un objeto en cada paso: 6,2 KB por búsqueda, por debajo de la 3.1.0. Su
+  límite en `limites.properties` baja de 32 KB a 10 KB, de modo que esa regresión —13,5 a 15,1 KB
+  según la tanda— ya no pasa.
+- **El cebado del segundo segmento se queda dentro en `concat`.** Quitarlo exigiría decodificar y
+  recodificar el principio de cada segmento, y `concat` no recodifica. Tampoco hace falta para la
+  sincronía: cada segmento se desplaza según el final real del audio anterior, así que su cebado
+  ocupa los ~21 ms de la unión y su primer fotograma y su primer sonido útil siguen alineados, como
+  en el original. Lo único perceptible es ese silencio de la unión. El KDoc de `concat` lo explica, y
+  un test lo fija en MP4 y MKV.
+
+### 10.5 Gradle 9
+
+El build pasa de Gradle 8.14.5 a **9.8.1**. Hizo falta poco: cambiar la configuración de la firma
+de Android de `by configurations.creating` a `configurations.create(...)`, obsoleto desde la 9.6, y
+subir el resolvedor de toolchains a la 1.0.0, porque la 0.8.0 usa una constante que Gradle 9 quitó
+y fallaría el día que tuviera que descargar un JDK. Queda un único aviso de obsolescencia,
+`Configuration.setVisible`, que viene del plugin de Kotlin 2.2.10 —el compilador se fija ahí a
+propósito, ver el §10.4— y que Gradle no retira hasta la 11. `compat/kotlin-1.9` sigue con su propio
+wrapper en Gradle 8, porque el plugin de Kotlin 1.9 no funciona con Gradle 9.
+
+### 10.6 Cómo se verificó
+
+- **Suite completa: 275 tests**, sin fallos ni omitidos, incluida la integración con FFmpeg real,
+  lanzando Gradle con JDK 21 y otra vez con JDK 17, como el CI.
+- **Cada corrección con su test**, escrito para fallar con el comportamiento anterior: el cebado en los
+  tres contenedores, la búsqueda por tiempo de presentación, la búsqueda en MKV con y sin índice
+  (también sobre un MKV de FFmpeg con keyframes a mitad de cluster), con el audio que suena en el
+  keyframe escrito antes o detrás de él y con una segunda pista de vídeo, la búsqueda pasado el
+  final de una pista en MP4, fMP4 y MKV, los errores de `concat` y su sincronía, el rechazo de
+  `.webm` y el de `fragmented` en `Mp4Muxer`, el aviso del índice roto, el truncado de
+  `SeekableOutput`, la pista predeterminada, el rechazo de un destino que no se puede leer para el
+  inicio rápido en el sitio, y que el `sidx` y el `tfra` coinciden con desfases sin signo. Los dos últimos de la búsqueda se comprobaron
+  además contra el código anterior, donde fallan: con el audio escrito detrás del keyframe
+  empezaba 48 ms antes, y tras buscar pasado el final de una cámara salía primero su keyframe de
+  3,2 s antes. Los dos últimos, también: el destino de solo escritura se aceptaba y fallaba al
+  cerrar, y el `sidx` sin signo iba 3000 tics —un fotograma a 90 kHz— por detrás del `tfra`.
+- **Lo nuevo contra referencias**: el inicio rápido sobre un descriptor da el mismo archivo, byte a
+  byte, que por ruta, también sobre un archivo que ya tenía datos; con FFmpeg, los desfases con
+  signo dejan el vídeo de un fMP4 desplazado y sin signo cada fotograma en su sitio; y `writingApp`
+  es el `encoder` que muestra `ffprobe` en MP4 y fMP4, también con texto no ASCII.
+- **Las tres grabaciones reales de §9.6**, repetidas con la 4.0.0:
+  - los paquetes que lee la librería son, pista a pista, los de `ffprobe` (MD5 de cada uno);
+  - cada una pasada a MKV, MP4, MP4 con inicio rápido por ruta y por descriptor, fMP4 con `sidx`,
+    fMP4 sin signo y MKV → MP4 decodifica en FFmpeg **exactamente** los mismos fotogramas de vídeo y
+    de audio que el original (MD5 de cada fotograma decodificado), 21 salidas;
+  - FFmpeg pone el vídeo del fMP4 firmado 34 ms (OBS) y 49 ms (tablet) por detrás; el sin signo, en
+    su sitio;
+  - `seekTo` en tres puntos de cada una cae en un keyframe y el audio empieza entre 0 y 23 ms antes
+    de él —el paquete que suena en ese instante—. En la grabación de la tablet empezaba 6,7 s antes;
+  - la única salida de FFmpeg al decodificarlas son los avisos de DTS no monótono que ya da el
+    original, en el mismo número.
+
+  Tras los últimos cambios —la etiqueta `©too` y la búsqueda en MKV— se repitió lo que tocan: la
+  búsqueda en tres puntos de cada grabación, y el `encoder` de cada una pasada a MP4 y fMP4, que
+  es el `writingApp` pedido. En el MKV de OBS el resultado cambió: OBS escribe el paquete de audio
+  del mismo milisegundo detrás del keyframe, y con la lectura desde el cluster anterior las dos
+  pistas de audio empezaban un paquete antes, 22 ms; ahora empiezan en el del instante del
+  keyframe, como en MP4. Ese caso es el que llevó a seguir leyendo tras el keyframe (§10.1). En los
+  MP4, el audio empieza entre 1 y 20 ms antes del keyframe, el paquete que suena en él. Con la
+  regla de las pistas ya terminadas se añadió una búsqueda justo antes del final de cada
+  grabación y otra pasado el final: en las tres, todas las pistas llegan hasta el final, y las dos
+  caen en el último keyframe con el audio en el paquete que suena, como debe ser.
+- **Fuzzing con semilla nueva** (20261014): 1 025 811 variantes en cinco minutos, ninguna falla, y la
+  mayor reserva fue de 2,6 MiB. El fuzzer llama a `seekTo`, así que recorre también la búsqueda
+  nueva de MKV. Tras los últimos cambios de la búsqueda, dos pasadas más de dos minutos con
+  semillas nuevas (40000015 y 40000016): 476 955 y 435 980 variantes, ninguna falla, y una reserva
+  máxima de 3,6 MiB. Tras la revisión de cierre, otra de dos minutos (40000017): 799 447
+  variantes, ninguna falla, y 3,8 MiB de reserva máxima.
+- **Benchmarks** con `verificarLimites`: los once dentro de su límite de memoria.
+- **El consumidor con Kotlin 1.9** contra el artefacto 4.0.0 publicado en el Maven local, y
+  `AndroidApiCompatibilityTest` contra la API 26 de Android, que encontró dos llamadas nuevas que no
+  existen allí antes de publicar.
+- **`seekTo` medido contra la 3.1.0** en la misma máquina y sesión, con su código extraído del tag
+  (§10.4): en MP4 plano y en fMP4 tarda lo mismo; buscar y leer el primer paquete es más rápido y
+  reserva un tercio de memoria; y en fMP4 cada búsqueda reserva 6,2 KB frente a 7,0 KB —7,4 KB en
+  el peor de cinco forks de JMH, lejos de su límite nuevo de 10 KB—. La memoria de las búsquedas en
+  MP4 plano varía de un fork a otro, entre 0 y unos 110 bytes, según lo que el JIT consiga eliminar
+  —un iterador, un `ByteBuffer`—, y lo mismo en la 3.1.0: con tres forks, 72 bytes de media en las
+  dos, muy por debajo de su límite.
+- **La compilación de JitPack, simulada en local**: sin `build/` ni `.gradle/`, con JDK 17 como
+  `JAVA_HOME` y el mismo `publishToMavenLocal` sin tests que lanza JitPack, sobre Gradle 9.8.1.
+- `public-api.txt` frente al de la 3.1.0: de 693 líneas a 451, con todo lo que sale explicado en el
+  CHANGELOG.
+- **La revisión de cierre**, sobre la librería entera y no solo sobre lo que cambió desde la 3.1.0:
+  - el mismo contenido escrito en MKV, MP4 y fMP4 —firmado y sin signo— se relee con los mismos
+    tiempos y la misma duración, y se busca igual: así salieron la pista tardía y la pausa (§10.1);
+  - nueve tipos de destino —`File`, `RandomAccessFile`, `FileChannel` y `FileDescriptor`, en
+    lectura y escritura, solo escritura o solo lectura según los admite cada uno— con los cuatro
+    muxers: lo que se puede escribir sale igual, y lo que no se rechaza al construir con un
+    mensaje que dice qué hacer, sin dejar canales abiertos;
+  - un disco lleno a mitad de grabación: MKV y fMP4 quedan legibles hasta el fallo, el MP4 plano
+    no —su índice va al final—, y cerrar repite el error en vez de tragárselo;
+  - los cuatro tipos de origen dan los mismos paquetes y se cierran;
+  - 64 combinaciones de `MuxerOptions`, más los extremos, sobre H.264 y AAC reales de x264:
+    todas decodifican en FFmpeg sin errores, y las imposibles no crean el archivo;
+  - archivos de terceros hechos con FFmpeg —recortados con `-ss`, con `negative_cts_offsets`,
+    fMP4, MKV con Opus, audio que arranca tarde en MKV y en MP4—: el MD5 de cada paquete es el de
+    `ffprobe`, sus tiempos difieren en un desplazamiento constante —el cebado— y se buscan bien;
+    `ffprobe` en modo detallado no da ningún aviso de contenedor sobre 30 salidas;
+  - las tres grabaciones reales, pasadas a MKV, MP4, MP4 con inicio rápido, fMP4 firmado, sin
+    signo y con `sidx`: los mismos paquetes, la misma duración, 105 búsquedas que caen donde deben
+    —lo que destapó el audio retrasado del MKV de la tablet— y una decodificación sin errores. Los
+    únicos mensajes de FFmpeg son los avisos de DTS de su muxer `null`, que da igual con los
+    originales;
+  - cada corrección nueva con un test que falla sin ella, comprobado deshaciéndola; la de memoria
+    de fMP4, con `verificarLimites`, que sin ella da 15 147 bytes por búsqueda con un límite de
+    10 240.
+
+### 10.7 Lo que queda
+
+Nada de la lista de la 4.0.0, ni de lo que salió al repasarla antes de cerrarla: `Mp4Muxer`
+ignoraba `fragmented`, `writingApp` no llegaba a MP4, el volcado de API no veía los constructores
+puente, la búsqueda en MKV dejaba el audio a unos milisegundos del paquete que suena en el
+keyframe, una pista ya terminada se seguía entregando tras buscar pasado su final, y la propia
+búsqueda por tiempo de presentación había hecho más lento `seekTo` en MP4 plano. Una revisión
+final de todo lo que cambió desde la 3.1.0 encontró dos más en lo nuevo: el inicio rápido sobre un
+descriptor de solo escritura fallaba al cerrar, con la grabación sin índice, y el `sidx` con
+desfases sin signo no llevaba su desplazamiento. Una revisión de cierre, sobre la librería entera
+y no solo sobre lo que cambió, encontró siete más: un `remux` o `concat` rechazado dejaba vacía la
+salida que ya existía; en fMP4, una pista que arrancaba tarde o se pausaba en un corte de
+fragmento quedaba con el DTS por detrás del PTS y se buscaba tarde; en MKV, buscar antes del primer
+cue perdía el audio que sonaba, y en un archivo con tiempos negativos devolvía cero; en MKV, el
+audio escrito segundos por detrás de su vídeo empezaba esos segundos antes tras buscar —lo
+encontraron las grabaciones reales—; lo que retenía esa búsqueda no tenía tope si los tiempos
+dejaban de avanzar; un destino de solo lectura fallaba sin mensaje; y en fMP4 cada búsqueda
+reservaba el doble de memoria que en la 3.1.0. Todo está corregido arriba, y el cebado del segundo
+segmento de `concat`, explicado y fijado con un test (§10.4).
+
+Las observaciones de §9.6 que eran comportamiento de la librería —el audio adelantado tras buscar
+en la tablet y el vídeo retrasado del fMP4 en FFmpeg— están resueltas en §10.1 y §10.3; las que son
+de FFmpeg —el idioma «eng» por el código 0 de Android y los avisos de DTS del vídeo variable— no
+dependen de la librería.
+
+Lo que sigue fuera es a propósito o no depende de la librería:
+
+- el índice `sidx` único al principio, por lo que explica §9.5;
+- en MKV, el audio que el muxer escribió más de diez segundos —o 64 MiB— por detrás de su vídeo:
+  la búsqueda deja de esperarlo y empieza antes del keyframe. Esperar más es guardar más en
+  memoria en cada búsqueda, y el caso real más extremo visto, el de la tablet, va 6,7 s por detrás;
+- en un fMP4 escrito por una versión anterior, una pausa del audio en un corte de fragmento: se
+  sigue buscando tarde desde ella, y `remux` lo arregla (§10.1);
+- en MKV, saber que una pista de vídeo ha terminado antes que el archivo lejos de su final:
+  Matroska no lo dice, y la alternativa —leer hasta el final en cada búsqueda— costaría más que
+  entregar un GOP de esa pista (§10.1);
+- el aviso de obsolescencia del plugin de Kotlin 2.2.10 (§10.5), que no afecta hasta Gradle 11 y
+  se irá con el plugin cuando se suba el compilador;
+- en MP4 plano, el hueco inicial de una pista que arranca después que las demás se escribe al
+  milisegundo, porque la escala de la película es 1000, como la que escribe FFmpeg: su primera
+  muestra se lee hasta medio milisegundo desplazada (0,33 ms en la revisión). El KDoc de la
+  constante lo dice;
+- Matroska guarda los tiempos negativos tal cual y MP4 los lleva a cero, por lo que el mismo
+  contenido puede leerse con un desplazamiento constante distinto en cada contenedor; es lo que
+  explica el KDoc de `MkvMuxer`, y la diferencia entre paquetes es la misma;
+- FFmpeg calcula la duración de un fMP4 con `sidx` sin descontar la lista de edición —6,033 s
+  donde son 6,0—, y con los suyos igual: 6,067 s en uno de 6 s escrito con `-movflags dash`;
+- que JitPack compile el tag con Gradle 9.8.1 solo se puede ver al publicarlo; en local se simuló
+  su build exacto (§10.6).

@@ -31,16 +31,16 @@ class Mp4HeaderHardeningTest {
     private fun mp4WithEditList(): File {
         val file = File(dir, "elst.mp4")
         Mp4Muxer(file).use { muxer ->
-            val track = TrackInfo.Audio(
-                codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2,
-                codecPrivate = AacConfig.build(48000, 2), codecDelayUs = 21_333,
-            )
+            val track = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+                codecPrivate = AacConfig.build(48000, 2)
+                codecDelayUs = 21_333
+            }
             val first = muxer.addTrack(track)
             val late = muxer.addTrack(track)
             muxer.start()
             for (i in 0 until 50) {
-                muxer.writePacket(MediaPacket(first, ByteArray(20), ptsUs = i * 21_333L))
-                muxer.writePacket(MediaPacket(late, ByteArray(20), ptsUs = 200_000 + i * 21_333L))
+                muxer.writePacket(MediaPacket(first, ByteArray(20), ptsUs = i * 21_333L, isKeyFrame = false))
+                muxer.writePacket(MediaPacket(late, ByteArray(20), ptsUs = 200_000 + i * 21_333L, isKeyFrame = false))
             }
         }
         return file
@@ -54,7 +54,7 @@ class Mp4HeaderHardeningTest {
         error("no se encontró $type")
     }
 
-    private fun packetsOf(file: File): Int = MkvKotlin.openDemuxer(file).use { demuxer ->
+    private fun packetsOf(file: File): Int = Kotmpeg.openDemuxer(file).use { demuxer ->
         assertEquals(2, demuxer.tracks.size, "se descartó alguna pista")
         generateSequence { demuxer.readPacket() }.count()
     }

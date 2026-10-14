@@ -97,16 +97,17 @@ class RecordingAudioLayoutsTest {
     /** Escribe el montaje con vídeo de pantalla y devuelve los paquetes escritos por nombre de pista. */
     private fun record(file: File, format: ContainerFormat, fragmented: Boolean, layout: Layout): Map<String, List<ByteArray>> {
         val written = LinkedHashMap<String, MutableList<ByteArray>>()
-        MkvKotlin.createMuxer(file, format, mp4Fragmented = fragmented).use { muxer ->
+        Kotmpeg.createMuxer(file, format) { this.fragmented = fragmented }.use { muxer ->
             val video = muxer.addTrack(
-                TrackInfo.Video(codec = VideoCodec.H264, width = 1080, height = 2400, frameRate = 30.0, codecPrivate = avcC, name = "Pantalla"),
+                TrackInfo.Video(codec = VideoCodec.H264, width = 1080, height = 2400) { frameRate = 30.0; codecPrivate = avcC; name = "Pantalla" },
             )
             val audioIds = layout.audioTracks.mapIndexed { index, name ->
                 name to muxer.addTrack(
-                    TrackInfo.Audio(
-                        codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2,
-                        codecPrivate = AacConfig.build(48_000, 2), name = name, default = index == 0,
-                    ),
+                    TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2) {
+                        codecPrivate = AacConfig.build(48_000, 2)
+                        this.name = name
+                        default = index == 0
+                    },
                 )
             }
             muxer.start()
@@ -122,7 +123,7 @@ class RecordingAudioLayoutsTest {
                     for ((trackNumber, entry) in audioIds.withIndex()) {
                         val (name, id) = entry
                         val aac = ByteArray(24) { (audioIndex * 7 + trackNumber * 31 + it).toByte() }
-                        muxer.writePacket(MediaPacket(id, aac, ptsUs = audioIndex * 21_333L))
+                        muxer.writePacket(MediaPacket(id, aac, ptsUs = audioIndex * 21_333L, isKeyFrame = false))
                         written.getValue(name) += aac
                     }
                     audioIndex++
@@ -133,11 +134,11 @@ class RecordingAudioLayoutsTest {
     }
 
     private fun assertLayout(file: File, layout: Layout, expected: Map<String, List<ByteArray>>) {
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             val audio = demuxer.tracks.filterIsInstance<TrackInfo.Audio>()
             assertEquals(layout.audioTracks, audio.map { it.name }, "${file.name}: pistas de audio")
-            assertEquals(1, audio.count { it.default }, "${file.name}: tiene que haber exactamente una pista de audio predeterminada")
-            assertEquals(layout.audioTracks.first(), audio.first { it.default }.name, "${file.name}: predeterminada equivocada")
+            assertEquals(1, audio.count { it.default == true }, "${file.name}: tiene que haber exactamente una pista de audio predeterminada")
+            assertEquals(layout.audioTracks.first(), audio.first { it.default == true }.name, "${file.name}: predeterminada equivocada")
             val nameById = demuxer.tracks.associate { it.id to it.name }
             val read = LinkedHashMap<String, MutableList<ByteArray>>()
             while (true) {
@@ -174,8 +175,8 @@ class RecordingAudioLayoutsTest {
             val written = record(source, ContainerFormat.MKV, fragmented = false, layout)
             val asMp4 = File(dir, "${layout.name.lowercase()}-medio.mp4")
             val back = File(dir, "${layout.name.lowercase()}-vuelta.mkv")
-            MkvKotlin.remux(source, asMp4)
-            MkvKotlin.remux(asMp4, back)
+            Kotmpeg.remux(source, asMp4)
+            Kotmpeg.remux(asMp4, back)
             assertLayout(asMp4, layout, written)
             assertLayout(back, layout, written)
         }

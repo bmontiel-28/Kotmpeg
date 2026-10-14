@@ -1,4 +1,4 @@
-import com.braymon.kotmpeg.MkvKotlin
+import com.braymon.kotmpeg.Kotmpeg
 import com.braymon.kotmpeg.audio.PcmMixer
 import com.braymon.kotmpeg.audio.PcmResampler
 import com.braymon.kotmpeg.audio.PcmStreamMixer
@@ -45,36 +45,37 @@ fun main() {
     }
 
     val segmentos = ArrayList<Mp4Segment>()
-    val segmentado = FragmentedMp4Muxer(File(directorio, "consumidor-segmentado.mp4")).apply {
+    val segmentado = FragmentedMp4Muxer(File(directorio, "consumidor-segmentado.mp4")) {
         segmentIndex = true
         onSegment = { segmentos += it }
     }
     val salidas = listOf(
-        File(directorio, "consumidor.mkv") to MkvKotlin.createMuxer(File(directorio, "consumidor.mkv")),
-        File(directorio, "consumidor.mp4") to MkvKotlin.createMuxer(File(directorio, "consumidor.mp4")),
-        File(directorio, "consumidor-frag.mp4") to MkvKotlin.createFragmentedMp4Muxer(File(directorio, "consumidor-frag.mp4")),
+        File(directorio, "consumidor.mkv") to Kotmpeg.createMuxer(File(directorio, "consumidor.mkv")),
+        File(directorio, "consumidor.mp4") to Kotmpeg.createMuxer(File(directorio, "consumidor.mp4")),
+        File(directorio, "consumidor-frag.mp4") to Kotmpeg.createMuxer(File(directorio, "consumidor-frag.mp4")) { fragmented = true },
         File(directorio, "consumidor-segmentado.mp4") to segmentado,
     )
     for ((archivo, creado) in salidas) {
-        val muxer = MkvKotlin.synchronizedMuxer(creado)
-        val pantalla = muxer.addTrack(TrackInfo.Video(codec = VideoCodec.H264, width = 1080, height = 2400, codecPrivate = avcC))
+        val muxer = Kotmpeg.synchronizedMuxer(creado)
+        val pantalla = muxer.addTrack(TrackInfo.Video(codec = VideoCodec.H264, width = 1080, height = 2400) { codecPrivate = avcC })
         val pistas = listOf("Mezcla", "Micrófono", "Audio del sistema").mapIndexed { indice, nombre ->
             muxer.addTrack(
-                TrackInfo.Audio(
-                    codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2,
-                    codecPrivate = AacConfig.build(48_000, 2), name = nombre, default = indice == 0,
-                ),
+                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2) {
+                    codecPrivate = AacConfig.build(48_000, 2)
+                    name = nombre
+                    default = indice == 0
+                },
             )
         }
         muxer.start()
         for (fotograma in 0 until 30) {
             val pts = fotograma * 33_333L
             muxer.writePacket(MediaPacket(pantalla, NalUnits.joinLengthPrefixed(listOf(byteArrayOf(0x65, 1))), pts, isKeyFrame = fotograma == 0))
-            for (pista in pistas) muxer.writePacket(MediaPacket(pista, ByteArray(8), pts))
+            for (pista in pistas) muxer.writePacket(MediaPacket(pista, ByteArray(8), pts, isKeyFrame = false))
         }
         muxer.stop()
 
-        MkvKotlin.openDemuxer(archivo).use { lector ->
+        Kotmpeg.openDemuxer(archivo).use { lector ->
             val nombres = lector.tracks.filterIsInstance<TrackInfo.Audio>().map { it.name }
             var paquetes = 0
             while (lector.readPacket() != null) paquetes++
@@ -85,8 +86,8 @@ fun main() {
         }
         println("OK ${archivo.name}")
     }
-    if (segmentos.size != 1 || segmentos[0].offset != segmentado.initSegmentSize) {
-        println("FALLO: segmentos avisados $segmentos, cabecera de ${segmentado.initSegmentSize} bytes")
+    if (segmentos.size != 1 || segmentos[0].offset != segmentos[0].initSegmentSize) {
+        println("FALLO: segmentos avisados $segmentos")
         exitProcess(1)
     }
     println("OK: compilado con Kotlin 1.9; biblioteca estándar en ejecución ${KotlinVersion.CURRENT}")

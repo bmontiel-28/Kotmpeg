@@ -12,7 +12,12 @@ public object OpusConfig {
 
     private val MAGIC = "OpusHead".toByteArray(Charsets.US_ASCII)
 
-    public class Parsed(
+    /**
+     * Los campos de una cabecera `OpusHead`, tal como los devuelve [parseOpusHead]. Solo los crea
+     * ese método: el constructor es interno para que un campo nuevo no cambie ninguna firma
+     * pública.
+     */
+    public class Parsed internal constructor(
         public val channelCount: Int,
         public val preSkip: Int,
         public val inputSampleRate: Int,

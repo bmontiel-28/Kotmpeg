@@ -15,6 +15,7 @@ import java.io.File
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -82,45 +83,53 @@ class SegmentIndexTest {
         )
     }
 
-    private val videoTrack = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 64, height = 48, frameRate = 30.0,
-        codecPrivate = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x1F, 0x11)), listOf(byteArrayOf(0x68, 0x22))),
-    )
-    private val audioTrack = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2),
-    )
+    private val videoTrack = TrackInfo.Video(codec = VideoCodec.H264, width = 64, height = 48) {
+        frameRate = 30.0
+        codecPrivate = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x1F, 0x11)), listOf(byteArrayOf(0x68, 0x22)))
+    }
+    private val audioTrack = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+        codecPrivate = AacConfig.build(48000, 2)
+    }
 
     /**
      * Cuatro segundos de vídeo a 30 fps con B-frames (pts reordenados) y un keyframe por segundo,
      * más AAC que empieza con el primer fotograma: cuatro fragmentos con las dos pistas. La fecha
-     * de creación es fija para que dos escrituras iguales den el mismo archivo.
+     * de creación es fija para que dos escrituras iguales den el mismo archivo. Sin [withDts] los
+     * fotogramas llegan solo con su PTS, como los da `MediaCodec`, y el muxer deriva un DTS con
+     * desfases de composición negativos; con [nonNegative], los escribe sin signo.
      */
     private fun write(
         file: File,
         segmentIndex: Boolean,
         segments: MutableList<Mp4Segment> = ArrayList(),
+        withDts: Boolean = true,
+        nonNegative: Boolean = false,
         onSegment: (Mp4Segment) -> Unit = { segments += it },
     ): FragmentedMp4Muxer {
-        val muxer = FragmentedMp4Muxer(file)
-        muxer.creationTimeMillis = 0
-        muxer.segmentIndex = segmentIndex
-        muxer.onSegment = onSegment
+        val muxer = FragmentedMp4Muxer(file) {
+            creationTimeMillis = 0
+            this.segmentIndex = segmentIndex
+            this.onSegment = onSegment
+            nonNegativeCompositionOffsets = nonNegative
+        }
         val video = muxer.addTrack(videoTrack)
         val audio = muxer.addTrack(audioTrack)
         muxer.start()
         val frame = 33_333L
         val order = intArrayOf(0, 2, 1, 3, 5, 4)
         val packets = ArrayList<MediaPacket>()
+        val decodeUs = HashMap<MediaPacket, Long>()
         for (i in 0 until 120) {
             val shown = (i / 6) * 6 + order[i % 6]
             val payload = NalUnits.joinLengthPrefixed(listOf(byteArrayOf(i.toByte(), 1, 2, 3)))
-            packets += MediaPacket(video, payload, shown * frame + frame, i * frame, i % 30 == 0, frame)
+            val pts = shown * frame + frame
+            packets += MediaPacket(video, payload, pts, if (withDts) i * frame else pts, i % 30 == 0, frame).also { decodeUs[it] = i * frame }
         }
         for (i in 0 until 188) {
             val pts = frame + i * 21_333L
             packets += MediaPacket(audio, byteArrayOf(i.toByte(), 9), pts, pts, true, 21_333)
         }
-        packets.sortedBy { it.dtsUs }.forEach { muxer.writePacket(it) }
+        packets.sortedBy { if (it.trackId == video) decodeUs.getValue(it) else it.dtsUs }.forEach { muxer.writePacket(it) }
         muxer.stop()
         return muxer
     }
@@ -190,7 +199,8 @@ class SegmentIndexTest {
     fun `the index does not change what a reader gets, and tfra still points at each moof`() {
         val plain = File(dir, "normal.mp4")
         val indexed = File(dir, "indexado.mp4")
-        val muxer = write(plain, segmentIndex = false)
+        val segments = ArrayList<Mp4Segment>()
+        write(plain, segmentIndex = false, segments)
         write(indexed, segmentIndex = true)
 
         fun read(file: File) = Mp4Demuxer(file).use { demuxer ->
@@ -198,7 +208,7 @@ class SegmentIndexTest {
         }
         assertEquals(read(plain), read(indexed))
         assertEquals(0, topLevel(plain.readBytes()).count { it.type == "sidx" }, "sin la opción no se escribe ningún sidx")
-        assertTrue(muxer.initSegmentSize > 0)
+        assertTrue(segments.isNotEmpty() && segments.all { it.initSegmentSize == segments[0].offset }, "initSegmentSize: $segments")
 
         val bytes = indexed.readBytes()
         val boxes = topLevel(bytes)
@@ -216,6 +226,29 @@ class SegmentIndexTest {
         }
     }
 
+    /**
+     * El `sidx` y el `tfra` dicen el mismo instante de inicio para cada fragmento de vídeo, que
+     * empieza en un keyframe que es también lo primero que se muestra. Los fotogramas llegan sin
+     * DTS, así que hay desfases de composición negativos, y se prueba con ellos firmados y sin
+     * signo. Sin signo, el `tfra` llevaba el desplazamiento que los hace positivos y el `sidx` no:
+     * anunciaba cada segmento un fotograma antes de lo que empieza.
+     */
+    @Test
+    fun `sidx and tfra agree on when each video fragment starts, with signed and unsigned offsets`() {
+        for (nonNegative in listOf(false, true)) {
+            val file = File(dir, "acuerdo-$nonNegative.mp4")
+            write(file, segmentIndex = true, withDts = false, nonNegative = nonNegative)
+            val bytes = file.readBytes()
+            val tfra = topLevel(bytes).last().offset + 8
+            assertEquals("tfra", String(bytes, tfra + 4, 4, Charsets.ISO_8859_1))
+            assertEquals(1L, u32(bytes, tfra + 12), "el primer tfra tiene que ser el del vídeo")
+            val tfraTimes = (0 until u32(bytes, tfra + 20).toInt()).map { u64(bytes, tfra + 24 + it * 28) }
+            val sidxTimes = sidxBoxes(bytes).filter { it.referenceId == 1L }.map { it.earliestPresentationTime }
+            assertEquals(4, sidxTimes.size)
+            assertEquals(tfraTimes, sidxTimes, if (nonNegative) "desfases sin signo" else "desfases firmados")
+        }
+    }
+
     @Test
     fun `without the index each notified segment starts at its moof`() {
         val file = File(dir, "avisos.mp4")
@@ -225,19 +258,21 @@ class SegmentIndexTest {
         assertEquals(boxes.filter { it.type == "moof" }.map { it.offset.toLong() }, segments.map { it.offset })
     }
 
+    /**
+     * Con el índice, un fragmento no puede pasar de lo que el `sidx` describe en 31 bits. Hasta la
+     * 3.x se comprobaba en `start()`, con el archivo ya creado; ahora se rechaza al construir el
+     * muxer, antes de abrir nada.
+     */
     @Test
-    fun `the index is configured before start and keeps fragments within what sidx can describe`() {
-        val muxer = FragmentedMp4Muxer(File(dir, "tarde.mp4"))
-        muxer.addTrack(audioTrack)
-        muxer.start()
-        assertFailsWith<IllegalStateException> { muxer.segmentIndex = true }
-        muxer.stop()
-
-        val huge = FragmentedMp4Muxer(File(dir, "enorme.mp4"), 2_000_000, 10_000_000, 2L shl 30)
-        huge.segmentIndex = true
-        huge.addTrack(audioTrack)
-        assertFailsWith<IllegalStateException> { huge.start() }
-        huge.close()
+    fun `the index keeps fragments within what sidx can describe`() {
+        val target = File(dir, "enorme.mp4")
+        assertFailsWith<IllegalArgumentException> {
+            FragmentedMp4Muxer(target) {
+                segmentIndex = true
+                maxFragmentBytes = 2L shl 30
+            }
+        }
+        assertFalse(target.exists(), "se creó el archivo antes de rechazar las opciones")
     }
 
     /**
@@ -265,9 +300,10 @@ class SegmentIndexTest {
     fun `a fragment that starts before the timeline origin is indexed from zero`() {
         val file = File(dir, "antes-del-origen.mp4")
         val segments = ArrayList<Mp4Segment>()
-        val muxer = FragmentedMp4Muxer(file)
-        muxer.segmentIndex = true
-        muxer.onSegment = { segments += it }
+        val muxer = FragmentedMp4Muxer(file) {
+            segmentIndex = true
+            onSegment = { segments += it }
+        }
         val video = muxer.addTrack(videoTrack)
         muxer.start()
         val frame = 33_333L

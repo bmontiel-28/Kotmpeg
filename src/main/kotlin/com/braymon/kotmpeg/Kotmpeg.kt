@@ -18,50 +18,46 @@ import java.io.File
  *
  * ```kotlin
  * // Escribir un archivo
- * val muxer = MkvKotlin.createMuxer(File("out.mkv"))
- * val videoId = muxer.addTrack(TrackInfo.Video(codec = VideoCodec.H264, width = 1920, height = 1080, codecPrivate = avcC))
- * muxer.start()
- * muxer.writePacket(MediaPacket(videoId, frameBytes, ptsUs = 0, isKeyFrame = true))
- * muxer.stop()
+ * Kotmpeg.createMuxer(File("out.mkv")).use { muxer ->
+ *     val videoId = muxer.addTrack(TrackInfo.Video(VideoCodec.H264, 1920, 1080) { codecPrivate = avcC })
+ *     muxer.start()
+ *     muxer.writePacket(MediaPacket(videoId, frameBytes, ptsUs = 0, isKeyFrame = true))
+ * }
  *
  * // Leer un archivo
- * val demuxer = MkvKotlin.openDemuxer(File("in.mp4"))
- * while (true) { val p = demuxer.readPacket() ?: break }
+ * Kotmpeg.openDemuxer(File("in.mp4")).use { demuxer ->
+ *     while (true) { val p = demuxer.readPacket() ?: break }
+ * }
  *
  * // Reempaquetar sin recodificar (ffmpeg -c copy)
- * MkvKotlin.remux(File("in.mp4"), File("out.mkv"))
+ * Kotmpeg.remux(File("in.mp4"), File("out.mkv"))
  * ```
+ *
+ * Hasta la 3.x se llamaba `MkvKotlin`, un nombre de cuando la librería solo escribía Matroska.
  */
-public object MkvKotlin {
+public object Kotmpeg {
 
     /**
-     * Crea un muxer para [file]; el formato se infiere de la extensión salvo que se pase [format].
+     * Crea un muxer para [file]; el formato se deduce de la extensión salvo que se pase [format].
      *
-     * Opciones MP4 (ignoradas para MKV, mutuamente excluyentes):
-     *  - [mp4FastStart]: recoloca el `moov` antes de los datos al finalizar
-     *    (`-movflags +faststart` de FFmpeg), para reproducción progresiva/en red.
-     *  - [mp4Fragmented]: escribe MP4 fragmentado — fMP4/CMAF, el
-     *    `-movflags frag_keyframe+empty_moov` de FFmpeg. Salida solo-añadir: grabación a
-     *    prueba de cortes y streaming en vivo (empaquetado HLS/DASH). Un fragmento por GOP
-     *    de vídeo, o por [mp4FragmentDurationUs] en archivos solo-audio.
+     * [options] configura el muxer (ver [MuxerOptions]); las opciones de un formato se ignoran en
+     * los demás, así que el mismo bloque sirve aunque la extensión decida el contenedor. Con MP4,
+     * `fragmented` elige el MP4 fragmentado.
+     *
+     * `.webm` no se deduce: WebM no admite los códecs que escribe esta librería, y el error lo
+     * explica.
      */
     public fun createMuxer(
         file: File,
         format: ContainerFormat? = null,
-        mp4FastStart: Boolean = false,
-        mp4Fragmented: Boolean = false,
-        mp4FragmentDurationUs: Long = 2_000_000,
+        options: MuxerOptions.() -> Unit = {},
     ): Muxer {
-        require(!(mp4FastStart && mp4Fragmented)) {
-            "mp4FastStart y mp4Fragmented son excluyentes (el fMP4 no necesita faststart: su cabecera ya va delante)"
-        }
-        val fmt = format ?: ContainerFormat.fromFileName(file.name)
-            ?: throw IllegalArgumentException("no se puede inferir el formato de ${file.name}")
+        val fmt = format ?: ContainerFormat.fromFileName(file.name) ?: throw IllegalArgumentException(unknownExtension(file.name))
+        val validated = MuxerOptions().apply(options).validated()
         return when (fmt) {
-            ContainerFormat.MKV -> MkvMuxer(file)
+            ContainerFormat.MKV -> MkvMuxer(validated, file)
             ContainerFormat.MP4 ->
-                if (mp4Fragmented) FragmentedMp4Muxer(file, mp4FragmentDurationUs)
-                else Mp4Muxer(file, fastStart = mp4FastStart)
+                if (validated.fragmented) FragmentedMp4Muxer(validated, file) else Mp4Muxer(validated, file)
         }
     }
 
@@ -71,62 +67,45 @@ public object MkvKotlin {
      * Android, donde solo se tiene un `ParcelFileDescriptor`:
      *
      * ```kotlin
-     * contentResolver.openFileDescriptor(uri, "rwt")!!.use { pfd ->
-     *     MkvKotlin.createMuxer(SeekableOutput(pfd.fileDescriptor), ContainerFormat.MP4)
+     * contentResolver.openFileDescriptor(uri, "rw")!!.use { pfd ->
+     *     Kotmpeg.createMuxer(SeekableOutput(pfd.fileDescriptor), ContainerFormat.MP4) { fastStart = true }
      * }
      * ```
      *
-     * [format] es obligatorio: sin nombre de archivo no hay extensión de la que inferirlo.
-     * No hay opción de `faststart` porque esa reescritura necesita reabrir el archivo por
-     * ruta; para un destino sin ruta el equivalente es [mp4Fragmented], cuya cabecera ya va
-     * delante por construcción.
+     * [format] es obligatorio: sin nombre de archivo no hay extensión de la que deducirlo. Con
+     * `fastStart` el `moov` se recoloca desplazando los datos en el sitio, sin temporal (ver
+     * `Mp4Muxer.stop`), y para eso el descriptor tiene que abrirse en `"rw"`. Si las opciones no
+     * valen, [output] se cierra antes de lanzar.
      */
     public fun createMuxer(
         output: SeekableOutput,
         format: ContainerFormat,
-        mp4Fragmented: Boolean = false,
-        mp4FragmentDurationUs: Long = 2_000_000,
-    ): Muxer = when (format) {
-        ContainerFormat.MKV -> MkvMuxer(output)
-        ContainerFormat.MP4 ->
-            if (mp4Fragmented) FragmentedMp4Muxer(output, mp4FragmentDurationUs)
-            else Mp4Muxer(output)
+        options: MuxerOptions.() -> Unit = {},
+    ): Muxer {
+        val validated = MuxerOptions().apply(options).validatedFor(output)
+        return when (format) {
+            ContainerFormat.MKV -> MkvMuxer(output, validated)
+            ContainerFormat.MP4 ->
+                if (validated.fragmented) FragmentedMp4Muxer(output, validated) else Mp4Muxer(output, null, validated)
+        }
     }
 
-    /**
-     * Crea un muxer de MP4 fragmentado con los límites de retención a la vista.
-     *
-     * Es lo mismo que [createMuxer] con `mp4Fragmented = true`, más los dos parámetros que deciden
-     * cuánta memoria retiene: las muestras de cada fragmento se guardan hasta cerrarlo, como mucho
-     * [maxFragmentDurationUs] o [maxFragmentBytes], lo que llegue antes. En un móvil con poca RAM
-     * conviene bajar [maxFragmentBytes] a 16 o 32 MB.
-     *
-     * Es una función aparte, y no dos parámetros más en [createMuxer], porque añadir parámetros a
-     * una función pública cambia su firma JVM y rompería a quien ya la usa compilada.
-     */
-    public fun createFragmentedMp4Muxer(
-        file: File,
-        fragmentDurationUs: Long = 2_000_000,
-        maxFragmentDurationUs: Long = 10_000_000,
-        maxFragmentBytes: Long = 64L * 1024 * 1024,
-    ): Muxer = FragmentedMp4Muxer(file, fragmentDurationUs, maxFragmentDurationUs, maxFragmentBytes)
-
-    /** Variante de [createFragmentedMp4Muxer] sobre un [SeekableOutput] ya abierto (`MediaStore`/SAF). */
-    public fun createFragmentedMp4Muxer(
-        output: SeekableOutput,
-        fragmentDurationUs: Long = 2_000_000,
-        maxFragmentDurationUs: Long = 10_000_000,
-        maxFragmentBytes: Long = 64L * 1024 * 1024,
-    ): Muxer = FragmentedMp4Muxer(output, fragmentDurationUs, maxFragmentDurationUs, maxFragmentBytes)
+    /** Por qué no se pudo deducir el formato de salida de [name], con lo que hay que hacer. */
+    private fun unknownExtension(name: String): String =
+        if (name.substringAfterLast('.').equals("webm", ignoreCase = true)) {
+            "$name: WebM solo admite VP8, VP9 o AV1 con Vorbis u Opus, y esta librería escribe " +
+                "H.264/H.265 con AAC u Opus. Usa la extensión .mkv"
+        } else {
+            "no se puede deducir el formato de salida de $name: usa .mkv, .mp4, .m4a, .m4v o .mov, o pasa el formato"
+        }
 
     /**
      * Abre un demuxer detectando el contenedor por los bytes mágicos del archivo.
      *
      * [onWarning] recibe los descartes no fatales: una pista cuyo formato no se reconoce, un
-     * `trak` que no parsea, un fragmento ilegible. **Vale la pena pasarlo**: sin él, esas
-     * pistas desaparecen sin dejar rastro y el síntoma que llega es "el vídeo se abre pero no
-     * tiene audio", sin nada que explicarlo. Es opcional para no romper a quien ya llamaba a
-     * esta función con un solo argumento.
+     * `trak` que no parsea, un fragmento ilegible, un índice que no se puede usar. **Vale la pena
+     * pasarlo**: sin él, esas pérdidas no dejan rastro y el síntoma que llega es "el vídeo se abre
+     * pero no tiene audio", sin nada que lo explique.
      */
     public fun openDemuxer(file: File, onWarning: (String) -> Unit = {}): Demuxer {
         return when (detectFormat(file)) {
@@ -164,7 +143,7 @@ public object MkvKotlin {
      * Detecta el formato leyendo la cabecera de [input] y **deja la posición donde estaba**,
      * para que el demuxer que venga después parsee desde el principio.
      */
-    private fun detectFormat(input: SeekableInput): ContainerFormat? {
+    public fun detectFormat(input: SeekableInput): ContainerFormat? {
         if (input.length < 12) return null
         val saved = input.position
         val head = try {
@@ -185,32 +164,36 @@ public object MkvKotlin {
 
     /**
      * Concatena [inputs] en [output] sin recodificar (el demuxer `concat` de FFmpeg).
-     * Las entradas deben compartir disposición de pistas y parámetros de códec (segmentos
-     * con los mismos ajustes de grabación). Devuelve el número de paquetes escritos.
+     * Las entradas deben compartir disposición de pistas y cabeceras de códec —segmentos
+     * con los mismos ajustes de grabación—; si no, el error dice qué difiere (ver
+     * `Remuxer.concat`). Devuelve el número de paquetes escritos.
+     *
+     * [onWarning] recibe los mismos avisos que en [openDemuxer], por cada entrada, y [options]
+     * configura el muxer de salida igual que en [createMuxer].
      *
      * Las entradas se abren de una en una y el `finally` cierra las que ya lo estuvieran: si
      * una falla a mitad —no es MKV ni MP4, cabecera corrupta, permisos— las anteriores no se
      * quedan con el descriptor abierto, que en Windows además impedía borrarlas o moverlas.
+     *
+     * Todo lo que se puede comprobar antes de escribir —que las entradas se abren y son
+     * compatibles— se comprueba antes de abrir [output], así que una llamada rechazada deja
+     * intacto lo que hubiera en esa ruta. Hasta ahora la truncaba primero y la dejaba vacía.
      */
     public fun concat(
         inputs: List<File>,
         output: File,
         format: ContainerFormat? = null,
-        mp4FastStart: Boolean = false,
-        mp4Fragmented: Boolean = false,
         onProgress: ((Long) -> Unit)? = null,
-        /**
-         * Mismos avisos que en [openDemuxer], por cada entrada: pistas descartadas al leerla.
-         * Sin esto una concatenación podía perder una pista por el camino sin poder decirlo.
-         */
         onWarning: (String) -> Unit = {},
+        options: MuxerOptions.() -> Unit = {},
     ): Long {
         require(inputs.isNotEmpty()) { "sin entradas" }
         requireDistinct(inputs, output)
         val demuxers = ArrayList<Demuxer>(inputs.size)
         try {
             for (file in inputs) demuxers.add(openDemuxer(file, onWarning))
-            return createMuxer(output, format, mp4FastStart, mp4Fragmented).use { muxer ->
+            Remuxer.requireConcatenable(demuxers)
+            return createMuxer(output, format, options).use { muxer ->
                 Remuxer.concat(demuxers, muxer, onProgress)
             }
         } finally {
@@ -221,22 +204,25 @@ public object MkvKotlin {
     /**
      * Reempaqueta [input] en [output] sin recodificar, en cualquier dirección (MKV <-> MP4
      * o limpieza en el mismo formato). Devuelve el número de paquetes copiados.
+     *
+     * [trackFilter] recibe el id de cada pista de entrada y descarta las que devuelvan `false`;
+     * [onWarning] y [options], como en [concat]. Como allí, una llamada que no puede salir bien
+     * —ninguna pista seleccionada, vídeo sin `codecPrivate`— se rechaza antes de abrir [output].
      */
     public fun remux(
         input: File,
         output: File,
         format: ContainerFormat? = null,
-        mp4FastStart: Boolean = false,
-        mp4Fragmented: Boolean = false,
         trackFilter: (Int) -> Boolean = { true },
         onProgress: ((Long) -> Unit)? = null,
-        /** Mismos avisos que en [openDemuxer]: pistas descartadas al leer la entrada. */
         onWarning: (String) -> Unit = {},
+        options: MuxerOptions.() -> Unit = {},
     ): Long {
         requireDistinct(listOf(input), output)
         val demuxer = openDemuxer(input, onWarning)
         try {
-            return createMuxer(output, format, mp4FastStart, mp4Fragmented).use { muxer ->
+            Remuxer.requireWritable(demuxer.tracks.filter { trackFilter(it.id) })
+            return createMuxer(output, format, options).use { muxer ->
                 Remuxer.remux(demuxer, muxer, trackFilter, onProgress)
             }
         } finally {
@@ -285,7 +271,7 @@ public object MkvKotlin {
      * de una de las cinco.
      *
      * ```kotlin
-     * val muxer = MkvKotlin.synchronizedMuxer(MkvKotlin.createMuxer(File("salida.mp4"), mp4Fragmented = true))
+     * val muxer = Kotmpeg.synchronizedMuxer(Kotmpeg.createMuxer(File("salida.mp4")) { fragmented = true })
      * ```
      *
      * Envolver uno que ya lo está devuelve el mismo objeto.

@@ -57,13 +57,14 @@ class TrackStartOrderTest {
         listOf(byteArrayOf(0x68, 0x11, 0x22)),
     )
 
-    private fun video() = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0, codecPrivate = avcC,
-    )
+    private fun video() = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        frameRate = 30.0
+        codecPrivate = avcC
+    }
 
-    private fun audio() = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2),
-    )
+    private fun audio() = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+        codecPrivate = AacConfig.build(48000, 2)
+    }
 
     private class Arrival(val atUs: Long, val packet: MediaPacket)
 
@@ -77,7 +78,7 @@ class TrackStartOrderTest {
         }
         for (a in 0 until AUDIO_PACKETS) {
             val pts = UPTIME_US + MIC_START_US + a * 21_333L
-            list += Arrival(pts + AUDIO_LATENCY_US, MediaPacket(audioId, ByteArray(16) { a.toByte() }, pts))
+            list += Arrival(pts + AUDIO_LATENCY_US, MediaPacket(audioId, ByteArray(16) { a.toByte() }, pts, isKeyFrame = false))
         }
         return list.sortedBy { it.atUs }.map { it.packet }
     }
@@ -93,7 +94,7 @@ class TrackStartOrderTest {
         return videoId to audioId
     }
 
-    private fun readAll(file: File): List<MediaPacket> = MkvKotlin.openDemuxer(file).use { demuxer ->
+    private fun readAll(file: File): List<MediaPacket> = Kotmpeg.openDemuxer(file).use { demuxer ->
         generateSequence { demuxer.readPacket() }.toList()
     }
 
@@ -133,7 +134,7 @@ class TrackStartOrderTest {
             val shared = ByteArray(16)
             for (a in 0 until 5) {
                 shared.fill(a.toByte())
-                muxer.writePacket(MediaPacket(audioId, shared, UPTIME_US + MIC_START_US + a * 21_333L))
+                muxer.writePacket(MediaPacket(audioId, shared, UPTIME_US + MIC_START_US + a * 21_333L, isKeyFrame = false))
             }
             val key = NalUnits.joinLengthPrefixed(listOf(byteArrayOf(0x65, 0)))
             muxer.writePacket(MediaPacket(videoId, key, UPTIME_US, isKeyFrame = true))
@@ -155,7 +156,7 @@ class TrackStartOrderTest {
             muxer.addTrack(video())
             val audioId = muxer.addTrack(audio())
             muxer.start()
-            for (a in 0 until 10) muxer.writePacket(MediaPacket(audioId, ByteArray(16), UPTIME_US + a * 21_333L))
+            for (a in 0 until 10) muxer.writePacket(MediaPacket(audioId, ByteArray(16), UPTIME_US + a * 21_333L, isKeyFrame = false))
             muxer.stop()
 
             val packets = readAll(file)
@@ -171,13 +172,13 @@ class TrackStartOrderTest {
     @Test
     fun `the wait for a missing track is bounded by time and by memory`() {
         val byTime = TimelineGate(trackCount = 2, maxWaitUs = 1_000_000, maxHeldBytes = Long.MAX_VALUE)
-        assertFalse(byTime.hold(MediaPacket(2, ByteArray(10), 0), trackIndex = 1))
-        assertFalse(byTime.hold(MediaPacket(2, ByteArray(10), 999_999), trackIndex = 1))
-        assertTrue(byTime.hold(MediaPacket(2, ByteArray(10), 1_000_000), trackIndex = 1), "no se agotó la espera")
+        assertFalse(byTime.hold(MediaPacket(2, ByteArray(10), 0, isKeyFrame = false), trackIndex = 1))
+        assertFalse(byTime.hold(MediaPacket(2, ByteArray(10), 999_999, isKeyFrame = false), trackIndex = 1))
+        assertTrue(byTime.hold(MediaPacket(2, ByteArray(10), 1_000_000, isKeyFrame = false), trackIndex = 1), "no se agotó la espera")
 
         val byMemory = TimelineGate(trackCount = 2, maxWaitUs = Long.MAX_VALUE, maxHeldBytes = 100)
-        assertFalse(byMemory.hold(MediaPacket(2, ByteArray(60), 0), trackIndex = 1))
-        assertTrue(byMemory.hold(MediaPacket(2, ByteArray(60), 1), trackIndex = 1), "no se respetó el tope de memoria")
+        assertFalse(byMemory.hold(MediaPacket(2, ByteArray(60), 0, isKeyFrame = false), trackIndex = 1))
+        assertTrue(byMemory.hold(MediaPacket(2, ByteArray(60), 1, isKeyFrame = false), trackIndex = 1), "no se respetó el tope de memoria")
     }
 
     /**
@@ -187,11 +188,11 @@ class TrackStartOrderTest {
     @Test
     fun `release interleaves tracks by time without reordering inside a track`() {
         val gate = TimelineGate(trackCount = 2, maxWaitUs = Long.MAX_VALUE, maxHeldBytes = Long.MAX_VALUE)
-        gate.hold(MediaPacket(2, ByteArray(1), 64_000), trackIndex = 1)
-        gate.hold(MediaPacket(2, ByteArray(1), 85_000), trackIndex = 1)
+        gate.hold(MediaPacket(2, ByteArray(1), 64_000, isKeyFrame = false), trackIndex = 1)
+        gate.hold(MediaPacket(2, ByteArray(1), 85_000, isKeyFrame = false), trackIndex = 1)
         gate.hold(MediaPacket(1, ByteArray(1), 0, isKeyFrame = true), trackIndex = 0)
-        gate.hold(MediaPacket(1, ByteArray(1), 100_000), trackIndex = 0)
-        gate.hold(MediaPacket(1, ByteArray(1), 33_000), trackIndex = 0)
+        gate.hold(MediaPacket(1, ByteArray(1), 100_000, isKeyFrame = false), trackIndex = 0)
+        gate.hold(MediaPacket(1, ByteArray(1), 33_000, isKeyFrame = false), trackIndex = 0)
 
         assertEquals(0L, gate.earliestPtsUs)
         val order = gate.release().map { it.trackId to it.ptsUs }

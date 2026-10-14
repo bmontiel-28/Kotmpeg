@@ -37,14 +37,15 @@ class LargeFileEdgeCasesTest {
         listOf(byteArrayOf(0x68, 0x11, 0x22)),
     )
 
-    private fun videoTrack(width: Int = 320) = TrackInfo.Video(
-        codec = VideoCodec.H264, width = width, height = 240, frameRate = 30.0, codecPrivate = avcC,
-    )
+    private fun videoTrack(width: Int = 320) = TrackInfo.Video(codec = VideoCodec.H264, width = width, height = 240) {
+        frameRate = 30.0
+        codecPrivate = avcC
+    }
 
     private fun payload(i: Int) = NalUnits.joinLengthPrefixed(listOf(ByteArray(64) { (i + it).toByte() }))
 
     private fun writeVideo(file: File, track: TrackInfo.Video = videoTrack(), frames: Int = 8): File {
-        MkvKotlin.createMuxer(file).use { muxer ->
+        Kotmpeg.createMuxer(file).use { muxer ->
             val id = muxer.addTrack(track)
             muxer.start()
             for (i in 0 until frames) {
@@ -68,7 +69,7 @@ class LargeFileEdgeCasesTest {
         val b = writeVideo(File(dir, "b.mkv"), videoTrack(width = 640))
         val out = File(dir, "bad-concat.mkv")
 
-        val result = runCatching { MkvKotlin.concat(listOf(a, b), out) }
+        val result = runCatching { Kotmpeg.concat(listOf(a, b), out) }
         assertTrue(result.isFailure, "un desajuste de dimensiones debe rechazarse")
         assertFalse(OpenFiles.isOpen(out), "el muxer de salida quedó abierto tras fallar")
     }
@@ -78,7 +79,7 @@ class LargeFileEdgeCasesTest {
         val input = writeVideo(File(dir, "in.mkv"))
         val out = File(dir, "bad-remux.mp4")
 
-        val result = runCatching { MkvKotlin.remux(input, out, trackFilter = { false }) }
+        val result = runCatching { Kotmpeg.remux(input, out, trackFilter = { false }) }
         assertTrue(result.isFailure, "sin pistas seleccionadas el remux debe fallar")
         assertFalse(OpenFiles.isOpen(out), "el muxer de salida quedó abierto tras fallar")
     }
@@ -109,7 +110,7 @@ class LargeFileEdgeCasesTest {
         out.write(bytes, at + 4 + oldSizeLen, bytes.size - at - 4 - oldSizeLen)
 
         val broken = File(dir, "huge-size-broken.mkv").also { it.writeBytes(out.toByteArray()) }
-        val error = assertFailsWith<Exception> { MkvKotlin.openDemuxer(broken).use { it.tracks } }
+        val error = assertFailsWith<Exception> { Kotmpeg.openDemuxer(broken).use { it.tracks } }
         assertTrue(
             error.message.orEmpty().contains("más allá del final"),
             "se esperaba un error de tamaño fuera del archivo, y llegó: ${error.message}",
@@ -127,7 +128,7 @@ class LargeFileEdgeCasesTest {
 
         bytes[at] = 0x08
         val broken = File(dir, "long-id-broken.mkv").also { it.writeBytes(bytes) }
-        assertFailsWith<Exception> { MkvKotlin.openDemuxer(broken).use { it.tracks } }
+        assertFailsWith<Exception> { Kotmpeg.openDemuxer(broken).use { it.tracks } }
     }
 
     private fun vintLength(first: Byte): Int {
@@ -164,7 +165,7 @@ class LargeFileEdgeCasesTest {
     fun `durations beyond 32 bits are written as version 1 boxes and survive the round trip`() {
         val farOutUs = 5_000_000_000_000L
         val file = File(dir, "long.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val id = muxer.addTrack(videoTrack())
             muxer.start()
             muxer.writePacket(MediaPacket(id, payload(0), 0, 0, true, 33_333L))
@@ -178,7 +179,7 @@ class LargeFileEdgeCasesTest {
             assertEquals(1, bytes[at + 4].toInt(), "$type debería ir en versión 1")
         }
 
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             assertEquals(1, demuxer.tracks.size)
             val packets = generateSequence { demuxer.readPacket() }.toList()
             assertEquals(2, packets.size)
@@ -318,18 +319,18 @@ class LargeFileEdgeCasesTest {
     @Test
     fun `a 64 bit chunk offset table reads back the same packets as the 32 bit one`() {
         val source = File(dir, "co64-src.mp4")
-        MkvKotlin.createMuxer(source, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(source, ContainerFormat.MP4).use { muxer ->
             val id = muxer.addTrack(videoTrack())
             muxer.start()
             for (i in 0 until 10) {
                 muxer.writePacket(MediaPacket(id, payload(i), i * 33_333L, i * 33_333L, i % 4 == 0, 33_333L))
             }
         }
-        val original = MkvKotlin.openDemuxer(source).use { d -> generateSequence { d.readPacket() }.toList() }
+        val original = Kotmpeg.openDemuxer(source).use { d -> generateSequence { d.readPacket() }.toList() }
         assertEquals(10, original.size)
 
         val patched = File(dir, "co64.mp4").also { it.writeBytes(stcoToCo64(source.readBytes())) }
-        MkvKotlin.openDemuxer(patched).use { demuxer ->
+        Kotmpeg.openDemuxer(patched).use { demuxer ->
             val packets = generateSequence { demuxer.readPacket() }.toList()
             assertEquals(original.size, packets.size, "co64 perdió muestras")
             for (i in original.indices) {
@@ -342,18 +343,18 @@ class LargeFileEdgeCasesTest {
     @Test
     fun `an mdat with a compact 32 bit header is parsed like our own largesize one`() {
         val source = File(dir, "compact-src.mp4")
-        MkvKotlin.createMuxer(source, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(source, ContainerFormat.MP4).use { muxer ->
             val id = muxer.addTrack(videoTrack())
             muxer.start()
             for (i in 0 until 6) {
                 muxer.writePacket(MediaPacket(id, payload(i), i * 33_333L, i * 33_333L, true, 33_333L))
             }
         }
-        val original = MkvKotlin.openDemuxer(source).use { d -> generateSequence { d.readPacket() }.toList() }
+        val original = Kotmpeg.openDemuxer(source).use { d -> generateSequence { d.readPacket() }.toList() }
         assertEquals(6, original.size)
 
         val patched = File(dir, "compact.mp4").also { it.writeBytes(mdatToCompactSize(source.readBytes())) }
-        MkvKotlin.openDemuxer(patched).use { demuxer ->
+        Kotmpeg.openDemuxer(patched).use { demuxer ->
             val packets = generateSequence { demuxer.readPacket() }.toList()
             assertEquals(original.size, packets.size, "el mdat de 32 bits perdió muestras")
             for (i in original.indices) {
@@ -378,14 +379,14 @@ class LargeFileEdgeCasesTest {
         assertFailsWith<IllegalArgumentException> { hdr(-1.0) }
         assertFailsWith<IllegalArgumentException> { hdr(max = 100.0, min = 500.0) }
 
-        val track = videoTrack().copy(color = ColorInfo.hdr10(hdr(1000.0)))
+        val track = videoTrack().copy { color = ColorInfo.hdr10(hdr(1000.0)) }
         val file = File(dir, "hdr.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val id = muxer.addTrack(track)
             muxer.start()
             muxer.writePacket(MediaPacket(id, payload(0), 0, 0, true, 33_333L))
         }
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             val video = demuxer.tracks.filterIsInstance<TrackInfo.Video>().single()
             assertEquals(1000.0, video.color?.hdr?.maxMasteringLuminance)
         }
@@ -400,11 +401,10 @@ class LargeFileEdgeCasesTest {
     @Test
     fun `a constant size stsz with an absurd sample count does not allocate beyond the file`() {
         val source = File(dir, "stsz-src.mp4")
-        MkvKotlin.createMuxer(source, ContainerFormat.MP4).use { muxer ->
-            val id = muxer.addTrack(TrackInfo.Audio(
-                codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2,
-                codecPrivate = AacConfig.build(48000, 2),
-            ))
+        Kotmpeg.createMuxer(source, ContainerFormat.MP4).use { muxer ->
+            val id = muxer.addTrack(TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+                codecPrivate = AacConfig.build(48000, 2)
+            })
             muxer.start()
             for (i in 0 until 20) {
                 muxer.writePacket(MediaPacket(id, ByteArray(64) { i.toByte() }, i * 21_333L, i * 21_333L, true, 21_333L))
@@ -418,7 +418,7 @@ class LargeFileEdgeCasesTest {
         putU32(data, start + 16, 1_000_000_000L)
 
         val broken = File(dir, "stsz-broken.mp4").also { it.writeBytes(data) }
-        MkvKotlin.openDemuxer(broken).use { demuxer ->
+        Kotmpeg.openDemuxer(broken).use { demuxer ->
             val packets = generateSequence { demuxer.readPacket() }.take(5_000).toList()
             assertTrue(
                 packets.size < 100_000,

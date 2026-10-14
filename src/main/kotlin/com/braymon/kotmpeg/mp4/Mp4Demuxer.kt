@@ -61,6 +61,14 @@ public class Mp4Demuxer(
     private class ParsedTrack(val info: TrackInfo, val samples: TrackSamples) {
         val reader: SampleCursor = samples.cursor()
         var cursor: Int = 0
+
+        /**
+         * Cuánto va la presentación de la pista por delante de su decodificación, medido en su
+         * primera muestra. En audio es cero, salvo en los fMP4 escritos por esta librería hasta la
+         * 4.0.0 con una pista que arranca después que las demás, que llevan ese retraso como
+         * desfase de composición. Se calcula la primera vez que se busca, con un cursor aparte.
+         */
+        val presentationLeadUs: Long by lazy { samples.cursor().let { it.ptsUs - it.dtsUs } }
     }
 
     /** Metadatos de la pista que no dependen del códec: los del `tkhd`, `mdhd` y `udta`. */
@@ -74,9 +82,9 @@ public class Mp4Demuxer(
      * Pista declarada en el moov pero sin muestras stbl: candidata a fragmentos.
      *
      * Lleva la lista de edición de su `trak` igual que una pista plana: el `elst` del `moov` vale
-     * para toda la línea de tiempo de la pista, fragmentos incluidos. Hasta la 3.0.0 se perdía, y un
-     * fMP4 con cebado de audio —el propio `FragmentedMp4Muxer` lo escribe así— se leía con el audio
-     * 21 ms por detrás de donde lo ponen FFmpeg y el MP4 plano equivalente.
+     * para toda la línea de tiempo de la pista, fragmentos incluidos. Hasta la 3.0.0 se perdía. En
+     * audio, la edición inicial es el cebado y llega ya convertida en `codecDelayUs` (ver
+     * [audioPriming]), así que aquí solo queda lo que afecta a los tiempos.
      */
     private class FragmentShell(
         val trackId: Int,
@@ -296,7 +304,7 @@ public class Mp4Demuxer(
                 "tkhd" -> {
                     input.position = box.dataStart
                     val version = input.readByte()
-                    enabled = (input.readBits(3) and TKHD_TRACK_ENABLED) != 0L
+                    enabled = (input.readUInt(3) and TKHD_TRACK_ENABLED) != 0L
                     input.skip(if (version == 1) 16L else 8L)
                     trackId = input.readInt32()
                     input.skip(4)
@@ -342,7 +350,7 @@ public class Mp4Demuxer(
                             input.skip(if (version == 1) 16L else 8L)
                             mediaTimescale = input.readInt32().toLong() and 0xFFFFFFFFL
                             input.skip(if (version == 1) 8L else 4L)
-                            language = SampleEntries.unpackLanguage(input.readBits(2).toInt()) // idioma ISO 639-2/T
+                            language = SampleEntries.unpackLanguage(input.readUInt(2).toInt()) // idioma ISO 639-2/T
                         }
                         "hdlr" -> {
                             input.position = child.dataStart
@@ -439,25 +447,54 @@ public class Mp4Demuxer(
             }
             return
         }
+        val priming = audioPriming(handlerType, desc, elstMediaTime, mediaTimescale)
+        val trackDesc = priming?.let { delayUs ->
+            SampleDescription(
+                desc.videoCodec, desc.audioCodec, desc.codecConfig, desc.width, desc.height,
+                desc.sampleRate, desc.channels, delayUs, desc.color,
+            )
+        } ?: desc
+        val mediaTime = if (priming != null) 0L else elstMediaTime
+
         if (sampleCount == 0) {
             fragmentShells[trackId] =
                 FragmentShell(
-                    trackId, handlerType, desc, mediaTimescale, width, height, rotationDegrees, header,
-                    elstMediaTime, elstEmptyDurationUs,
+                    trackId, handlerType, trackDesc, mediaTimescale, width, height, rotationDegrees, header,
+                    mediaTime, elstEmptyDurationUs,
                 )
             return
         }
 
         val samples = StblSamples(
             sampleCount, constantSize, sampleSizes, chunkOffsets, chunkOffsets64, stsc, stts, ctts, stss,
-            mediaTimescale, elstMediaTime, elstEmptyDurationUs,
+            mediaTimescale, mediaTime, elstEmptyDurationUs,
         )
         if (samples.size == 0) return
 
         val frameRateHint = samples.firstPositiveDelta()?.let { mediaTimescale.toDouble() / it } ?: 0.0
-        val info = buildTrackInfo(handlerType, desc, trackId, width, height, frameRateHint, rotationDegrees, header)
+        val info = buildTrackInfo(handlerType, trackDesc, trackId, width, height, frameRateHint, rotationDegrees, header)
         if (info != null) parsedTracks.add(ParsedTrack(info, samples))
     }
+
+    /**
+     * El cebado de una pista de audio, en µs, si su lista de edición lo declara; `null` si no.
+     *
+     * En audio, la edición inicial (`media_time` > 0) es el cebado del codificador: las muestras que
+     * hay que descartar al decodificar. Se entrega en `codecDelayUs` y **no se resta** de los
+     * tiempos de los paquetes, igual que el `CodecDelay` de Matroska en `MkvDemuxer` y que lo que
+     * esperan los muxers, que vuelven a escribirlo como edición o como `CodecDelay`. Hasta la 3.x
+     * este demuxer lo restaba y declaraba un retardo cero, así que el mismo audio llegaba con 21 ms
+     * de diferencia según viniera de un MP4 o de un MKV.
+     *
+     * En vídeo la edición inicial es el desfase de composición de los B-frames y sí se resta, como
+     * siempre: ahí no hay nada que descartar.
+     */
+    private fun audioPriming(handlerType: String, desc: SampleDescription, mediaTime: Long, timescale: Long): Long? =
+        if (handlerType == "soun" && desc.audioCodec != null && mediaTime > 0 && timescale > 0) {
+            Timestamps.rescaleFloor(mediaTime, 1_000_000, timescale)
+        } else {
+            null
+        }
 
     /**
      * Texto de `udta`/`name`. Puede venir con un terminador nulo (QuickTime) o sin él (lo que
@@ -504,33 +541,25 @@ public class Mp4Demuxer(
             val transposed = rotatedQuarter && tkhdWidth == height && tkhdHeight == width
             val usable = tkhdWidth > 0 && tkhdHeight > 0 && !transposed
 
-            TrackInfo.Video(
-                id = trackId,
-                codec = desc.videoCodec,
-                width = width,
-                height = height,
-                displayWidth = if (usable) tkhdWidth else width,
-                displayHeight = if (usable) tkhdHeight else height,
-                frameRate = frameRateHint,
-                rotationDegrees = rotationDegrees,
-                color = desc.color,
-                codecPrivate = desc.codecConfig,
-                language = header.language,
-                name = header.name,
-                default = header.default,
-            )
+            TrackInfo.Video(desc.videoCodec, width, height) {
+                displayWidth = if (usable) tkhdWidth else width
+                displayHeight = if (usable) tkhdHeight else height
+                frameRate = frameRateHint
+                this.rotationDegrees = rotationDegrees
+                color = desc.color
+                codecPrivate = desc.codecConfig
+                language = header.language
+                name = header.name
+                default = header.default
+            }.withId(trackId)
         }
-        handlerType == "soun" && desc.audioCodec != null -> TrackInfo.Audio(
-            id = trackId,
-            codec = desc.audioCodec,
-            sampleRate = desc.sampleRate,
-            channelCount = desc.channels,
-            codecDelayUs = desc.codecDelayUs,
-            codecPrivate = desc.codecConfig,
-            language = header.language,
-            name = header.name,
-            default = header.default,
-        )
+        handlerType == "soun" && desc.audioCodec != null -> TrackInfo.Audio(desc.audioCodec, desc.sampleRate, desc.channels) {
+            codecDelayUs = desc.codecDelayUs
+            codecPrivate = desc.codecConfig
+            language = header.language
+            name = header.name
+            default = header.default
+        }.withId(trackId)
         else -> null
     }
 
@@ -714,41 +743,71 @@ public class Mp4Demuxer(
 
     /**
      * Cursor de una pista de fMP4: retoma el recorrido de fragmentos desde un punto de control y
-     * guarda en [buffer] las muestras de su pista del último `moof` leído. Parsea los fragmentos
-     * completos —todas las pistas— porque el tiempo de un `traf` sin `tfdt` depende de lo anterior,
-     * pero solo se queda con lo suyo.
+     * guarda en [buffer] las muestras de su pista del último `moof` leído, y en [previous] las del
+     * anterior. Parsea los fragmentos completos —todas las pistas— porque el tiempo de un `traf` sin
+     * `tfdt` depende de lo anterior, pero solo se queda con lo suyo.
+     *
+     * Guardar también el fragmento anterior es lo que deja volver una muestra atrás sin repetir el
+     * recorrido. Los fragmentos se cortan en los keyframes, así que el paquete de audio que suena en
+     * un keyframe suele ser el último del fragmento anterior: para encontrarlo, la búsqueda llega al
+     * final de ese fragmento, carga el siguiente para ver que se ha pasado y retrocede una. Con un
+     * solo fragmento, retroceder obligaba a volver al punto de control y parsear otra vez hasta tres
+     * fragmentos, y cada búsqueda reservaba el doble de memoria que en la 3.1.0.
      */
     private inner class FragmentCursor(private val owner: FragmentSamples) : SampleCursor() {
         private val ids = fragmentShells.keys.toIntArray()
         private val ticks = HashMap<Int, Long>()
-        private val buffer = SampleBuffer()
+        private var buffer = SampleBuffer()
+        private var previous = SampleBuffer()
+        private var current = buffer
         private val sinks: Map<Int, SampleSink> = ids.associateWith { id ->
-            if (id == ids[owner.shell]) buffer else IGNORED_SAMPLES
+            if (id == ids[owner.shell]) {
+                SampleSink { offset, size, ptsUs, dtsUs, key, durationUs -> buffer.add(offset, size, ptsUs, dtsUs, key, durationUs) }
+            } else {
+                IGNORED_SAMPLES
+            }
         }
         private var walkPosition = 0L
         private var bufferStart = 0
+        private var previousStart = 0
         private var restored = false
         private var at = 0
 
         override var index: Int = -1
             private set
-        override val offset: Long get() = buffer.offset(at)
-        override val size: Int get() = buffer.size(at)
-        override val ptsUs: Long get() = buffer.ptsUs(at)
-        override val dtsUs: Long get() = buffer.dtsUs(at)
-        override val key: Boolean get() = buffer.isKey(at)
-        override val durationUs: Long get() = buffer.durationUs(at)
+        override val offset: Long get() = current.offset(at)
+        override val size: Int get() = current.size(at)
+        override val ptsUs: Long get() = current.ptsUs(at)
+        override val dtsUs: Long get() = current.dtsUs(at)
+        override val key: Boolean get() = current.isKey(at)
+        override val durationUs: Long get() = current.durationUs(at)
+
+        /**
+         * Se conoce la siguiente dentro del fragmento en que está y, al final del anterior, la
+         * primera del último cargado; al final de este, no.
+         */
+        override val knowsNextDts: Boolean
+            get() = at + 1 < current.size || (current === previous && buffer.size > 0)
+
+        override val nextDtsUs: Long
+            get() = if (at + 1 < current.size) current.dtsUs(at + 1) else buffer.dtsUs(0)
 
         override fun moveTo(target: Int) {
             require(target in 0 until owner.size) { "muestra $target fuera de 0..${owner.size - 1}" }
             val bufferEnd = bufferStart + buffer.size
-            if (!restored || target < bufferStart || target - bufferEnd >= TrackSamples.CHECKPOINT_INTERVAL) {
+            if (!restored || target < previousStart || target - bufferEnd >= TrackSamples.CHECKPOINT_INTERVAL) {
                 restore(owner.checkpointFor(target))
             }
             while (bufferStart + buffer.size <= target) {
                 check(loadNextFragment()) { "el recorrido de fragmentos terminó antes de la muestra $target" }
             }
-            at = target - bufferStart
+            if (target >= bufferStart) {
+                current = buffer
+                at = target - bufferStart
+            } else {
+                current = previous
+                at = target - previousStart
+            }
             index = target
         }
 
@@ -759,11 +818,18 @@ public class Mp4Demuxer(
             for ((j, id) in ids.withIndex()) ticks[id] = checkpoints.ticks(c, j)
             bufferStart = checkpoints.index(c, owner.shell)
             buffer.clear()
+            previous.clear()
+            previousStart = bufferStart
             restored = true
         }
 
+        /** El último cargado pasa a ser el anterior, y su búfer se reutiliza para el siguiente. */
         private fun loadNextFragment(): Boolean {
+            val reused = previous
+            previous = buffer
+            previousStart = bufferStart
             bufferStart += buffer.size
+            buffer = reused
             buffer.clear()
             input.position = walkPosition
             while (true) {
@@ -944,8 +1010,8 @@ public class Mp4Demuxer(
     private fun parseVisual(entry: Box, codec: VideoCodec, configBoxType: String): SampleDescription {
         input.position = entry.dataStart
         input.skip(6 + 2 + 2 + 2 + 12)
-        val w = input.readBits(2).toInt()
-        val h = input.readBits(2).toInt()
+        val w = input.readUInt(2).toInt()
+        val h = input.readUInt(2).toInt()
         input.skip(4 + 4 + 4 + 2 + 32 + 2 + 2)
         var config: ByteArray? = null
         var primaries = ColorInfo.UNSPECIFIED
@@ -964,21 +1030,21 @@ public class Mp4Demuxer(
                     val kind = String(input.readBytes(4), Charsets.US_ASCII)
                     if (kind == "nclx" || kind == "nclc") {
                         hasColr = true
-                        primaries = input.readBits(2).toInt()
-                        transfer = input.readBits(2).toInt()
-                        matrix = input.readBits(2).toInt()
+                        primaries = input.readUInt(2).toInt()
+                        transfer = input.readUInt(2).toInt()
+                        matrix = input.readUInt(2).toInt()
                         if (kind == "nclx") fullRange = input.readByte() and 0x80 != 0
                     }
                 }
                 "mdcv" -> {
-                    val v = DoubleArray(8) { (input.readBits(2)) * 0.00002 }
+                    val v = DoubleArray(8) { (input.readUInt(2)) * 0.00002 }
                     val maxLum = (input.readInt32().toLong() and 0xFFFFFFFFL) * 0.0001
                     val minLum = (input.readInt32().toLong() and 0xFFFFFFFFL) * 0.0001
                     mastering = doubleArrayOf(v[4], v[5], v[0], v[1], v[2], v[3], v[6], v[7], maxLum, minLum)
                 }
                 "clli" -> {
-                    maxCll = input.readBits(2).toInt()
-                    maxFall = input.readBits(2).toInt()
+                    maxCll = input.readUInt(2).toInt()
+                    maxFall = input.readUInt(2).toInt()
                 }
             }
         }
@@ -1000,20 +1066,24 @@ public class Mp4Demuxer(
         } ?: if (maxCll > 0 || maxFall > 0) {
             HdrStaticInfo(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, maxCll, maxFall)
         } else null
-        val color = if (hasColr || hdr != null) ColorInfo(
-            primaries,
-            transfer,
-            matrix,
-            fullRange,
-            hdr
-        ) else null
+        val color = if (hasColr || hdr != null) {
+            ColorInfo {
+                this.primaries = primaries
+                this.transfer = transfer
+                this.matrix = matrix
+                this.fullRange = fullRange
+                this.hdr = hdr
+            }
+        } else {
+            null
+        }
         return SampleDescription(videoCodec = codec, codecConfig = config, width = w, height = h, color = color)
     }
 
     private fun parseMp4a(entry: Box): SampleDescription {
         input.position = entry.dataStart
         input.skip(6 + 2 + 8)
-        var channels = input.readBits(2).toInt()
+        var channels = input.readUInt(2).toInt()
         input.skip(2 + 2 + 2)
         var sampleRate = (input.readInt32() ushr 16)
         var asc: ByteArray? = null
@@ -1039,7 +1109,7 @@ public class Mp4Demuxer(
     private fun parseOpus(entry: Box): SampleDescription {
         input.position = entry.dataStart
         input.skip(6 + 2 + 8)
-        val channels = input.readBits(2).toInt()
+        val channels = input.readUInt(2).toInt()
         input.skip(2 + 2 + 2)
         val sampleRate = (input.readInt32() ushr 16)
         var head: ByteArray? = null
@@ -1141,37 +1211,124 @@ public class Mp4Demuxer(
     }
 
     /**
-     * Mismo resultado que el recorrido lineal de siempre —último keyframe con `pts <= destino`
-     * entre las muestras que no empiezan a decodificarse después del destino—, pero localizando
-     * ese límite por bisección entre los puntos de control de [TrackSamples]. En un archivo de dos
-     * horas el recorrido tocaba cientos de miles de muestras por cada búsqueda; aquí son una
-     * veintena de pasos de bisección y, como mucho, unos cientos de muestras por pista.
+     * Busca el último keyframe de la pista ancla —la primera de vídeo, o la primera si no hay
+     * vídeo— con `pts <= destino`, y coloca **todas las demás pistas por tiempo de presentación**
+     * en ese keyframe, que es donde de verdad empieza la imagen:
      *
-     * Los cursores de lectura sirven también para buscar, porque al terminar se recolocan todos.
+     * - otra pista de vídeo, en su propio último keyframe con `pts` no posterior;
+     * - una de audio, en el paquete que suena en ese instante, contado en su tiempo de paquete. Con
+     *   cebado eso deja delante justo el margen que el decodificador necesita para arrancar (ver
+     *   `TrackInfo.Audio.codecDelayUs`);
+     * - una que ya ha terminado en ese instante, en ninguna parte: no entrega nada (ver
+     *   [startAfterSeek]).
+     *
+     * Hasta la 3.x las demás pistas se colocaban por tiempo de **decodificación**, como hace el
+     * demuxer de FFmpeg. En un MP4 normal da igual, pero las grabaciones de Android con B-frames
+     * llevan el DTS hasta varios segundos por detrás del PTS, y tras buscar el audio empezaba esos
+     * segundos antes que la imagen: un recorte desde ahí abría con audio sin vídeo.
+     *
+     * Los límites se localizan por bisección entre los puntos de control de [TrackSamples]: una
+     * veintena de pasos y, como mucho, unos cientos de muestras por pista. Los cursores de lectura
+     * sirven también para buscar, porque al terminar se recolocan todos.
      */
     override fun seekTo(timestampUs: Long): Long {
-        val videoTrack = parsedTracks.firstOrNull { it.info is TrackInfo.Video }
-        val anchor = videoTrack ?: parsedTracks.firstOrNull() ?: return 0
-        val samples = anchor.samples
-        val scan = anchor.reader
-        val limit = if (samples.dtsMonotonic) {
-            samples.firstIndexWithDtsAbove(timestampUs, scan).coerceAtMost(samples.size - 1)
-        } else {
-            samples.lastIndexWithDtsAtMostLinear(timestampUs, scan)
-        }
-        val target = samples.lastKeyAtOrBefore(limit, timestampUs, scan)
-        scan.moveTo(target)
-        val targetDts = scan.dtsUs
-        val targetPts = scan.ptsUs
+        val anchor = parsedTracks.firstOrNull { it.info is TrackInfo.Video } ?: parsedTracks.firstOrNull() ?: return 0
+        val target = keyFrameAtOrBefore(anchor, timestampUs)
+        anchor.reader.moveTo(target)
+        val targetPts = anchor.reader.ptsUs
         for (t in parsedTracks) {
-            t.cursor = when {
-                t === anchor -> target
-                t.samples.dtsMonotonic -> t.samples.firstIndexWithDtsAtLeast(targetDts, t.reader)
-                else -> t.samples.firstIndexWithDtsAtLeastLinear(targetDts, t.reader)
-            }
+            t.cursor = if (t === anchor) target else startAfterSeek(t, targetPts)
             if (t.cursor < t.samples.size) t.reader.moveTo(t.cursor)
         }
         return targetPts
+    }
+
+    /**
+     * Dónde sigue [track], que no es el ancla, tras buscar el keyframe de [timestampUs]: si es de
+     * vídeo, en su último keyframe no posterior; si es de audio, en el paquete que suena en ese
+     * instante. Y en ninguna parte —[TrackSamples.size], la pista agotada— si ya ha terminado:
+     * desde ahí hasta su última muestra, nada se presenta en ese instante ni después. Hasta ahora
+     * entregaba igualmente su último keyframe o su último paquete, imagen o sonido de segundos
+     * antes, y un recorte desde ahí empezaba con ellos.
+     *
+     * Saber si ha terminado solo cuesta algo cuando la búsqueda ya llegó a su última muestra; si
+     * no, alguna se decodifica —y se presenta— después, y la pista sigue.
+     */
+    private fun startAfterSeek(track: ParsedTrack, timestampUs: Long): Int {
+        val samples = track.samples
+        if (samples.size == 0) return 0
+        val start: Int
+        val reached: Int
+        if (track.info is TrackInfo.Video) {
+            reached = decodeLimit(track, timestampUs)
+            start = samples.lastKeyAtOrBefore(reached, timestampUs, track.reader)
+        } else {
+            start = sampleSoundingAt(track, timestampUs)
+            reached = start
+        }
+        return if (reached == samples.size - 1 && endsBefore(track, start, timestampUs)) samples.size else start
+    }
+
+    /**
+     * Si ninguna muestra de [track] desde [from] hasta la última se presenta en [timestampUs] o
+     * después. Cada una se presenta desde su `pts` durante su duración, y una que empieza justo en
+     * ese instante cuenta aunque no declare duración. Se llama con la última muestra ya alcanzada,
+     * así que recorre como mucho lo que hay desde un keyframe hasta el final.
+     */
+    private fun endsBefore(track: ParsedTrack, from: Int, timestampUs: Long): Boolean {
+        val scan = track.reader
+        scan.moveTo(from)
+        var index = from
+        while (true) {
+            if (scan.ptsUs >= timestampUs || timestampUs - scan.ptsUs < scan.durationUs) return false
+            if (++index >= track.samples.size) return true
+            scan.next()
+        }
+    }
+
+    /**
+     * Último keyframe con `pts <= `[timestampUs] entre las muestras que no empiezan a decodificarse
+     * después de él, o la primera muestra si no hay ninguno. Es el algoritmo de siempre del ancla,
+     * con el límite localizado por bisección.
+     */
+    private fun keyFrameAtOrBefore(track: ParsedTrack, timestampUs: Long): Int =
+        track.samples.lastKeyAtOrBefore(decodeLimit(track, timestampUs), timestampUs, track.reader)
+
+    /**
+     * Hasta dónde puede estar el keyframe de [timestampUs]: la primera muestra que se decodifica
+     * después de ese instante, o la última si ninguna lo hace.
+     */
+    private fun decodeLimit(track: ParsedTrack, timestampUs: Long): Int {
+        val samples = track.samples
+        return if (samples.dtsMonotonic) {
+            samples.firstIndexWithDtsAbove(timestampUs, track.reader).coerceAtMost(samples.size - 1)
+        } else {
+            samples.lastIndexWithDtsAtMostLinear(timestampUs, track.reader)
+        }
+    }
+
+    /**
+     * La muestra que suena en [timestampUs]: la última con tiempo no posterior, o la primera si
+     * todas empiezan después. En audio el DTS sigue al PTS a una distancia fija —cero, salvo en
+     * los fMP4 que describe [ParsedTrack.presentationLeadUs]—, así que se busca por DTS el
+     * instante menos esa distancia, por bisección y sin pasarse (ver
+     * [TrackSamples.lastIndexWithDtsAtMost]). Sin descontarla, el audio de esos archivos empezaba
+     * tarde justo lo que tardó su pista en arrancar.
+     */
+    private fun sampleSoundingAt(track: ParsedTrack, timestampUs: Long): Int {
+        val samples = track.samples
+        val scan = track.reader
+        val lead = track.presentationLeadUs
+        val decodeUs = when {
+            lead > 0 && timestampUs < Long.MIN_VALUE + lead -> Long.MIN_VALUE
+            lead < 0 && timestampUs > Long.MAX_VALUE + lead -> Long.MAX_VALUE
+            else -> timestampUs - lead
+        }
+        if (samples.dtsMonotonic) return samples.lastIndexWithDtsAtMost(decodeUs, scan)
+        val index = samples.lastIndexWithDtsAtMostLinear(decodeUs, scan)
+        scan.moveTo(index)
+        val firstAfter = if (scan.dtsUs > decodeUs) index else index + 1
+        return (firstAfter - 1).coerceAtLeast(0)
     }
 
     override fun close(): Unit = input.close()

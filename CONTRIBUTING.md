@@ -54,7 +54,7 @@ integración no se omitan en silencio—, comprueba que el artefacto se puede pu
 un job paralelo ejecuta los benchmarks y su límite de memoria.
 
 Los tests de integración generan archivos de referencia con FFmpeg (x264 con B-frames, x265, AAC
-multipista, Opus), los remuxean con Kotmpeg en ambas direcciones — incluidos `mp4FastStart`, la
+multipista, Opus), los remuxean con Kotmpeg en ambas direcciones — incluidos `fastStart`, la
 escritura de fMP4 propio y la lectura del fMP4 generado por FFmpeg con `frag_keyframe+empty_moov` —
 y comprueban con `ffprobe` códecs, dimensiones, fps, número de paquetes y duración, además de
 exigir una decodificación completa sin un solo error.
@@ -113,6 +113,24 @@ anterior recibe un `NoSuchMethodError`.
 
 Un cambio que solo **añade** miembros es compatible hacia atrás; uno que quita o modifica una firma
 existente no lo es, y va declarado como `Cambios incompatibles` en el [CHANGELOG](CHANGELOG.md).
+
+Lo `internal` no cuenta: el test pregunta la visibilidad a los metadatos de Kotlin y deja fuera las
+clases y los constructores internos, aunque el bytecode los declare públicos. Un refactor interno no
+mueve el volcado; si lo mueve, algo interno se ha vuelto público sin querer.
+
+Los puentes de los valores por defecto sí cuentan, aunque el compilador los marque como sintéticos:
+los métodos `$default` y los constructores que terminan en `DefaultConstructorMarker`. Son lo que
+llama el código compilado que omite argumentos —`Mp4Muxer(file)`, sin bloque, llama al puente, no
+al constructor de dos parámetros—, así que quitar un valor por defecto es una ruptura aunque la
+firma visible no cambie, y el volcado lo enseña.
+
+Para que la API pueda **crecer sin romperse**, que es la forma que le dio la 4.0.0:
+
+- Una opción de escritura nueva va en `MuxerOptions`, como propiedad `var` con su valor por defecto;
+  nunca como parámetro nuevo de un constructor o de la fachada.
+- Un campo nuevo de una pista o de `ColorInfo` va en su `Builder`, y como propiedad de la clase.
+- Un tipo público que puede crecer no es `data class`, y uno que solo devuelve la librería tiene el
+  constructor `internal`, como `Mp4Segment` o `AacConfig.Parsed`.
 
 Cuando el cambio es intencionado, regenera el volcado y **revisa el diff**:
 
@@ -183,7 +201,7 @@ no se puede arreglar sin publicar de nuevo.
 | `CHANGELOG.md` | La entrada nueva, con su fecha |
 | `README.md` | La cabecera «Versión: …», las dos coordenadas de ejemplo y el `-PkotmpegVersion=` del comando de `compat/kotlin-1.9` |
 
-`SECURITY.md` lleva la serie soportada (`3.x`), no una versión exacta, así que solo se toca al
+`SECURITY.md` lleva la serie soportada (`4.x`), no una versión exacta, así que solo se toca al
 subir la mayor.
 
 Y al publicar, el **tag de git tiene que llamarse exactamente igual que la versión**: JitPack usa el
@@ -228,15 +246,17 @@ igual que una firma rota, con lo que hay que revisar.
 
 Y el caso que no parece incompatible pero lo es: **en Kotlin, añadir un parámetro con valor por
 defecto es compatible en código fuente pero no a nivel binario**. El volcado lo delata porque la
-firma JVM cambia, así que añadir un campo a algo como `AacConfig.Parsed` cae en la tercera fila y
-no en la segunda. Las correcciones internas del demuxer, en cambio, no mueven el volcado: patch.
+firma JVM cambia, así que añadir un parámetro a una función pública, o un campo a una `data class`
+pública, cae en la tercera fila y no en la segunda. Por eso las opciones y el modelo van en bloques
+(ver arriba): ahí, lo mismo es una línea nueva y sale por una menor. Las correcciones internas del
+demuxer no mueven el volcado: patch.
 
 ## Cómo está organizada la suite
 
 Los tests se llaman por **lo que cubren**, no por cuándo se escribieron: `ContainerHardeningTest`,
 `UntrustedTableSizesTest`, `LargeFileEdgeCasesTest`, `FastStartSafetyTest`, `HeAacConfigTest`,
 `DisplayGeometryTest`, `WarningChannelTest`… Si vas a tocar una zona delicada —marcas de tiempo,
-tablas del demuxer, el cierre con `mp4FastStart`— el KDoc de la clase que la cubre explica qué
+tablas del demuxer, el cierre con `fastStart`— el KDoc de la clase que la cubre explica qué
 fallaba antes, con qué archivo se reproducía y por qué el código está como está. Casi todos vienen
 de un fallo real, no de un caso imaginado.
 

@@ -57,25 +57,26 @@ class SyncSamplesAndTimelineTest {
         listOf(byteArrayOf(0x68, 0x11, 0x22)),
     )
 
-    private fun audioTrack() = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2),
-    )
+    private fun audioTrack() = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+        codecPrivate = AacConfig.build(48000, 2)
+    }
 
-    private fun videoTrack() = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0, codecPrivate = avcC,
-    )
+    private fun videoTrack() = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        frameRate = 30.0
+        codecPrivate = avcC
+    }
 
     /** Audio con `isKeyFrame` a su valor por defecto, como lo escribiría una integración ingenua. */
     private fun writeAudioOnly(muxer: Muxer, packets: Int = 200, firstPtsUs: Long = 0) {
         val id = muxer.addTrack(audioTrack())
         muxer.start()
         for (i in 0 until packets) {
-            muxer.writePacket(MediaPacket(id, ByteArray(64) { i.toByte() }, ptsUs = firstPtsUs + i * 21_333L))
+            muxer.writePacket(MediaPacket(id, ByteArray(64) { i.toByte() }, ptsUs = firstPtsUs + i * 21_333L, isKeyFrame = false))
         }
         muxer.stop()
     }
 
-    private fun readAll(file: File): List<MediaPacket> = MkvKotlin.openDemuxer(file).use { demuxer ->
+    private fun readAll(file: File): List<MediaPacket> = Kotmpeg.openDemuxer(file).use { demuxer ->
         generateSequence { demuxer.readPacket() }.toList()
     }
 
@@ -96,8 +97,8 @@ class SyncSamplesAndTimelineTest {
     @Test
     fun `an audio only mkv written without key flags can still seek`() {
         val file = File(dir, "seek.mkv")
-        writeAudioOnly(MkvMuxer(file, maxClusterDurationMs = 1_000), packets = 400)
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        writeAudioOnly(MkvMuxer(file) { maxClusterDurationMs = 1_000 }, packets = 400)
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             val landed = demuxer.seekTo(5_000_000)
             assertTrue(landed in 4_000_000..5_000_000, "el seek cayó en $landed µs: no hay cues")
             val next = demuxer.readPacket()
@@ -110,7 +111,7 @@ class SyncSamplesAndTimelineTest {
         val thirtyDaysUs = 30L * 24 * 3600 * 1_000_000
         val file = File(dir, "uptime.mkv")
         writeAudioOnly(MkvMuxer(file), packets = 47, firstPtsUs = thirtyDaysUs)
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             assertTrue(demuxer.durationUs in 950_000..1_100_000, "duración declarada ${demuxer.durationUs} µs")
             assertEquals(0L, demuxer.readPacket()?.ptsUs, "la línea de tiempo no empieza en cero")
         }
@@ -136,8 +137,8 @@ class SyncSamplesAndTimelineTest {
         }
         val mkv = File(dir, "dur.mkv").also { write(MkvMuxer(it)) }
         val mp4 = File(dir, "dur.mp4").also { write(Mp4Muxer(it)) }
-        val mkvUs = MkvKotlin.openDemuxer(mkv).use { it.durationUs }
-        val mp4Us = MkvKotlin.openDemuxer(mp4).use { it.durationUs }
+        val mkvUs = Kotmpeg.openDemuxer(mkv).use { it.durationUs }
+        val mp4Us = Kotmpeg.openDemuxer(mp4).use { it.durationUs }
         assertTrue(abs(mkvUs - 1_000_000) <= 1_000, "MKV declara $mkvUs µs para 30 fotogramas a 30 fps")
         assertTrue(abs(mkvUs - mp4Us) <= 1_000, "MKV $mkvUs µs y MP4 $mp4Us µs no coinciden")
     }
@@ -158,14 +159,14 @@ class SyncSamplesAndTimelineTest {
                     muxer.writePacket(MediaPacket(video, payload, ptsUs = ptsUs, isKeyFrame = frame == 0))
                     expected += ptsUs
                     while (audioIndex * 21_333L <= ptsUs) {
-                        muxer.writePacket(MediaPacket(audio, ByteArray(8), ptsUs = audioIndex * 21_333L))
+                        muxer.writePacket(MediaPacket(audio, ByteArray(8), ptsUs = audioIndex * 21_333L, isKeyFrame = false))
                         audioIndex++
                     }
                     ptsUs += if (frame == 9) 2_000_000 + burst * 350_000L else 16_667
                 }
             }
         }
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             val videoId = demuxer.tracks.first { it is TrackInfo.Video }.id
             val frames = generateSequence { demuxer.readPacket() }.filter { it.trackId == videoId }.toList()
             assertEquals(expected.size, frames.size)
@@ -213,7 +214,7 @@ class SyncSamplesAndTimelineTest {
                 }
             }
         }
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             val frames = generateSequence { demuxer.readPacket() }.toList()
             assertEquals(expected.size, frames.size)
             var previousDts = Long.MIN_VALUE
@@ -232,33 +233,43 @@ class SyncSamplesAndTimelineTest {
     }
 
     /**
-     * El cebado del AAC va en la lista de edición tanto en el MP4 plano como en el fragmentado,
-     * pero el demuxer solo la aplicaba al plano: el fMP4 se releía con el audio 21 ms por detrás de
-     * donde lo ponen FFmpeg y el MP4 plano, y pasarlo a otro contenedor arrastraba ese desfase.
+     * El cebado del AAC se escribe como lista de edición en MP4 y fMP4 y como `CodecDelay` en
+     * Matroska, y los tres tienen que releerse igual: los paquetes con los tiempos con los que se
+     * escribieron, desde cero, y el cebado en `codecDelayUs`.
+     *
+     * Hasta la 3.0.0 el fMP4 perdía la edición. Hasta la 3.x los dos MP4 la restaban de los tiempos
+     * y declaraban un retardo cero, al revés que el MKV: el mismo audio llegaba 21 ms antes desde un
+     * MP4 que desde un MKV, y pasarlo de un contenedor a otro arrastraba ese desfase.
      */
     @Test
-    fun `an fmp4 with encoder priming reads back exactly like the plain mp4`() {
-        val primed = audioTrack().copy(codecDelayUs = 21_333)
-        val timestamps = listOf(false, true).map { fragmented ->
-            val file = File(dir, if (fragmented) "cebado-frag.mp4" else "cebado.mp4")
-            MkvKotlin.createMuxer(file, ContainerFormat.MP4, mp4Fragmented = fragmented).use { muxer ->
+    fun `encoder priming reads back the same from mp4, fmp4 and mkv`() {
+        val primed = audioTrack().copy { codecDelayUs = 21_333 }
+        val written = (0 until 200).map { it * 21_333L }
+        for ((name, fragmented) in listOf("cebado.mp4" to false, "cebado-frag.mp4" to true, "cebado.mkv" to false)) {
+            val file = File(dir, name)
+            Kotmpeg.createMuxer(file) { this.fragmented = fragmented }.use { muxer ->
                 val audio = muxer.addTrack(primed)
                 muxer.start()
-                for (i in 0 until 200) muxer.writePacket(MediaPacket(audio, ByteArray(8), ptsUs = i * 21_333L, isKeyFrame = true))
+                for (pts in written) muxer.writePacket(MediaPacket(audio, ByteArray(8), ptsUs = pts, isKeyFrame = true))
             }
-            MkvKotlin.openDemuxer(file).use { demuxer -> generateSequence { demuxer.readPacket() }.map { it.ptsUs }.toList() }
+            Kotmpeg.openDemuxer(file).use { demuxer ->
+                val delay = (demuxer.tracks.single() as TrackInfo.Audio).codecDelayUs
+                assertTrue(abs(delay - 21_333) <= 21, "$name: cebado releído como $delay µs")
+                val read = generateSequence { demuxer.readPacket() }.map { it.ptsUs }.toList()
+                assertEquals(0L, read.first(), "$name: el primer paquete tiene que seguir en cero")
+                assertEquals(written.size, read.size, "$name: paquetes releídos")
+                val worst = written.zip(read).maxOf { (w, r) -> abs(w - r) }
+                assertTrue(worst < 1_000, "$name: un paquete se releyó $worst µs fuera de su tiempo")
+            }
         }
-        val (plain, fragmented) = timestamps
-        assertTrue(abs(plain.first() + 21_333) <= 21, "el MP4 plano ya no aplica el cebado: empieza en ${plain.first()} µs")
-        assertEquals(plain, fragmented, "el fMP4 se lee con otros tiempos que el MP4 plano de la misma entrada")
     }
 
     @Test
     fun `muxers reject parameters that would produce a broken file`() {
-        assertThrows<IllegalArgumentException> { MkvMuxer(File(dir, "a.mkv"), maxClusterDurationMs = 0) }
-        assertThrows<IllegalArgumentException> { FragmentedMp4Muxer(File(dir, "b.mp4"), fragmentDurationUs = 0) }
+        assertThrows<IllegalArgumentException> { MkvMuxer(File(dir, "a.mkv")) { maxClusterDurationMs = 0 } }
+        assertThrows<IllegalArgumentException> { FragmentedMp4Muxer(File(dir, "b.mp4")) { fragmentDurationUs = 0 } }
         assertThrows<IllegalArgumentException> {
-            MkvKotlin.createMuxer(File(dir, "c.mp4"), ContainerFormat.MP4, mp4Fragmented = true, mp4FragmentDurationUs = -1)
+            Kotmpeg.createMuxer(File(dir, "c.mp4"), ContainerFormat.MP4) { fragmented = true; fragmentDurationUs = -1 }
         }
     }
 }

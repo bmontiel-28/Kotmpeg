@@ -7,12 +7,17 @@ package com.braymon.kotmpeg.model
  *                    o el que aparece en `Demuxer.tracks`).
  * @param data        Carga codificada. Para H.264/H.265 son NALUs con prefijo de longitud
  *                    de 4 bytes.
- * @param ptsUs       Marca de tiempo de presentación en microsegundos.
+ * @param ptsUs       Marca de tiempo de presentación en microsegundos. En audio con cebado es la
+ *                    del paquete tal cual, sin descontar `TrackInfo.Audio.codecDelayUs`: ver
+ *                    ahí la convención.
  * @param dtsUs       Marca de tiempo de decodificación en microsegundos. Puede ser igual a
  *                    [ptsUs] cuando se desconoce (p. ej. desde MediaCodec o desde MKV); los
  *                    muxers que necesitan DTS real (MP4) derivan uno monótono espec-correcto
  *                    automáticamente en ese caso.
- * @param isKeyFrame  True para muestras IDR/sync y para todo paquete de audio.
+ * @param isKeyFrame  True para muestras IDR/sync. Es obligatorio: hasta la 3.x valía `false` por
+ *                    defecto, y un keyframe que no se marcaba por olvido daba un archivo sin
+ *                    puntos de búsqueda, sin ningún error. En audio los muxers tratan todo
+ *                    paquete como punto de acceso, lo diga o no.
  * @param durationUs  Duración del paquete en microsegundos, 0 si se desconoce.
  *
  * **[data] se puede reutilizar en cuanto `Muxer.writePacket` vuelve.** Ningún muxer guarda una
@@ -27,7 +32,7 @@ public class MediaPacket(
     public val data: ByteArray,
     public val ptsUs: Long,
     public val dtsUs: Long = ptsUs,
-    public val isKeyFrame: Boolean = false,
+    public val isKeyFrame: Boolean,
     public val durationUs: Long = 0,
 ) {
     public val size: Int get() = data.size

@@ -38,8 +38,28 @@ public interface Demuxer : Closeable {
     public fun readPacket(): MediaPacket?
 
     /**
-     * Reposiciona el stream en el último keyframe anterior o igual a [timestampUs]
-     * (sobre la pista de vídeo principal si existe). Devuelve la posición real en microsegundos.
+     * Reposiciona el stream en el último keyframe con `pts <= `[timestampUs] de la pista ancla
+     * —la primera de vídeo, o la primera si no hay vídeo— y devuelve su `pts`, en
+     * microsegundos. Si no hay ninguno antes, en el primero.
+     *
+     * Lo siguiente que entrega [readPacket] de esa pista es ese keyframe. Las demás siguen desde
+     * el mismo instante **de presentación**, para que un recorte que empiece en el valor devuelto
+     * tenga imagen y sonido desde el primer momento:
+     * - una pista de audio empieza en el paquete que suena en ese instante. En Matroska, si el
+     *   muxer lo escribió muy por detrás del keyframe —más de diez segundos de lectura, o más de
+     *   64 MiB—, se deja de esperarlo y la pista empieza antes;
+     * - otra pista de vídeo, en su propio último keyframe no posterior. En Matroska, que intercala
+     *   todas las pistas en los mismos clusters, la lectura empieza un cluster antes que el del
+     *   keyframe; si el de esa otra pista queda más atrás, empieza en el siguiente suyo, porque lo
+     *   que hay entre medias no se puede decodificar;
+     * - una pista que ya ha terminado en ese instante —nada suyo se presenta en él ni después— no
+     *   entrega nada. En Matroska, donde un fotograma se muestra hasta el siguiente diga lo que
+     *   diga su duración, de una pista de vídeo eso solo se sabe cerca del final del archivo; antes,
+     *   se trata como si siguiera.
+     *
+     * Hasta la 3.x las demás pistas de un MP4 se colocaban por tiempo de decodificación, que con
+     * B-frames adelantaba el audio, y un MKV cuyos clusters no empezaban en keyframe entregaba
+     * primero fotogramas que no se pueden decodificar.
      */
     public fun seekTo(timestampUs: Long): Long
 }

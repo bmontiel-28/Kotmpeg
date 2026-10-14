@@ -77,8 +77,11 @@ public object AacConfig {
      * PS el núcleo es mono aunque la salida sea estéreo. [sampleRate] y [channelCount] son
      * siempre los de **salida**; si necesitas los del núcleo, están en [coreSampleRate] y
      * [coreChannelCount].
+     *
+     * Solo lo crea [parse]: el constructor es interno para que un campo nuevo no cambie ninguna
+     * firma pública.
      */
-    public class Parsed(
+    public class Parsed internal constructor(
         public val audioObjectType: Int,
         /** Frecuencia de la señal decodificada. Con SBR es la de extensión, no la del núcleo. */
         public val sampleRate: Int,

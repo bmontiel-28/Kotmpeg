@@ -5,7 +5,7 @@ plugins {
 
 // La versión vive aquí y no como texto suelto en el README: es la que acaba en el POM y en el
 // nombre del jar, así que cualquier otra copia acabaría desincronizándose.
-version = "3.1.0"
+version = "4.0.0"
 group = "com.braymon"
 
 // El nombre del jar sigue al del artefacto publicado, no al de la carpeta del repositorio.
@@ -39,13 +39,16 @@ kotlin {
 
 // La firma de la API 26 de Android, como archivo suelto. Es una configuración aparte y no una
 // dependencia de test porque no es un jar: `AndroidApiCompatibilityTest` la lee por su ruta.
-val androidApiSignature: Configuration by configurations.creating {
+val androidApiSignature: Configuration = configurations.create("androidApiSignature") {
     isCanBeConsumed = false
     isTransitive = false
 }
 
 dependencies {
     testImplementation(kotlin("test"))
+    // Solo para `PublicApiTest`: es lo único que distingue una clase `internal` de una pública en
+    // el bytecode, leyendo los metadatos de Kotlin. No llega al artefacto.
+    testImplementation(kotlin("reflect"))
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.animal.sniffer)
     testRuntimeOnly(libs.junit.platform.launcher)

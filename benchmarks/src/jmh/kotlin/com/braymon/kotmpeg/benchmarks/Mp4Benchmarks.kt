@@ -1,6 +1,6 @@
 package com.braymon.kotmpeg.benchmarks
 
-import com.braymon.kotmpeg.MkvKotlin
+import com.braymon.kotmpeg.Kotmpeg
 import com.braymon.kotmpeg.model.ContainerFormat
 import com.braymon.kotmpeg.mp4.Mp4Demuxer
 import org.openjdk.jmh.annotations.Benchmark
@@ -105,6 +105,6 @@ open class Mp4MuxerBenchmark {
 
     @Benchmark
     fun writeTwoHours() {
-        TwoHourFiles.writeInto(MkvKotlin.createMuxer(file, ContainerFormat.MP4))
+        TwoHourFiles.writeInto(Kotmpeg.createMuxer(file, ContainerFormat.MP4))
     }
 }

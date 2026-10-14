@@ -325,22 +325,22 @@ public object NalUnits {
 }
 
 /** Campos de un SPS HEVC necesarios para rellenar un registro hvcC. */
-public class HevcSpsInfo(
-    public val profileSpace: Int,
-    public val tierFlag: Boolean,
-    public val profileIdc: Int,
-    public val profileCompatFlags: Long,
-    public val constraintFlags: Long,
-    public val levelIdc: Int,
-    public val chromaFormatIdc: Int,
-    public val bitDepthLuma: Int,
-    public val bitDepthChroma: Int,
-    public val maxSubLayers: Int,
-    public val temporalIdNesting: Boolean,
+internal class HevcSpsInfo(
+    val profileSpace: Int,
+    val tierFlag: Boolean,
+    val profileIdc: Int,
+    val profileCompatFlags: Long,
+    val constraintFlags: Long,
+    val levelIdc: Int,
+    val chromaFormatIdc: Int,
+    val bitDepthLuma: Int,
+    val bitDepthChroma: Int,
+    val maxSubLayers: Int,
+    val temporalIdNesting: Boolean,
 ) {
-    public companion object {
+    companion object {
         /** Parsea la parte inicial de un SPS HEVC (cabecera + profile_tier_level). */
-        public fun parse(spsNal: ByteArray): HevcSpsInfo {
+        fun parse(spsNal: ByteArray): HevcSpsInfo {
             val rbsp = NalUnits.unescapeRbsp(spsNal.copyOfRange(2, spsNal.size)) // salta la cabecera NAL de 2 bytes
             val r = BitReader(rbsp)
             r.bits(4)                                  // sps_video_parameter_set_id
@@ -385,10 +385,10 @@ public class HevcSpsInfo(
 }
 
 /** Lector de bits MSB-first con soporte Exp-Golomb. */
-public class BitReader(private val data: ByteArray) {
+internal class BitReader(private val data: ByteArray) {
     private var bitPos = 0
 
-    public fun bits(count: Int): Int {
+    fun bits(count: Int): Int {
         var v = 0
         repeat(count) {
             val index = bitPos ushr 3
@@ -401,7 +401,7 @@ public class BitReader(private val data: ByteArray) {
     }
 
     /** Exp-Golomb sin signo. */
-    public fun ue(): Int {
+    fun ue(): Int {
         var zeros = 0
         while (bits(1) == 0) {
             zeros++

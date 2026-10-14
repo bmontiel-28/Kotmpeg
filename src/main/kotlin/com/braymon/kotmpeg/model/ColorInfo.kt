@@ -7,23 +7,77 @@ package com.braymon.kotmpeg.model
  * Los códigos enteros siguen ISO/IEC 23091-2 (los mismos valores que usan el VUI de
  * H.264/H.265, la caja `colr` nclx de MP4, los elementos `Colour` de Matroska y el
  * `MediaFormat` de Android), por lo que mapean 1:1 en todas las capas.
+ *
+ * Se construye con un bloque de configuración, como `TrackInfo`, y por lo mismo: un campo nuevo
+ * —la descripción de color sigue creciendo, con metadatos HDR dinámicos o la posición del
+ * croma— no cambia ninguna firma. Lo que no se configura queda sin especificar.
+ *
+ * ```kotlin
+ * val color = ColorInfo { primaries = ColorInfo.PRIMARIES_BT709; fullRange = true }
+ * ```
  */
-public data class ColorInfo(
+public class ColorInfo private constructor(builder: Builder) {
+
+    public constructor(configure: Builder.() -> Unit = {}) : this(Builder().apply(configure))
+
     /** Primarios de color: 1 = BT.709, 9 = BT.2020, 2 = sin especificar. */
-    val primaries: Int = UNSPECIFIED,
+    public val primaries: Int = builder.primaries
+
     /** Característica de transferencia: 1 = BT.709, 16 = PQ (SMPTE 2084), 18 = HLG. */
-    val transfer: Int = UNSPECIFIED,
+    public val transfer: Int = builder.transfer
+
     /** Coeficientes de matriz: 1 = BT.709, 9 = BT.2020 no constante. */
-    val matrix: Int = UNSPECIFIED,
+    public val matrix: Int = builder.matrix
+
     /** True para rango completo (PC/JPEG), false para rango limitado (broadcast). */
-    val fullRange: Boolean = false,
+    public val fullRange: Boolean = builder.fullRange
+
     /** Metadatos HDR10 estáticos (SMPTE ST 2086 + CTA-861.3). */
-    val hdr: HdrStaticInfo? = null,
-) {
+    public val hdr: HdrStaticInfo? = builder.hdr
+
     init {
         require(primaries in 0..255) { "primaries fuera de rango: $primaries" }
         require(transfer in 0..255) { "transfer fuera de rango: $transfer" }
         require(matrix in 0..255) { "matrix fuera de rango: $matrix" }
+    }
+
+    /** Una copia con lo que cambie [configure]. */
+    public fun copy(configure: Builder.() -> Unit): ColorInfo = ColorInfo(
+        Builder().also {
+            it.primaries = primaries
+            it.transfer = transfer
+            it.matrix = matrix
+            it.fullRange = fullRange
+            it.hdr = hdr
+        }.apply(configure),
+    )
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ColorInfo) return false
+        return primaries == other.primaries && transfer == other.transfer && matrix == other.matrix &&
+            fullRange == other.fullRange && hdr == other.hdr
+    }
+
+    override fun hashCode(): Int {
+        var result = primaries
+        result = 31 * result + transfer
+        result = 31 * result + matrix
+        result = 31 * result + fullRange.hashCode()
+        result = 31 * result + (hdr?.hashCode() ?: 0)
+        return result
+    }
+
+    override fun toString(): String =
+        "ColorInfo(primaries=$primaries, transfer=$transfer, matrix=$matrix, fullRange=$fullRange, hdr=$hdr)"
+
+    /** Los campos de [ColorInfo], para su constructor y para [copy]. Ver cada propiedad en [ColorInfo]. */
+    public class Builder internal constructor() {
+        public var primaries: Int = UNSPECIFIED
+        public var transfer: Int = UNSPECIFIED
+        public var matrix: Int = UNSPECIFIED
+        public var fullRange: Boolean = false
+        public var hdr: HdrStaticInfo? = null
     }
 
     public companion object {
@@ -40,18 +94,29 @@ public data class ColorInfo(
         public const val MATRIX_BT2020_NCL: Int = 9
 
         /** Preajuste: HDR10 (BT.2020 + PQ). */
-        public fun hdr10(hdr: HdrStaticInfo? = null): ColorInfo =
-            ColorInfo(PRIMARIES_BT2020, TRANSFER_PQ, MATRIX_BT2020_NCL, fullRange = false, hdr = hdr)
+        public fun hdr10(hdr: HdrStaticInfo? = null): ColorInfo = ColorInfo {
+            primaries = PRIMARIES_BT2020
+            transfer = TRANSFER_PQ
+            matrix = MATRIX_BT2020_NCL
+            this.hdr = hdr
+        }
 
         /** Preajuste: SDR BT.709 rango broadcast. */
-        public fun bt709(): ColorInfo =
-            ColorInfo(PRIMARIES_BT709, TRANSFER_BT709, MATRIX_BT709, fullRange = false)
+        public fun bt709(): ColorInfo = ColorInfo {
+            primaries = PRIMARIES_BT709
+            transfer = TRANSFER_BT709
+            matrix = MATRIX_BT709
+        }
     }
 }
 
 /**
  * Metadatos HDR estáticos: volumen de color del display de masterizado (ST 2086) y niveles
  * de luz del contenido. Cromaticidades CIE 1931 xy en [0,1]; luminancia en cd/m².
+ *
+ * Es la única clase del modelo que sigue siendo `data class`: sus doce campos son exactamente los
+ * de SMPTE ST 2086 y CTA-861.3, que no van a cambiar. Lo que se añada a HDR —metadatos dinámicos,
+ * por ejemplo— irá en [ColorInfo], que sí está preparada para crecer.
  */
 public data class HdrStaticInfo(
     val redX: Double, val redY: Double,

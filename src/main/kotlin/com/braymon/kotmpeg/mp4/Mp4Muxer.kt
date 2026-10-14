@@ -1,10 +1,12 @@
 package com.braymon.kotmpeg.mp4
 
 import com.braymon.kotmpeg.Muxer
+import com.braymon.kotmpeg.MuxerOptions
 import com.braymon.kotmpeg.io.SeekableOutput
 import com.braymon.kotmpeg.model.AudioCodec
 import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.Timestamps
+import com.braymon.kotmpeg.model.TrackDefaults
 import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.model.VideoCodec
 import java.io.EOFException
@@ -23,9 +25,11 @@ import java.nio.file.StandardCopyOption.REPLACE_EXISTING
  * que los archivos >4 GiB funcionan) mientras los metadatos se mantienen en memoria; el
  * `moov` completo (stts/ctts/stss/stsc/stsz/stco o co64, edit lists) se escribe en [stop].
  *
- * Con [fastStart] (el equivalente de `-movflags +faststart` de FFmpeg) el archivo se
- * reescribe al finalizar como `ftyp moov mdat`, para poder reproducir antes de descargarlo
- * entero (streaming progresivo). Requiere el constructor con [File].
+ * Con `fastStart` de [MuxerOptions] (el equivalente de `-movflags +faststart` de FFmpeg) el
+ * archivo queda al finalizar como `ftyp moov mdat`, para poder reproducir antes de descargarlo
+ * entero (streaming progresivo). Con un [File] se reescribe en un temporal que sustituye al
+ * original de forma atómica; con un [SeekableOutput] se desplazan los datos en el sitio (ver
+ * [stop]). De las demás opciones usa `creationTimeMillis` y `writingApp`.
  *
  * El manejo de tiempos es espec-exacto para la sincronización A/V:
  *  - Si los paquetes llevan DTS monótono válido, se usa directamente.
@@ -37,43 +41,67 @@ import java.nio.file.StandardCopyOption.REPLACE_EXISTING
  *  - Una edit list alinea el inicio de presentación a cero (y conserva los offsets de
  *    inicio por pista), así que los streams con B-frames quedan en sincronía perfecta.
  */
-public class Mp4Muxer private constructor(
+public class Mp4Muxer internal constructor(
     private val out: SeekableOutput,
     private val file: File?,
-    private val fastStart: Boolean,
+    options: MuxerOptions,
 ) : Muxer {
 
-    public constructor(out: SeekableOutput) : this(out, file = null, fastStart = false)
-
-    public constructor(file: File, fastStart: Boolean = false) :
-        this(SeekableOutput(file), file, fastStart)
+    /**
+     * Escribe en [out], que el muxer cierra al terminar. Rechaza `fragmented = true`, y con
+     * `fastStart` exige que [out] se pueda leer, porque el índice se recoloca en el sitio: un
+     * descriptor abierto solo para escribir se rechaza aquí, antes de grabar nada, y no en [stop].
+     * En los dos casos [out] queda cerrado.
+     */
+    public constructor(out: SeekableOutput, options: MuxerOptions.() -> Unit = {}) :
+        this(out, null, MuxerOptions().apply(options).validatedFor(out) { validatedForPlainMp4() })
 
     /**
-     * Fecha de creación que se escribe en `mvhd`, `tkhd` y `mdhd`, en milisegundos desde la época
-     * de Unix. `null` deja los campos a cero, que es lo que hacían siempre.
-     *
-     * **Hay que asignarla antes de [start]**, que es cuando se congelan las cabeceras. Es una
-     * propiedad y no un parámetro del constructor para que añadirla no cambiara la firma de los
-     * constructores públicos, que habría obligado a recompilar a todo el mundo por un metadato.
+     * Escribe en [file], truncándolo. Las opciones se validan antes de abrirlo, y
+     * `fragmented = true` se rechaza: para eso está `FragmentedMp4Muxer`.
      */
-    public var creationTimeMillis: Long? = System.currentTimeMillis()
+    public constructor(file: File, options: MuxerOptions.() -> Unit = {}) :
+        this(MuxerOptions().apply(options).validatedForPlainMp4(), file)
+
+    internal constructor(options: MuxerOptions, file: File) : this(SeekableOutput(file), file, options)
+
+    private val fastStart = options.fastStart
+    private val creationTimeMillis = options.creationTimeMillis
+    private val writingApp = options.writingApp
+
+    init {
+        if (fastStart && file == null) {
+            try {
+                out.requireReadable("fastStart sobre un SeekableOutput recoloca el índice en el sitio y")
+            } catch (t: Throwable) {
+                runCatching { out.close() }
+                throw t
+            }
+        }
+    }
 
     private companion object {
-        const val MOVIE_TIMESCALE = 1000L
-        const val VIDEO_TIMESCALE = 90000L
+        /**
+         * Escala de la película, en milésimas, como la escribe FFmpeg. En ella van las duraciones
+         * de `mvhd` y `tkhd` y las de la lista de edición, así que el hueco inicial de una pista que
+         * arranca después que las demás se expresa al milisegundo: su primera muestra puede leerse
+         * hasta medio milisegundo antes o después de donde se escribió.
+         */
+        private const val MOVIE_TIMESCALE = 1000L
+        private const val VIDEO_TIMESCALE = 90000L
         /** Mayor offset que puede expresar una entrada stco (32 bits sin signo). */
-        const val UINT32_MAX = 0xFFFFFFFFL
+        private const val UINT32_MAX = 0xFFFFFFFFL
 
         /**
          * El origen de tiempos de MP4 es 1904-01-01 UTC y no 1970, así que hay que sumar estos
          * segundos a una marca de Unix. Con `version = 0` el campo es de 32 bits sin signo, que
          * alcanza hasta 2040.
          */
-        const val MP4_EPOCH_OFFSET_S = 2_082_844_800L
+        private const val MP4_EPOCH_OFFSET_S = 2_082_844_800L
 
         /** Flags de `tkhd`: `track_enabled` (0x1) y `track_in_movie` (0x2). */
-        const val TKHD_ENABLED_IN_MOVIE = 3
-        const val TKHD_IN_MOVIE_ONLY = 2
+        private const val TKHD_ENABLED_IN_MOVIE = 3
+        private const val TKHD_IN_MOVIE_ONLY = 2
     }
 
     /** La fecha en la escala de MP4, o 0 si no hay ninguna que escribir. */
@@ -89,6 +117,9 @@ public class Mp4Muxer private constructor(
     }
 
     private val tracks = ArrayList<TrackState>()
+
+    /** [TrackInfo.default] resuelto por pista, en el orden de [tracks]; se fija en [start]. */
+    private var defaultFlags = BooleanArray(0)
     private var started = false
     private var stopped = false
     private var mdatStart = 0L
@@ -114,6 +145,7 @@ public class Mp4Muxer private constructor(
         check(!started) { "ya iniciado" }
         check(tracks.isNotEmpty()) { "sin pistas" }
         started = true
+        defaultFlags = TrackDefaults.resolve(tracks.map { it.info })
 
         val brands = BoxBuilder()
         brands.box("ftyp") {
@@ -134,9 +166,9 @@ public class Mp4Muxer private constructor(
 
     /**
      * Toda muestra de audio se registra como muestra de sincronización, la marque o no quien
-     * llama. En AAC y Opus cada paquete se decodifica por sí solo, y `MediaPacket.isKeyFrame`
-     * vale `false` por defecto: con el audio marcado tal cual llegaba, la pista salía con un
-     * `stss` sin una sola entrada, y los reproductores la tomaban por imposible de buscar.
+     * llama. En AAC y Opus cada paquete se decodifica por sí solo, y con el audio marcado tal
+     * cual llegaba —un codificador de audio no tiene por qué marcarlos como keyframes— la pista salía
+     * con un `stss` sin una sola entrada, y los reproductores la tomaban por imposible de buscar.
      */
     override fun writePacket(packet: MediaPacket) {
         check(started) { "start() no llamado" }
@@ -163,6 +195,13 @@ public class Mp4Muxer private constructor(
      * vez, y las tablas de tiempos se calculan una sola vez para las dos construcciones: cada
      * una recorre todas las muestras de todas las pistas, y en una grabación larga se nota en lo
      * que tarda este método.
+     *
+     * Sobre un [SeekableOutput] no hay ruta con la que crear un temporal, así que el inicio rápido
+     * se hace **en el sitio**: el `moov` se inserta delante del `mdat` desplazando los datos hacia
+     * el final (ver `SeekableOutput.insert`). No necesita espacio extra, pero no tiene la red de
+     * seguridad del temporal: si el proceso muere durante el desplazamiento, el archivo queda
+     * inservible. Hasta la 3.x esta combinación no existía y la única salida era el MP4
+     * fragmentado.
      */
     override fun stop() {
         if (stopped) return
@@ -189,16 +228,18 @@ public class Mp4Muxer private constructor(
             val globalStartUs = globalStartUs()
             val tables = tracks.map { computeTables(it, globalStartUs) }
             val tailMoov = buildMoov(tables, 0)
+            if (fastStart && file == null) {
+                out.insert(mdatStart, buildMoov(tables, frontMoovSize(tables, tailMoov.size.toLong(), maxOffset)))
+                out.close()
+                closed = true
+                return
+            }
             out.write(tailMoov)
             out.close()
             closed = true
 
             if (fastStart && file != null) {
-                var moovSize = tailMoov.size.toLong()
-                if (!useCo64 && maxOffset + moovSize > UINT32_MAX) {
-                    useCo64 = true
-                    moovSize = buildMoov(tables, 0).size.toLong()
-                }
+                val moovSize = frontMoovSize(tables, tailMoov.size.toLong(), maxOffset)
                 try {
                     rewriteFastStart(file, buildMoov(tables, moovSize), mdatSize)
                 } catch (t: Throwable) {
@@ -214,6 +255,19 @@ public class Mp4Muxer private constructor(
         } finally {
             if (!closed) runCatching { out.close() }
         }
+    }
+
+    /**
+     * Tamaño del `moov` que va delante de los datos, sabiendo que el de cola mide [tailSize].
+     *
+     * Es el mismo salvo en un caso: si al desplazar los datos lo que mide el propio `moov` el mayor
+     * offset deja de caber en 32 bits, la tabla pasa a `co64` y el `moov` crece. Por eso
+     * [useCo64] se decide aquí una sola vez, antes de construir el definitivo.
+     */
+    private fun frontMoovSize(tables: List<TrackTables>, tailSize: Long, maxOffset: Long): Long {
+        if (useCo64 || maxOffset + tailSize <= UINT32_MAX) return tailSize
+        useCo64 = true
+        return buildMoov(tables, 0).size.toLong()
     }
 
     /**
@@ -386,6 +440,7 @@ public class Mp4Muxer private constructor(
             for ((i, t) in tracks.withIndex()) {
                 writeTrak(this, t, tables[i], offsetDelta)
             }
+            SampleEntries.writeEncoderTag(this, writingApp)
         }
         return moov.toByteArray()
     }
@@ -401,7 +456,7 @@ public class Mp4Muxer private constructor(
         val trackDurationMs = toMovieTicks(tab.startOffsetUs + tab.presentationDurationUs)
         val tkhdVersion = versionFor(trackDurationMs)
         val created = mp4Time()
-        val tkhdFlags = if (info.default) TKHD_ENABLED_IN_MOVIE else TKHD_IN_MOVIE_ONLY
+        val tkhdFlags = if (defaultFlags[info.id - 1]) TKHD_ENABLED_IN_MOVIE else TKHD_IN_MOVIE_ONLY
         parent.box("trak") {
             fullBox("tkhd", tkhdVersion, tkhdFlags) {
                 if (tkhdVersion == 1) {

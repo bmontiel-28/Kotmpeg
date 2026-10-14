@@ -322,10 +322,10 @@ class MatroskaContentEncodingTest {
         val file = File(dir, "completo.mkv")
         MkvMuxer(file).use { muxer ->
             val id = muxer.addTrack(
-                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2)),
+                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) { codecPrivate = AacConfig.build(48000, 2) },
             )
             muxer.start()
-            for (i in 0 until 20) muxer.writePacket(MediaPacket(id, ByteArray(1000) { i.toByte() }, ptsUs = i * 21_333L))
+            for (i in 0 until 20) muxer.writePacket(MediaPacket(id, ByteArray(1000) { i.toByte() }, ptsUs = i * 21_333L, isKeyFrame = false))
         }
         val bytes = file.readBytes()
         val lastBlock = bytes.size - 2_000

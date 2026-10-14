@@ -47,12 +47,12 @@ class HeAacConfigTest {
     }
 
     /** Lo que produce `AudioEncoder.trackInfo()`: canales y tasa de la config, ASC del códec. */
-    private fun heTrack(asc: ByteArray) = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2, codecPrivate = asc,
-    )
+    private fun heTrack(asc: ByteArray) = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2) {
+        codecPrivate = asc
+    }
 
     private fun writeAudio(target: File, format: ContainerFormat, asc: ByteArray) {
-        MkvKotlin.createMuxer(target, format).use { muxer ->
+        Kotmpeg.createMuxer(target, format).use { muxer ->
             val id = muxer.addTrack(heTrack(asc))
             muxer.start()
             for (i in 0 until 20) {
@@ -67,7 +67,7 @@ class HeAacConfigTest {
     }
 
     private fun readTrack(file: File): TrackInfo.Audio =
-        MkvKotlin.openDemuxer(file).use { it.tracks.first() as TrackInfo.Audio }
+        Kotmpeg.openDemuxer(file).use { it.tracks.first() as TrackInfo.Audio }
 
     /**
      * **El ASC declara lo que codifica el núcleo; `parse` tiene que devolver lo que sale.**
@@ -134,7 +134,7 @@ class HeAacConfigTest {
         val mp4 = File(dir, "origen.mp4")
         writeAudio(mp4, ContainerFormat.MP4, ASC_HE_V2)
         val mkv = File(dir, "convertido.mkv")
-        MkvKotlin.remux(mp4, mkv)
+        Kotmpeg.remux(mp4, mkv)
 
         val track = readTrack(mkv)
         assertEquals(2, track.channelCount, "el remux perdió el estéreo")
@@ -188,7 +188,7 @@ class HeAacConfigTest {
         )
 
         val out = File(dir, "he-convertido.mkv")
-        MkvKotlin.remux(source, out)
+        Kotmpeg.remux(source, out)
         assertEquals(48_000, readTrack(out).sampleRate, "el remux heredó la tasa del núcleo")
     }
 
@@ -206,12 +206,12 @@ class HeAacConfigTest {
         assertEquals(48_000, readTrack(he).sampleRate)
 
         val lc = File(dir, "propio-lc.mkv")
-        MkvKotlin.createMuxer(lc, ContainerFormat.MKV).use { muxer ->
+        Kotmpeg.createMuxer(lc, ContainerFormat.MKV).use { muxer ->
             val id = muxer.addTrack(
-                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2, codecPrivate = AacConfig.build(48_000, 2)),
+                TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48_000, channelCount = 2) { codecPrivate = AacConfig.build(48_000, 2) },
             )
             muxer.start()
-            muxer.writePacket(MediaPacket(id, ByteArray(16), ptsUs = 0))
+            muxer.writePacket(MediaPacket(id, ByteArray(16), ptsUs = 0, isKeyFrame = false))
         }
         assertTrue(!declaresOutputSamplingFrequency(lc), "un AAC-LC no lleva OutputSamplingFrequency")
         assertEquals(48_000, readTrack(lc).sampleRate)

@@ -140,34 +140,41 @@ internal object FuzzSeeds {
         segmentIndex: Boolean = false,
     ): ByteArray {
         val muxer = if (segmentIndex) {
-            FragmentedMp4Muxer(file, 300_000).apply { this.segmentIndex = true }
+            FragmentedMp4Muxer(file) { fragmentDurationUs = 300_000; this.segmentIndex = true }
         } else {
-            MkvKotlin.createMuxer(file, format, mp4FastStart = fastStart, mp4Fragmented = fragmented, mp4FragmentDurationUs = 300_000)
+            Kotmpeg.createMuxer(file, format) { this.fastStart = fastStart; this.fragmented = fragmented; fragmentDurationUs = 300_000 }
         }
         val video = if (hevcConfig != null) {
-            TrackInfo.Video(
-                codec = VideoCodec.H265, width = 64, height = 48, frameRate = 15.0, codecPrivate = hevcConfig,
-                color = ColorInfo(
-                    primaries = 9, transfer = 16, matrix = 9, fullRange = false,
-                    hdr = HdrStaticInfo(0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290, 1000.0, 0.005, 1000, 400),
-                ),
-                language = "spa", name = "Pantalla",
-            )
+            TrackInfo.Video(codec = VideoCodec.H265, width = 64, height = 48) {
+                frameRate = 15.0
+                codecPrivate = hevcConfig
+                color = ColorInfo {
+                    primaries = 9
+                    transfer = 16
+                    matrix = 9
+                    hdr = HdrStaticInfo(0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290, 1000.0, 0.005, 1000, 400)
+                }
+                language = "spa"
+                name = "Pantalla"
+            }
         } else {
-            TrackInfo.Video(
-                codec = VideoCodec.H264, width = 64, height = 48, frameRate = 15.0, rotationDegrees = 90,
-                codecPrivate = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x1F, 0x11)), listOf(byteArrayOf(0x68, 0x22))),
-            )
+            TrackInfo.Video(codec = VideoCodec.H264, width = 64, height = 48) {
+                frameRate = 15.0
+                rotationDegrees = 90
+                codecPrivate = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x1F, 0x11)), listOf(byteArrayOf(0x68, 0x22)))
+            }
         }
         val videoId = muxer.addTrack(video)
         val aacId = muxer.addTrack(
-            TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = AacConfig.build(48000, 2), name = "Micrófono"),
+            TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) { codecPrivate = AacConfig.build(48000, 2); name = "Micrófono" },
         )
         val opusId = muxer.addTrack(
-            TrackInfo.Audio(
-                codec = AudioCodec.OPUS, sampleRate = 48000, channelCount = 2, codecDelayUs = 6_500,
-                codecPrivate = OpusConfig.buildOpusHead(channelCount = 2), language = "eng", default = false,
-            ),
+            TrackInfo.Audio(codec = AudioCodec.OPUS, sampleRate = 48000, channelCount = 2) {
+                codecDelayUs = 6_500
+                codecPrivate = OpusConfig.buildOpusHead(channelCount = 2)
+                language = "eng"
+                default = false
+            },
         )
         muxer.start()
         val random = Random(7)

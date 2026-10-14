@@ -149,6 +149,37 @@ internal object SampleEntries {
     }
 
     /** Escribe la matriz de presentación de 9 entradas de tkhd/mvhd (punto fijo 16.16 / 2.30). */
+    /**
+     * La aplicación que escribió el archivo, en `udta` > `meta` > `ilst` > `©too`: lo que FFmpeg
+     * escribe con su propio nombre y lo que `ffprobe` muestra como `encoder`. Va en el `moov` de los
+     * dos muxers MP4; con [app] vacío no se escribe nada.
+     *
+     * El `meta` es una full box, como en ISO/IEC 14496-12, y su `hdlr` declara `mdir`, el
+     * manejador de metadatos de iTunes que define esta estructura de `ilst`.
+     */
+    fun writeEncoderTag(parent: BoxBuilder, app: String) {
+        if (app.isEmpty()) return
+        parent.box("udta") {
+            fullBox("meta", 0, 0) {
+                fullBox("hdlr", 0, 0) {
+                    u32(0)                               // pre_defined
+                    fourcc("mdir")                       // handler_type
+                    fourcc("appl"); u32(0); u32(0)       // reserved
+                    u8(0)                                // name, vacío
+                }
+                box("ilst") {
+                    box("\u00A9too") {
+                        box("data") {
+                            u32(1)                       // type: texto UTF-8
+                            u32(0)                       // locale
+                            bytes(app.toByteArray(Charsets.UTF_8))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fun writeDisplayMatrix(b: BoxBuilder, rotationDegrees: Int, width: Int, height: Int) {
         val one = 0x00010000L
         val negOne = 0xFFFF0000L

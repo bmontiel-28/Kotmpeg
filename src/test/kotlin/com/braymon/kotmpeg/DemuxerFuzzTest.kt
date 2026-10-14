@@ -73,7 +73,7 @@ class DemuxerFuzzTest {
             for (seed in seeds) {
                 val file = File(dir, "${seed.name}.${seed.container.extension}").apply { writeBytes(seed.bytes) }
                 val warnings = ArrayList<String>()
-                val packets = MkvKotlin.openDemuxer(file) { warnings += it }.use { demuxer ->
+                val packets = Kotmpeg.openDemuxer(file) { warnings += it }.use { demuxer ->
                     generateSequence { demuxer.readPacket() }.count()
                 }
                 assertTrue(packets > 0, "${seed.name}: no entregó ningún paquete")

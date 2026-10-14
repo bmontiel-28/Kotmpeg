@@ -28,19 +28,19 @@ class FastStartSafetyTest {
     @TempDir
     lateinit var dir: File
 
-    private fun videoTrack() = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0,
+    private fun videoTrack() = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        frameRate = 30.0
         codecPrivate = NalUnits.buildAvcC(
             listOf(byteArrayOf(0x67, 0x64, 0x00, 0x1F, 0x11, 0x22, 0x33)),
             listOf(byteArrayOf(0x68, 0x11, 0x22)),
-        ),
-    )
+        )
+    }
 
     private fun payload(i: Int): ByteArray =
         NalUnits.joinLengthPrefixed(listOf(ByteArray(24 + (i % 5) * 4) { (i + it).toByte() }))
 
     private fun writeMp4(target: File, frames: Int, fastStart: Boolean): Mp4Muxer {
-        val muxer = Mp4Muxer(target, fastStart = fastStart)
+        val muxer = Mp4Muxer(target) { this.fastStart = fastStart }
         val id = muxer.addTrack(videoTrack())
         muxer.start()
         for (i in 0 until frames) {
@@ -53,7 +53,7 @@ class FastStartSafetyTest {
 
     /** Paquetes releídos como (pts, tamaño), para comparar dos archivos muestra a muestra. */
     private fun readBack(file: File): List<Pair<Long, Int>> =
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             generateSequence { demuxer.readPacket() }.map { it.ptsUs to it.data.size }.toList()
         }
 

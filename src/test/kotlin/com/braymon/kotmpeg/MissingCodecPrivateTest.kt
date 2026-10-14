@@ -30,12 +30,12 @@ class MissingCodecPrivateTest {
     lateinit var dir: File
 
     private fun writeAudio(file: File, format: ContainerFormat, fragmented: Boolean, track: TrackInfo.Audio): TrackInfo.Audio {
-        MkvKotlin.createMuxer(file, format, mp4Fragmented = fragmented).use { muxer ->
+        Kotmpeg.createMuxer(file, format) { this.fragmented = fragmented }.use { muxer ->
             val id = muxer.addTrack(track)
             muxer.start()
-            for (i in 0 until 5) muxer.writePacket(MediaPacket(id, ByteArray(16), ptsUs = i * 20_000L))
+            for (i in 0 until 5) muxer.writePacket(MediaPacket(id, ByteArray(16), ptsUs = i * 20_000L, isKeyFrame = false))
         }
-        return MkvKotlin.openDemuxer(file).use { it.tracks.single() as TrackInfo.Audio }
+        return Kotmpeg.openDemuxer(file).use { it.tracks.single() as TrackInfo.Audio }
     }
 
     private val containers = listOf(
@@ -57,7 +57,7 @@ class MissingCodecPrivateTest {
     @Test
     fun `opus without codecPrivate takes its pre skip from the declared delay`() {
         for ((suffix, format, fragmented) in containers) {
-            val track = TrackInfo.Audio(codec = AudioCodec.OPUS, sampleRate = 48_000, channelCount = 2, codecDelayUs = 10_000)
+            val track = TrackInfo.Audio(codec = AudioCodec.OPUS, sampleRate = 48_000, channelCount = 2) { codecDelayUs = 10_000 }
             val read = writeAudio(File(dir, "opus.$suffix"), format, fragmented, track)
             val head = OpusConfig.parseOpusHead(assertNotNull(read.codecPrivate, "$suffix sin OpusHead"))
             assertEquals(480, head.preSkip, "$suffix: 10 ms a 48 kHz son 480 muestras")
@@ -72,7 +72,7 @@ class MissingCodecPrivateTest {
         val error = assertFailsWith<IllegalArgumentException> { mkv.addTrack(video) }
         assertEquals(true, error.message?.contains("codecPrivate"), error.message)
         mkv.close()
-        MkvKotlin.createMuxer(File(dir, "video.mp4")).use { mp4 ->
+        Kotmpeg.createMuxer(File(dir, "video.mp4")).use { mp4 ->
             assertFailsWith<IllegalArgumentException> { mp4.addTrack(video) }
         }
     }

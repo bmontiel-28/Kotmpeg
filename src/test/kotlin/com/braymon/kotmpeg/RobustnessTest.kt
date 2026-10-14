@@ -40,18 +40,18 @@ class RobustnessTest {
     private val fakePps = byteArrayOf(0x68, 0x11, 0x22)
     private val avcC = NalUnits.buildAvcC(listOf(fakeSps), listOf(fakePps))
 
-    private fun videoTrack() = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240, frameRate = 30.0, codecPrivate = avcC,
-    )
+    private fun videoTrack() = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
+        frameRate = 30.0
+        codecPrivate = avcC
+    }
 
-    private fun audioTrack(rate: Int = 48000, channels: Int = 2) = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = rate, channelCount = channels,
-        codecPrivate = AacConfig.build(rate, channels),
-    )
+    private fun audioTrack(rate: Int = 48000, channels: Int = 2) = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = rate, channelCount = channels) {
+        codecPrivate = AacConfig.build(rate, channels)
+    }
 
     /** Escribe un archivo pequeño pero válido en el contenedor pedido. */
     private fun writeSample(file: File, format: ContainerFormat, frames: Int = 12): File {
-        val muxer = MkvKotlin.createMuxer(file, format)
+        val muxer = Kotmpeg.createMuxer(file, format)
         val videoId = muxer.addTrack(videoTrack())
         muxer.start()
         val rnd = Random(3)
@@ -81,7 +81,7 @@ class RobustnessTest {
                 val cut = File(dir, "cut-${format.name}-$fraction.bin")
                 cut.writeBytes(bytes.copyOfRange(0, (bytes.size * fraction).toInt()))
                 runCatching {
-                    MkvKotlin.openDemuxer(cut).use { demuxer ->
+                    Kotmpeg.openDemuxer(cut).use { demuxer ->
                         while (demuxer.readPacket() != null) Unit
                     }
                 }
@@ -98,7 +98,7 @@ class RobustnessTest {
             bytes[0] = 0x1A; bytes[1] = 0x45; bytes[2] = 0xDF.toByte(); bytes[3] = 0xA3.toByte()
             val f = File(dir, "fuzz-mkv-$seed.mkv")
             f.writeBytes(bytes)
-            runCatching { MkvKotlin.openDemuxer(f).use { while (it.readPacket() != null) Unit } }
+            runCatching { Kotmpeg.openDemuxer(f).use { while (it.readPacket() != null) Unit } }
         }
         repeat(40) { seed ->
             val bytes = ByteArray(512)
@@ -108,7 +108,7 @@ class RobustnessTest {
             bytes[6] = 'y'.code.toByte(); bytes[7] = 'p'.code.toByte()
             val f = File(dir, "fuzz-mp4-$seed.mp4")
             f.writeBytes(bytes)
-            runCatching { MkvKotlin.openDemuxer(f).use { while (it.readPacket() != null) Unit } }
+            runCatching { Kotmpeg.openDemuxer(f).use { while (it.readPacket() != null) Unit } }
         }
     }
 
@@ -124,7 +124,7 @@ class RobustnessTest {
         val broken = File(dir, "unknown-size.mkv")
         broken.writeBytes(bytes)
 
-        assertFailsWith<Exception> { MkvKotlin.openDemuxer(broken).close() }
+        assertFailsWith<Exception> { Kotmpeg.openDemuxer(broken).close() }
     }
 
     private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
@@ -163,7 +163,7 @@ class RobustnessTest {
         val noCues = File(dir, "no-cues.mkv")
         noCues.writeBytes(bytes)
 
-        MkvKotlin.openDemuxer(noCues).use { demuxer ->
+        Kotmpeg.openDemuxer(noCues).use { demuxer ->
             val target = 2_000_000L
             val landed = demuxer.seekTo(target)
             assertTrue(landed > 0, "sin Cues el seek volvió al principio en vez de escanear")
@@ -194,14 +194,14 @@ class RobustnessTest {
         val file = File(dir, "big-asc.mp4")
         val muxer = Mp4Muxer(file)
         val id = muxer.addTrack(
-            TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2, codecPrivate = bigAsc),
+            TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) { codecPrivate = bigAsc },
         )
         muxer.start()
         muxer.writePacket(MediaPacket(id, ByteArray(32), 0, 0, true, 21_333))
         muxer.writePacket(MediaPacket(id, ByteArray(32), 21_333, 21_333, true, 21_333))
         muxer.stop()
 
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             val track = demuxer.tracks.filterIsInstance<TrackInfo.Audio>().single()
             assertContentEquals(bigAsc, track.codecPrivate, "el ASC largo no sobrevivió al esds")
         }

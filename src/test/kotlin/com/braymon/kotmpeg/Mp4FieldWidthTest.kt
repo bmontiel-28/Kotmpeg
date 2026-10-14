@@ -33,18 +33,16 @@ class Mp4FieldWidthTest {
     /** ~57,9 días: en ticks de película (ms) supera holgadamente 0xFFFFFFFF. */
     private val farOutUs = 5_000_000_000_000L
 
-    private fun videoTrack() = TrackInfo.Video(
-        codec = VideoCodec.H264, width = 320, height = 240,
+    private fun videoTrack() = TrackInfo.Video(codec = VideoCodec.H264, width = 320, height = 240) {
         codecPrivate = NalUnits.buildAvcC(
             listOf(byteArrayOf(0x67, 0x64, 0x00, 0x1F, 0x11, 0x22, 0x33)),
             listOf(byteArrayOf(0x68, 0x11, 0x22)),
-        ),
-    )
+        )
+    }
 
-    private fun audioTrack(rate: Int) = TrackInfo.Audio(
-        codec = AudioCodec.AAC, sampleRate = rate, channelCount = 2,
-        codecPrivate = AacConfig.build(rate, 2),
-    )
+    private fun audioTrack(rate: Int) = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = rate, channelCount = 2) {
+        codecPrivate = AacConfig.build(rate, 2)
+    }
 
     private fun payload(i: Int) = ByteArray(32) { i.toByte() }
 
@@ -98,7 +96,7 @@ class Mp4FieldWidthTest {
     @Test
     fun `an edit list longer than 32 bits is written as version 1`() {
         val file = File(dir, "long-edts.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val v = muxer.addTrack(videoTrack())
             val a = muxer.addTrack(audioTrack(48_000))
             muxer.start()
@@ -142,7 +140,7 @@ class Mp4FieldWidthTest {
     @Test
     fun `an empty edit longer than 32 bits keeps its media time at minus one`() {
         val file = File(dir, "long-delay.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val v = muxer.addTrack(videoTrack())
             val a = muxer.addTrack(audioTrack(48_000))
             muxer.start()
@@ -169,7 +167,7 @@ class Mp4FieldWidthTest {
     @Test
     fun `a normal edit list stays on version 0`() {
         val file = File(dir, "normal-edts.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val v = muxer.addTrack(videoTrack())
             val a = muxer.addTrack(audioTrack(48_000))
             muxer.start()
@@ -201,7 +199,7 @@ class Mp4FieldWidthTest {
     @Test
     fun `a sample rate above the 16 bit field saturates instead of wrapping`() {
         val file = File(dir, "96k.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val a = muxer.addTrack(audioTrack(96_000))
             muxer.start()
             muxer.writePacket(MediaPacket(a, payload(0), 0, 0, true, 10_666L))
@@ -228,14 +226,14 @@ class Mp4FieldWidthTest {
     @Test
     fun `the real sample rate survives the round trip through esds`() {
         val file = File(dir, "96k-roundtrip.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val a = muxer.addTrack(audioTrack(96_000))
             muxer.start()
             muxer.writePacket(MediaPacket(a, payload(0), 0, 0, true, 10_666L))
             muxer.writePacket(MediaPacket(a, payload(1), 10_666L, 10_666L, true, 10_666L))
         }
 
-        MkvKotlin.openDemuxer(file).use { demuxer ->
+        Kotmpeg.openDemuxer(file).use { demuxer ->
             val track = demuxer.tracks.single()
             assertTrue(track is TrackInfo.Audio)
             assertEquals(
@@ -249,7 +247,7 @@ class Mp4FieldWidthTest {
     @Test
     fun `a normal sample rate is written unchanged`() {
         val file = File(dir, "48k.mp4")
-        MkvKotlin.createMuxer(file, ContainerFormat.MP4).use { muxer ->
+        Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val a = muxer.addTrack(audioTrack(48_000))
             muxer.start()
             muxer.writePacket(MediaPacket(a, payload(0), 0, 0, true, 21_333L))

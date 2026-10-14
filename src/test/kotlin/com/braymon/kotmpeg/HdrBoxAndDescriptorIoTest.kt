@@ -59,12 +59,11 @@ class HdrBoxAndDescriptorIoTest {
      */
     private fun writeHdrMp4(): File {
         val file = File(dir, "hdr.mp4")
-        val track = TrackInfo.Video(
-            codec = VideoCodec.H264, width = 3840, height = 2160,
-            codecPrivate = avcC(),
-            color = ColorInfo.hdr10(hdr()),
-        )
-        MkvKotlin.createMuxer(file).use { muxer ->
+        val track = TrackInfo.Video(codec = VideoCodec.H264, width = 3840, height = 2160) {
+            codecPrivate = avcC()
+            color = ColorInfo.hdr10(hdr())
+        }
+        Kotmpeg.createMuxer(file).use { muxer ->
             val id = muxer.addTrack(track)
             muxer.start()
             muxer.writePacket(MediaPacket(id, ByteArray(64) { 7 }, 0, 0, true, 33_333))
@@ -250,15 +249,39 @@ class HdrBoxAndDescriptorIoTest {
      * ruta del sistema de archivos, solo un `ParcelFileDescriptor`. Aquí se usa el
      * `FileDescriptor` de un `RandomAccessFile` para ejercitar el mismo camino en la JVM.
      */
+    /**
+     * Un descriptor abierto en `"rw"` sobre un archivo más largo que lo que se va a escribir. Hasta
+     * la 3.x no se truncaba, y el resto del contenido anterior quedaba detrás del final: un MKV lo
+     * leía como parte del último cluster.
+     */
+    @Test
+    fun `writing through a descriptor replaces what the file had before`() {
+        val file = File(dir, "reutilizado.mkv").apply { writeBytes(ByteArray(1 shl 20) { 0x55 }) }
+        val track = TrackInfo.Video(codec = VideoCodec.H264, width = 640, height = 480) { codecPrivate = avcC() }
+        RandomAccessFile(file, "rw").use { raf ->
+            Kotmpeg.createMuxer(SeekableOutput(raf.fd), ContainerFormat.MKV).use { muxer ->
+                val id = muxer.addTrack(track)
+                muxer.start()
+                for (i in 0 until 5) muxer.writePacket(MediaPacket(id, ByteArray(32) { i.toByte() }, i * 40_000L, isKeyFrame = true))
+            }
+        }
+        assertTrue(file.length() < 4096, "quedó el contenido anterior: ${file.length()} bytes")
+        val warnings = ArrayList<String>()
+        Kotmpeg.openDemuxer(file, onWarning = { warnings.add(it) }).use { demuxer ->
+            assertEquals(5, generateSequence { demuxer.readPacket() }.count())
+        }
+        assertEquals(emptyList(), warnings)
+    }
+
     @Test
     fun `a container can be written and read entirely through a file descriptor`() {
         val file = File(dir, "fd.mkv")
-        val track = TrackInfo.Video(
-            codec = VideoCodec.H264, width = 640, height = 480, codecPrivate = avcC(),
-        )
+        val track = TrackInfo.Video(codec = VideoCodec.H264, width = 640, height = 480) {
+            codecPrivate = avcC()
+        }
 
         RandomAccessFile(file, "rw").use { raf ->
-            MkvKotlin.createMuxer(SeekableOutput(raf.fd), ContainerFormat.MKV).use { muxer ->
+            Kotmpeg.createMuxer(SeekableOutput(raf.fd), ContainerFormat.MKV).use { muxer ->
                 val id = muxer.addTrack(track)
                 muxer.start()
                 for (i in 0 until 5) {
@@ -272,7 +295,7 @@ class HdrBoxAndDescriptorIoTest {
         assertTrue(file.length() > 0, "no se escribió nada por el descriptor")
 
         RandomAccessFile(file, "r").use { raf ->
-            MkvKotlin.openDemuxer(SeekableInput(raf.fd)).use { demuxer ->
+            Kotmpeg.openDemuxer(SeekableInput(raf.fd)).use { demuxer ->
                 assertEquals(1, demuxer.tracks.size)
                 var count = 0
                 while (demuxer.readPacket() != null) count++
@@ -289,7 +312,7 @@ class HdrBoxAndDescriptorIoTest {
     fun `detecting the format through a descriptor does not consume the header`() {
         val file = writeHdrMp4()
         RandomAccessFile(file, "r").use { raf ->
-            MkvKotlin.openDemuxer(SeekableInput(raf.fd)).use { demuxer ->
+            Kotmpeg.openDemuxer(SeekableInput(raf.fd)).use { demuxer ->
                 assertEquals(1, demuxer.tracks.size, "el demuxer no pudo parsear desde el principio")
             }
         }
@@ -310,7 +333,7 @@ class HdrBoxAndDescriptorIoTest {
 
         val input = SeekableInput(file)
         assertTrue(OpenFiles.isOpen(file), "no llegó a abrirse el archivo")
-        assertFailsWith<IllegalArgumentException> { MkvKotlin.openDemuxer(input) }
+        assertFailsWith<IllegalArgumentException> { Kotmpeg.openDemuxer(input) }
 
         assertFalse(OpenFiles.isOpen(file), "openDemuxer dejó el descriptor abierto al no reconocer el contenedor")
     }
@@ -319,6 +342,6 @@ class HdrBoxAndDescriptorIoTest {
     @Test
     fun `a file too short to hold a header is not detected as a container`() {
         val file = File(dir, "tiny.bin").also { it.writeBytes(ByteArray(4)) }
-        assertNull(MkvKotlin.detectFormat(file))
+        assertNull(Kotmpeg.detectFormat(file))
     }
 }

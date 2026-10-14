@@ -74,7 +74,7 @@ class CommentPolicyTest {
      * Cuenta los comentarios que **no** son KDoc.
      *
      * Es un recorrido con estado y no una expresión regular a propósito: hay `//` que no son
-     * comentarios —dentro de una cadena, o en el ejemplo de uso del KDoc de `MkvKotlin`— y una
+     * comentarios —dentro de una cadena, o en el ejemplo de uso del KDoc de `Kotmpeg`— y una
      * regexp los contaría. Reconoce cadenas normales y crudas, literales de carácter y bloques
      * anidados.
      */
