@@ -612,6 +612,22 @@ que un usuario no puede esquivar—, después la forma de la API, y al final lo 
    `Remuxer` con el muxer ya abierto, están ahora en dos funciones que la fachada llama antes de
    abrir el destino; la excepción es la misma.
 
+10. **La conversión de escalas de tiempo no reserva memoria al desbordar.** La encontró la campaña
+    semanal de fuzzing, sobre el código de la 3.1.0, el mismo día en que se subió la 4.0.0: un fMP4
+    de 6 KB hacía reservar 230 MiB. Una mutación había dejado un `tfdt` con un tiempo de
+    decodificación de 7·10¹⁶ tics y un `trun` sin campos por muestra con una cuenta enorme, que
+    se acota al tamaño del archivo: unas 6 000 muestras de tamaño cero con tiempos que, pasados a
+    µs, desbordan. `Timestamps` detectaba el desbordamiento capturando la `ArithmeticException` de
+    `Math.multiplyExact`, y crear una excepción reserva su traza, unos 3 KB; eso, en cada muestra y
+    en cada pasada por el fragmento. En la 4.0.0 la misma entrada reservaba 62 MiB, por debajo del
+    tope del arnés pero igual de desproporcionado. Ahora el desbordamiento se detecta por la
+    longitud en bits de los dos factores —y, en el margen, con una división—, y lo que desborda se
+    resuelve con `valor = q · divisor + r`, exacto y sin `BigInteger` salvo en los extremos de
+    `Long`. La misma entrada reserva 1,9 MiB, casi todo los propios paquetes. Lo fijan dos tests
+    que fallan sin la corrección —leer un fMP4 reconstruido de 4,9 KB reservaba 62 MiB, y 10 000
+    conversiones que desbordan, 31 MiB— y otro que compara la conversión nueva con la definición
+    exacta en 20 000 casos, extremos incluidos.
+
 ### 10.2 Una API que ya no se rompe al crecer
 
 Kotlin compila los parámetros con valor por defecto y las `data class` a firmas JVM que **cambian con
@@ -739,7 +755,7 @@ wrapper en Gradle 8, porque el plugin de Kotlin 1.9 no funciona con Gradle 9.
 
 ### 10.6 Cómo se verificó
 
-- **Suite completa: 275 tests**, sin fallos ni omitidos, incluida la integración con FFmpeg real,
+- **Suite completa: 278 tests**, sin fallos ni omitidos, incluida la integración con FFmpeg real,
   lanzando Gradle con JDK 21 y otra vez con JDK 17, como el CI.
 - **Cada corrección con su test**, escrito para fallar con el comportamiento anterior: el cebado en los
   tres contenedores, la búsqueda por tiempo de presentación, la búsqueda en MKV con y sin índice
@@ -784,7 +800,9 @@ wrapper en Gradle 8, porque el plugin de Kotlin 1.9 no funciona con Gradle 9.
   nueva de MKV. Tras los últimos cambios de la búsqueda, dos pasadas más de dos minutos con
   semillas nuevas (40000015 y 40000016): 476 955 y 435 980 variantes, ninguna falla, y una reserva
   máxima de 3,6 MiB. Tras la revisión de cierre, otra de dos minutos (40000017): 799 447
-  variantes, ninguna falla, y 3,8 MiB de reserva máxima.
+  variantes, ninguna falla, y 3,8 MiB de reserva máxima. Tras corregir la conversión de escalas,
+  dos minutos con la semilla de la campaña que la encontró (39233584437): 1 262 915 variantes,
+  ninguna falla, y 3,6 MiB de reserva máxima.
 - **Benchmarks** con `verificarLimites`: los once dentro de su límite de memoria.
 - **El consumidor con Kotlin 1.9** contra el artefacto 4.0.0 publicado en el Maven local, y
   `AndroidApiCompatibilityTest` contra la API 26 de Android, que encontró dos llamadas nuevas que no
@@ -844,6 +862,12 @@ encontraron las grabaciones reales—; lo que retenía esa búsqueda no tenía t
 dejaban de avanzar; un destino de solo lectura fallaba sin mensaje; y en fMP4 cada búsqueda
 reservaba el doble de memoria que en la 3.1.0. Todo está corregido arriba, y el cebado del segundo
 segmento de `concat`, explicado y fijado con un test (§10.4).
+
+Al subir el commit, el CI encontró dos cosas más. Un test de integración que pasaba con FFmpeg 8.1
+fallaba con la 6.1 del CI: la captura con el audio llegando antes que el vídeo copiaba el cebado
+del original aunque había descartado su paquete, y las dos versiones de ffprobe dan un inicio
+distinto para el mismo MKV correcto; ahora copia las pistas sin cebado. Y la campaña semanal de
+fuzzing encontró el desbordamiento de §10.1, punto 10. Los dos se corrigieron antes de la etiqueta.
 
 Las observaciones de §9.6 que eran comportamiento de la librería —el audio adelantado tras buscar
 en la tablet y el vídeo retrasado del fMP4 en FFmpeg— están resueltas en §10.1 y §10.3; las que son

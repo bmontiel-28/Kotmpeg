@@ -173,6 +173,57 @@ class FastPathEquivalenceTest {
     }
 
     /**
+     * La conversión que desborda ya no pasa por `BigInteger` salvo en los extremos: se resuelve
+     * con `valor = q · divisor + r`. Tiene que dar lo mismo que la definición directa, con suelo y
+     * con redondeo, en valores normales, enormes, negativos y en los bordes de `Long`, con las
+     * escalas reales y con otras arbitrarias.
+     */
+    @Test
+    fun `timescale conversion matches the exact definition everywhere`() {
+        val random = Random(41)
+        val edges = listOf(0L, 1L, -1L, Long.MAX_VALUE, Long.MIN_VALUE, Long.MAX_VALUE - 1, Long.MIN_VALUE + 1)
+        val scales = listOf(1L, 1_000L, 48_000L, 90_000L, 1_000_000L, 1_000_000_007L, 0xFFFFFFFFL, Long.MAX_VALUE / 3)
+        fun exact(value: Long, multiplier: Long, addend: Long, divisor: Long): Long {
+            val n = BigInteger.valueOf(value).multiply(BigInteger.valueOf(multiplier)).add(BigInteger.valueOf(addend))
+            val floor = n.subtract(n.mod(BigInteger.valueOf(divisor))).divide(BigInteger.valueOf(divisor))
+            return floor.max(BigInteger.valueOf(Long.MIN_VALUE)).min(BigInteger.valueOf(Long.MAX_VALUE)).toLong()
+        }
+        repeat(20_000) {
+            val value = when (random.nextInt(4)) {
+                0 -> edges.random(random)
+                1 -> random.nextLong()
+                2 -> random.nextLong(-10_000_000_000_000L, 10_000_000_000_000L)
+                else -> random.nextLong() shr random.nextInt(64)
+            }
+            val multiplier = if (random.nextInt(8) == 0) -scales.random(random) else scales.random(random)
+            val divisor = scales.random(random)
+            assertEquals(exact(value, multiplier, 0, divisor), Timestamps.rescaleFloor(value, multiplier, divisor), "floor($value * $multiplier / $divisor)")
+            assertEquals(
+                exact(value, multiplier, divisor / 2, divisor), Timestamps.rescaleRounded(value, multiplier, divisor),
+                "round($value * $multiplier / $divisor)",
+            )
+        }
+    }
+
+    /**
+     * Una conversión que desborda no reserva memoria. Se detectaba capturando la
+     * `ArithmeticException` de `Math.multiplyExact`, y crear la excepción reservaba su traza: unos
+     * 3 KB cada vez. Con los tiempos enormes de un archivo dañado pasa en cada muestra (ver
+     * `UntrustedTableSizesTest`). Se mide la segunda tanda, ya compilada.
+     */
+    @Test
+    fun `an overflowing timescale conversion allocates nothing`() {
+        val threads = java.lang.management.ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
+        org.junit.jupiter.api.Assumptions.assumeTrue(threads != null, "este JDK no mide la memoria por hilo")
+        var sink = 0L
+        repeat(10_000) { sink += Timestamps.rescaleFloor(71_776_119_061_218_240L + it, 1_000_000, 48_000) }
+        val before = threads!!.currentThreadAllocatedBytes
+        repeat(10_000) { sink += Timestamps.rescaleFloor(71_776_119_061_218_240L + it, 1_000_000, 48_000) }
+        val allocated = threads.currentThreadAllocatedBytes - before
+        assertTrue(allocated < 64 * 1024, "10 000 conversiones que desbordan reservaron ${allocated / 1024} KiB ($sink)")
+    }
+
+    /**
      * Un descriptor de solo lectura y vacío: Java no sabe que no admite escrituras hasta que el
      * sistema rechaza la primera, así que el constructor lo acepta y el fallo llega al vaciar el
      * buffer al cerrar. Un `RandomAccessFile` en `"r"` ya no sirve para provocarlo: desde la

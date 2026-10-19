@@ -489,6 +489,12 @@ class FfmpegIntegrationTest {
      * packet: the MKV left the opening keyframe with a negative timestamp (no time for ffprobe,
      * non-monotonic DTS on decode) and the fMP4 played the audio 64 ms early. Every container
      * must now report what the plain MP4 always did: video at 0, audio at +0.064.
+     *
+     * Las pistas de audio se copian **sin cebado**: el escenario descarta los paquetes de antes de
+     * 50 ms, y el de cebado es el primero de ellos. Con el `codecDelayUs` del original, los muxers
+     * marcarían como cebado —para descartarlos al decodificar— los primeros 21 ms de audio real,
+     * y el `start_time` de ffprobe dependería de la versión: FFmpeg 6.1 da el del primer paquete
+     * menos el `CodecDelay` de Matroska (0,043) y la 8.1, el primer instante audible (0,064).
      */
     @Test
     fun `tracks reaching the muxer out of capture order keep their offset in every container`() {
@@ -514,7 +520,7 @@ class FfmpegIntegrationTest {
                     MediaPacket(p.trackId, p.data, p.ptsUs + uptimeUs, isKeyFrame = isVideo && p.isKeyFrame),
                 )
             }
-            demux.tracks
+            demux.tracks.map { if (it is TrackInfo.Audio) it.copy { codecDelayUs = 0 } else it }
         }
         arrivals.sortBy { it.atUs }
         assertTrue(sourceTracks.first { it.id == arrivals.first().trackId } is TrackInfo.Audio, "scenario must start with audio")

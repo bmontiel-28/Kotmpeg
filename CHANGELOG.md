@@ -300,6 +300,14 @@ es mecánico.
   vídeo sin `codecPrivate`, lanzaba `IllegalArgumentException` y dejaba el archivo anterior en 0
   bytes. Ahora se comprueba antes de abrirlo, con la misma excepción, y el archivo queda como estaba.
 
+- **Un MP4 dañado con tiempos enormes ya no hace reservar cientos de MB.** La conversión entre
+  escalas de tiempo detectaba el desbordamiento capturando la `ArithmeticException` de
+  `Math.multiplyExact`, y crear una excepción reserva su traza: unos 3 KB por conversión. Con
+  tiempos normales no desborda nunca, pero un `tfdt` dañado los da enormes en cada muestra, y un
+  `trun` sin campos por muestra puede declarar tantas como bytes tiene el archivo: el fuzzing
+  semanal encontró un fMP4 de 6 KB que hacía reservar 230 MiB. Ahora el desbordamiento se detecta
+  sin excepciones y casi siempre se resuelve sin `BigInteger`; los resultados son los mismos.
+
 ### Documentación
 
 - El contrato de `Demuxer.seekTo` dice exactamente dónde queda cada pista en cada contenedor.
@@ -334,7 +342,15 @@ es mecánico.
   que un `remux` o `concat` rechazado deja intacta la salida que existía. Con FFmpeg, uno comprueba
   que los desfases sin signo dejan cada fotograma donde se escribió y que los firmados no, otro
   busca en un MKV con keyframes a mitad de cluster, y otro que `writingApp` es el `encoder` que
-  muestra `ffprobe`. 275 tests en total.
+  muestra `ffprobe`. Otros dos fijan el hallazgo del fuzzing: que leer un fMP4 con tiempos enormes
+  y que convertir un tiempo que desborda no reservan memoria por muestra; y uno más, que esa
+  conversión da exactamente lo mismo que la definición con `BigInteger` en miles de casos. 278
+  tests en total.
+- El test de FFmpeg que escribe la captura con el audio llegando antes que el vídeo copia las
+  pistas de audio sin cebado: descarta los primeros paquetes, y el de cebado con ellos. Con el
+  cebado del original, ffprobe daba un inicio distinto según su versión —FFmpeg 6.1, la del CI,
+  resta el `CodecDelay` de Matroska; la 8.1 cuenta el primer instante audible—, y el CI fallaba
+  en un archivo correcto.
 - El límite de memoria del benchmark `seekFragmented` baja de 32 KB a 10 KB por búsqueda. Una
   búsqueda en fMP4 reserva unos 6 KB; durante la 4.0.0 llegó a reservar el doble sin que el límite
   lo detectara (ver «Cambiado»).

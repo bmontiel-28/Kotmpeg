@@ -667,7 +667,7 @@ Todas son decisiones de alcance, no carencias pendientes:
 ./gradlew test
 ```
 
-275 tests. Necesitan **JDK 17+**; si además tienes **ffmpeg** en el `PATH`, se ejecuta también la
+278 tests. Necesitan **JDK 17+**; si además tienes **ffmpeg** en el `PATH`, se ejecuta también la
 suite de integración, que genera archivos con FFmpeg real, los reescribe con esta librería en ambas
 direcciones y valida el resultado con `ffprobe` y una decodificación completa sin errores. Sin
 ffmpeg esos tests se omiten solos (`assumeTrue`).

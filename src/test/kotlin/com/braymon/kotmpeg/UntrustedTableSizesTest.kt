@@ -114,6 +114,45 @@ class UntrustedTableSizesTest {
     }
 
     /**
+     * Encontrado por el fuzzing: un fMP4 de 6 KB hacía reservar 230 MiB. Un `trun` sin campos por
+     * muestra puede declarar tantas como bytes tiene el archivo, todas con la duración y el tamaño
+     * por defecto, y un `tfdt` dañado les da tiempos de decodificación enormes. Convertirlos a µs
+     * desbordaba en cada muestra, y el desbordamiento se detectaba capturando una
+     * `ArithmeticException`, que reserva su traza: unos 3 KB por conversión, en cada pasada por el
+     * fragmento. Ahora se detecta sin excepciones.
+     *
+     * El archivo se obtiene de uno sano cambiando lo mismo que la mutación: el `tfdt` del primer
+     * fragmento y las banderas y la cuenta de su `trun`. Se mide la segunda lectura, no la primera:
+     * la primera carga clases y eso también cuenta como memoria reservada por el hilo.
+     */
+    @Test
+    fun `a fragment with enormous decode times does not allocate per sample`() {
+        val threads = java.lang.management.ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
+        org.junit.jupiter.api.Assumptions.assumeTrue(threads != null, "este JDK no mide la memoria por hilo")
+        val bytes = writeFragmented(File(dir, "sano.mp4"), packets = 60).readBytes()
+        val moof = boxAt(bytes, 0, bytes.size, "moof")
+        val traf = boxAt(bytes, moof + 8, moof + u32(bytes, moof).toInt(), "traf")
+        val trafEnd = traf + u32(bytes, traf).toInt()
+        val tfdt = boxAt(bytes, traf + 8, trafEnd, "tfdt")
+        val trun = boxAt(bytes, traf + 8, trafEnd, "trun")
+        assertEquals(1, bytes[tfdt + 8].toInt(), "se esperaba un tfdt de versión 1")
+        putU32(bytes, tfdt + 12, 0x00FF0000L)
+        putU32(bytes, tfdt + 16, 0x00003C00L)
+        putU32(bytes, trun + 8, 0x01000001L)
+        putU32(bytes, trun + 12, 0x00120000L)
+        val file = File(dir, "tiempos-enormes.mp4").also { it.writeBytes(bytes) }
+
+        fun readAll(): Int = Kotmpeg.openDemuxer(file).use { d -> generateSequence { d.readPacket() }.count() }
+        val packets = readAll()
+        val before = threads!!.currentThreadAllocatedBytes
+        assertEquals(packets, readAll())
+        val allocated = threads.currentThreadAllocatedBytes - before
+
+        assertTrue(packets > 1_000, "el trun manipulado tenía que dar miles de muestras: $packets")
+        assertTrue(allocated < 8L * 1024 * 1024, "leer ${bytes.size} bytes reservó ${allocated / 1024} KiB")
+    }
+
+    /**
      * `stts` declara la longitud de cada serie como uint32 sin acotar. Con `repeat`, el
      * `return@repeat` que cortaba solo saltaba a la vuelta siguiente, así que el bucle giraba
      * hasta agotar la cuenta declarada sin escribir nada: ~0,6 s de CPU en JVM de escritorio
@@ -273,5 +312,21 @@ class UntrustedTableSizesTest {
             return i
         }
         return -1
+    }
+
+    private fun u32(b: ByteArray, at: Int): Long = (0 until 4).fold(0L) { v, k -> (v shl 8) or (b[at + k].toLong() and 0xFF) }
+
+    private fun putU32(b: ByteArray, at: Int, value: Long) {
+        for (k in 0 until 4) b[at + k] = (value ushr (8 * (3 - k))).toByte()
+    }
+
+    /** Posición de la primera caja [type] entre [start] y [end], recorriendo solo ese nivel. */
+    private fun boxAt(b: ByteArray, start: Int, end: Int, type: String): Int {
+        var p = start
+        while (p + 8 <= end) {
+            if (String(b, p + 4, 4, Charsets.ISO_8859_1) == type) return p
+            p += u32(b, p).toInt()
+        }
+        error("no hay caja $type entre $start y $end")
     }
 }
