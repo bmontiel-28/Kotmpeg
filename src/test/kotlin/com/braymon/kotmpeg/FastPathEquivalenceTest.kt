@@ -213,13 +213,11 @@ class FastPathEquivalenceTest {
      */
     @Test
     fun `an overflowing timescale conversion allocates nothing`() {
-        val threads = java.lang.management.ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
-        org.junit.jupiter.api.Assumptions.assumeTrue(threads != null, "este JDK no mide la memoria por hilo")
         var sink = 0L
         repeat(10_000) { sink += Timestamps.rescaleFloor(71_776_119_061_218_240L + it, 1_000_000, 48_000) }
-        val before = threads!!.currentThreadAllocatedBytes
-        repeat(10_000) { sink += Timestamps.rescaleFloor(71_776_119_061_218_240L + it, 1_000_000, 48_000) }
-        val allocated = threads.currentThreadAllocatedBytes - before
+        val allocated = allocatedBytes {
+            repeat(10_000) { sink += Timestamps.rescaleFloor(71_776_119_061_218_240L + it, 1_000_000, 48_000) }
+        }
         assertTrue(allocated < 64 * 1024, "10 000 conversiones que desbordan reservaron ${allocated / 1024} KiB ($sink)")
     }
 

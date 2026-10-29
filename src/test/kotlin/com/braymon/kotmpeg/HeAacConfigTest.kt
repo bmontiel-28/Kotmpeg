@@ -9,7 +9,6 @@ import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -37,13 +36,6 @@ class HeAacConfigTest {
 
         /** HE-v2 (SBR+PS) a 48 kHz estéreo: núcleo a 24 kHz **mono**, extensión a 48 kHz. */
         val ASC_HE_V2 = byteArrayOf(0xEB.toByte(), 0x09, 0x88.toByte(), 0x00)
-
-        fun run(vararg cmd: String): Pair<String, Int> {
-            val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
-            val out = p.inputStream.bufferedReader().readText()
-            p.waitFor(120, TimeUnit.SECONDS)
-            return out to p.exitValue()
-        }
     }
 
     /** Lo que produce `AudioEncoder.trackInfo()`: canales y tasa de la config, ASC del códec. */
@@ -227,7 +219,7 @@ class HeAacConfigTest {
      */
     private fun makeHeAacMkv(target: File): Boolean {
         val (_, code) = runCatching {
-            run(
+            runProcess(
                 "ffmpeg", "-y", "-v", "error",
                 "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=10",
                 "-ac", "2", "-c:a", "aac_mf", "-profile:a", "28", "-b:a", "48k",

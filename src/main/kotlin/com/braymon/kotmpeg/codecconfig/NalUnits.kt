@@ -97,22 +97,32 @@ public object NalUnits {
     /** Divide una muestra con prefijos de longitud de 4 bytes en NAL units crudas. */
     public fun splitLengthPrefixed(data: ByteArray): List<ByteArray> {
         val nals = ArrayList<ByteArray>()
+        forEachLengthPrefixed(data) { start, length -> nals.add(data.copyOfRange(start, start + length)) }
+        return nals
+    }
+
+    /**
+     * Recorre las NAL de una muestra con prefijos de longitud de 4 bytes, comprobando que cada una
+     * cabe en lo que queda, y devuelve dónde acaba la última. Lo que quede detrás, menos de 4
+     * bytes, no llega a ser un prefijo y se ignora, igual en [splitLengthPrefixed] que en
+     * [lengthPrefixedToAnnexB]: por eso las dos usan este recorrido y no uno cada una.
+     */
+    private inline fun forEachLengthPrefixed(data: ByteArray, action: (start: Int, length: Int) -> Unit): Int {
         var i = 0
         while (i + 4 <= data.size) {
-            val len = ((data[i].toInt() and 0xFF) shl 24) or ((data[i + 1].toInt() and 0xFF) shl 16) or
-                ((data[i + 2].toInt() and 0xFF) shl 8) or (data[i + 3].toInt() and 0xFF)
+            val len = readLength(data, i)
             i += 4
             require(len >= 0 && i.toLong() + len.toLong() <= data.size.toLong()) {
                 "muestra con prefijos de longitud corrupta"
             }
-            nals.add(data.copyOfRange(i, i + len))
+            action(i, len)
             i += len
         }
-        return nals
+        return i
     }
 
     public fun joinLengthPrefixed(nals: List<ByteArray>): ByteArray {
-        val out = ByteArray(prefixedSize(nals))
+        val out = ByteArray(prefixedSize(nals.size) { nals[it].size })
         var at = 0
         for (nal in nals) {
             writeLength(out, at, nal.size)
@@ -123,7 +133,7 @@ public object NalUnits {
     }
 
     public fun joinAnnexB(nals: List<ByteArray>): ByteArray {
-        val out = ByteArray(prefixedSize(nals))
+        val out = ByteArray(prefixedSize(nals.size) { nals[it].size })
         var at = 0
         for (nal in nals) {
             out[at + 3] = 1                                             // código de inicio 00 00 00 01
@@ -133,9 +143,14 @@ public object NalUnits {
         return out
     }
 
-    private fun prefixedSize(nals: List<ByteArray>): Int {
+    /**
+     * Tamaño de [count] NAL con un prefijo o un código de inicio de 4 bytes cada una, siendo
+     * [length] la longitud de cada NAL. Se suma en `Long` y se rechaza lo que no cabe en un array:
+     * sumado en `Int` daría la vuelta a un tamaño negativo o, peor, a uno pequeño y válido.
+     */
+    private inline fun prefixedSize(count: Int, length: (Int) -> Int): Int {
         var total = 0L
-        for (nal in nals) total += 4L + nal.size
+        for (k in 0 until count) total += 4L + length(k)
         require(total <= MAX_ARRAY_BYTES) { "la unidad de acceso no cabe en un array: $total bytes" }
         return total.toInt()
     }
@@ -157,10 +172,7 @@ public object NalUnits {
      */
     public fun annexBToLengthPrefixed(data: ByteArray): ByteArray {
         val bounds = findAnnexBNals(data)
-        var total = 0L
-        for (k in 0 until bounds.count) total += 4L + (bounds.end(k) - bounds.start(k))
-        require(total <= MAX_ARRAY_BYTES) { "la unidad de acceso no cabe en un array: $total bytes" }
-        val out = ByteArray(total.toInt())
+        val out = ByteArray(prefixedSize(bounds.count) { bounds.end(it) - bounds.start(it) })
         var at = 0
         for (k in 0 until bounds.count) {
             val length = bounds.end(k) - bounds.start(k)
@@ -177,18 +189,10 @@ public object NalUnits {
      * una copia de la muestra con cada prefijo sustituido: no hace falta trocearla.
      */
     public fun lengthPrefixedToAnnexB(data: ByteArray): ByteArray {
-        var i = 0
-        while (i + 4 <= data.size) {
-            val len = readLength(data, i)
-            i += 4
-            require(len >= 0 && i.toLong() + len.toLong() <= data.size.toLong()) {
-                "muestra con prefijos de longitud corrupta"
-            }
-            i += len
-        }
-        val out = data.copyOf(i)
+        val end = forEachLengthPrefixed(data) { _, _ -> }
+        val out = data.copyOf(end)
         var at = 0
-        while (at + 4 <= i) {
+        while (at + 4 <= end) {
             val len = readLength(out, at)
             out[at] = 0; out[at + 1] = 0; out[at + 2] = 0; out[at + 3] = 1 // código de inicio
             at += 4 + len
@@ -221,7 +225,19 @@ public object NalUnits {
         return out.toByteArray()
     }
 
-    /** Construye un AVCDecoderConfigurationRecord (avcC) desde NAL units SPS/PPS crudas. */
+    /**
+     * Construye un AVCDecoderConfigurationRecord (avcC) desde NAL units SPS/PPS crudas.
+     *
+     * Con un perfil de la familia High el registro lleva al final el formato de croma, las dos
+     * profundidades de bits y el número de SPS de extensión. ISO/IEC 14496-15 lo exige con
+     * `profile_idc` 100, 110, 122 y 144, y no se escribía: MediaCodec da perfil High en casi
+     * cualquier móvil, así que faltaba en el caso normal. Se escribe, como FFmpeg, en todo perfil
+     * que no sea Baseline, Main o Extended (66, 77 y 88), que es lo que esperan los lectores que
+     * leen esos campos; los valores salen del SPS ([AvcSpsFormat]).
+     *
+     * Las longitudes de los parameter sets son campos de 16 bits: lo que no cabe se rechaza, porque
+     * truncado dejaba el registro desalineado y el lector tomaba como SPS lo que venía detrás.
+     */
     public fun buildAvcC(spsList: List<ByteArray>, ppsList: List<ByteArray>): ByteArray {
         require(spsList.isNotEmpty() && ppsList.isNotEmpty()) { "avcC requiere SPS y PPS" }
         require(spsList.size <= 31) { "avcC admite como máximo 31 SPS, recibidos ${spsList.size}" }
@@ -235,10 +251,26 @@ public object NalUnits {
         out.write(sps[3].toInt())          // AVCLevelIndication
         out.write(0xFF)                    // 6 bits reservados + lengthSizeMinusOne = 3
         out.write(0xE0 or spsList.size)    // 3 bits reservados + numOfSequenceParameterSets
-        for (s in spsList) { out.write(s.size ushr 8); out.write(s.size); out.write(s) }
+        for (s in spsList) writeParameterSet(out, s, "avcC/SPS")
         out.write(ppsList.size)
-        for (p in ppsList) { out.write(p.size ushr 8); out.write(p.size); out.write(p) }
+        for (p in ppsList) writeParameterSet(out, p, "avcC/PPS")
+        when (sps[1].toInt() and 0xFF) {
+            66, 77, 88 -> Unit
+            else -> {
+                val format = AvcSpsFormat.parse(sps)
+                out.write(0xFC or format.chromaFormatIdc)          // 6 bits reservados + chroma_format
+                out.write(0xF8 or (format.bitDepthLuma - 8))      // 5 bits reservados + bit_depth_luma_minus8
+                out.write(0xF8 or (format.bitDepthChroma - 8))    // 5 bits reservados + bit_depth_chroma_minus8
+                out.write(0)                                      // numOfSequenceParameterSetExt
+            }
+        }
         return out.toByteArray()
+    }
+
+    /** Escribe un parameter set precedido de su longitud de 16 bits, como lo guardan avcC y hvcC. */
+    private fun writeParameterSet(out: ByteArrayOutputStream, nal: ByteArray, what: String) {
+        require(nal.size <= 0xFFFF) { "$what de ${nal.size} bytes: su longitud es un campo de 16 bits" }
+        out.write(nal.size ushr 8); out.write(nal.size); out.write(nal)
     }
 
     /**
@@ -274,9 +306,19 @@ public object NalUnits {
         return start + len
     }
 
-    /** Construye un HEVCDecoderConfigurationRecord (hvcC) desde NAL units VPS/SPS/PPS crudas. */
+    /**
+     * Construye un HEVCDecoderConfigurationRecord (hvcC) desde NAL units VPS/SPS/PPS crudas.
+     *
+     * Exige los tres tipos, como [buildAvcC] exige SPS y PPS. Cada array se escribe con
+     * `array_completeness = 1` —todos los de ese tipo están aquí— porque la entrada `hvc1` no admite
+     * parameter sets dentro del stream; sin VPS salía un registro que se aceptaba sin error y un
+     * archivo que ningún decodificador puede abrir. El número de NAL de cada array y la longitud
+     * de cada una son campos de 16 bits, y lo que no cabe se rechaza en vez de truncarse.
+     */
     public fun buildHvcC(vpsList: List<ByteArray>, spsList: List<ByteArray>, ppsList: List<ByteArray>): ByteArray {
-        require(spsList.isNotEmpty() && ppsList.isNotEmpty()) { "hvcC requiere SPS y PPS" }
+        require(vpsList.isNotEmpty() && spsList.isNotEmpty() && ppsList.isNotEmpty()) {
+            "hvcC requiere VPS, SPS y PPS: hvc1 no admite parameter sets dentro del stream"
+        }
         val sps = HevcSpsInfo.parse(spsList[0])
         val out = ByteArrayOutputStream()
         out.write(1)                                                    // configurationVersion
@@ -295,12 +337,13 @@ public object NalUnits {
             H265_VPS to vpsList,
             H265_SPS to spsList,
             H265_PPS to ppsList,
-        ).filter { it.second.isNotEmpty() }
-        out.write(arrays.size)
+        )
+        out.write(arrays.size)                                          // numOfArrays
         for ((type, nals) in arrays) {
+            require(nals.size <= 0xFFFF) { "hvcC/tipo $type: ${nals.size} NAL y numNalus es de 16 bits" }
             out.write(0x80 or type)                                     // array_completeness=1
             out.write(nals.size ushr 8); out.write(nals.size)
-            for (nal in nals) { out.write(nal.size ushr 8); out.write(nal.size); out.write(nal) }
+            for (nal in nals) writeParameterSet(out, nal, "hvcC/tipo $type")
         }
         return out.toByteArray()
     }
@@ -361,7 +404,7 @@ internal class HevcSpsInfo(
                     profilePresent[i] = r.bits(1) == 1
                     levelPresent[i] = r.bits(1) == 1
                 }
-                if (maxSubLayersMinus1 > 0) repeat(8 - maxSubLayersMinus1) { r.bits(2) }
+                repeat(8 - maxSubLayersMinus1) { r.bits(2) } // reserved_zero_2bits
                 for (i in 0 until maxSubLayersMinus1) {
                     if (profilePresent[i]) repeat(88) { r.bits(1) }
                     if (levelPresent[i]) r.bits(8)
@@ -384,9 +427,49 @@ internal class HevcSpsInfo(
     }
 }
 
+/**
+ * Formato de croma y profundidades de bits de un SPS de H.264: lo que piden los cuatro bytes finales
+ * de un `avcC` de perfil High.
+ *
+ * El SPS solo los lleva con los perfiles que H.264 enumera en su sintaxis (7.3.2.1.1), más el 144
+ * de sus primeras ediciones; en cualquier otro valen lo que dice la norma, 4:2:0 a 8 bits. Un SPS
+ * que no se puede leer —truncado, o con valores fuera de rango— da también esos valores, que son
+ * los de un High corriente: un `avcC` que se construía antes no puede dejar de construirse por estos
+ * campos, que ningún decodificador usa para configurarse.
+ */
+internal class AvcSpsFormat private constructor(val chromaFormatIdc: Int, val bitDepthLuma: Int, val bitDepthChroma: Int) {
+    companion object {
+        private val DEFAULT = AvcSpsFormat(1, 8, 8)
+        private val PROFILES_WITH_CHROMA_FORMAT = setOf(100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135, 144)
+
+        /**
+         * Lee el SPS desde detrás de la cabecera NAL, quitando antes los bytes de prevención: el
+         * nivel y las restricciones pueden ser ceros que formen un `00 00 03` con lo que sigue.
+         */
+        fun parse(spsNal: ByteArray): AvcSpsFormat {
+            if (spsNal.size < 5 || (spsNal[1].toInt() and 0xFF) !in PROFILES_WITH_CHROMA_FORMAT) return DEFAULT
+            return try {
+                val r = BitReader(NalUnits.unescapeRbsp(spsNal.copyOfRange(1, spsNal.size)))
+                r.bits(24)                                 // profile_idc, constraint_set_flags, level_idc
+                r.ue()                                     // seq_parameter_set_id
+                val chroma = r.ue()                        // chroma_format_idc
+                if (chroma == 3) r.bits(1)                 // separate_colour_plane_flag
+                val luma = r.ue() + 8                      // bit_depth_luma_minus8
+                val chromaDepth = r.ue() + 8               // bit_depth_chroma_minus8
+                if (chroma in 0..3 && luma in 8..14 && chromaDepth in 8..14) AvcSpsFormat(chroma, luma, chromaDepth) else DEFAULT
+            } catch (_: IllegalArgumentException) {
+                DEFAULT
+            }
+        }
+    }
+}
+
 /** Lector de bits MSB-first con soporte Exp-Golomb. */
 internal class BitReader(private val data: ByteArray) {
     private var bitPos = 0
+
+    /** Bits que quedan por leer, para los campos opcionales que la norma condiciona a que los haya. */
+    val bitsLeft: Long get() = data.size * 8L - bitPos
 
     fun bits(count: Int): Int {
         var v = 0

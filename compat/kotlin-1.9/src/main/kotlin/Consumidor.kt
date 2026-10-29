@@ -1,4 +1,5 @@
 import com.braymon.kotmpeg.Kotmpeg
+import com.braymon.kotmpeg.RepairResult
 import com.braymon.kotmpeg.audio.PcmMixer
 import com.braymon.kotmpeg.audio.PcmResampler
 import com.braymon.kotmpeg.audio.PcmStreamMixer
@@ -16,10 +17,47 @@ import kotlin.system.exitProcess
 
 /**
  * Graba pantalla, micrófono y sistema en los tres contenedores, con la mezcla y las dos pistas por
- * separado, más un fMP4 con índice `sidx` y aviso de segmentos, y lo relee. Sale con código distinto
- * de cero si algo no cuadra.
+ * separado, más un fMP4 con índice `sidx` y aviso de segmentos, y lo relee; después corta un MKV
+ * grabado con reserva de índice y lo repara. Sale con código distinto de cero si algo no cuadra.
  */
 fun main() {
+    grabarYLeer()
+    cortarYReparar()
+    println("OK: compilado con Kotlin 1.9; biblioteca estándar en ejecución ${KotlinVersion.CURRENT}")
+}
+
+/**
+ * Lo que una app hace con una grabación que se cortó: de un MKV con `cuesReserveBytes` se copia lo que
+ * hay en disco a mitad de grabación, antes de `stop()`, como si el proceso hubiera muerto ahí; la
+ * copia se repara con `Kotmpeg.repair` y se vuelve a leer, y reparada otra vez ya no cambia.
+ */
+private fun cortarYReparar() {
+    val directorio = File("build/salidas").apply { mkdirs() }
+    val grabando = File(directorio, "consumidor-grabando.mkv")
+    val cortado = File(directorio, "consumidor-cortado.mkv")
+    Kotmpeg.createMuxer(grabando) { cuesReserveBytes = 256 }.use { muxer ->
+        val pantalla = muxer.addTrack(
+            TrackInfo.Video(codec = VideoCodec.H264, width = 1080, height = 2400) {
+                codecPrivate = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0x00, 0x1F)), listOf(byteArrayOf(0x68, 0x11)))
+            },
+        )
+        muxer.start()
+        for (fotograma in 0 until 150) {
+            muxer.writePacket(MediaPacket(pantalla, ByteArray(4_000) { fotograma.toByte() }, fotograma * 33_333L, isKeyFrame = fotograma % 30 == 0))
+        }
+        cortado.writeBytes(grabando.readBytes())
+    }
+    val resultado: RepairResult = Kotmpeg.repair(cortado)
+    val paquetes = Kotmpeg.openDemuxer(cortado).use { lector -> generateSequence { lector.readPacket() }.count() }
+    if (!resultado.repaired || resultado.format != ContainerFormat.MKV || paquetes == 0 || Kotmpeg.repair(cortado).repaired) {
+        println("FALLO al reparar: $resultado, $paquetes paquetes")
+        exitProcess(1)
+    }
+    println("OK ${cortado.name}: $resultado, $paquetes paquetes")
+}
+
+/** La grabación de pantalla con tres pistas de audio en los tres contenedores, releída. */
+private fun grabarYLeer() {
     val directorio = File("build/salidas").apply { mkdirs() }
     val avcC = NalUnits.buildAvcC(
         listOf(byteArrayOf(0x67, 0x64, 0x00, 0x1F, 0x11, 0x22, 0x33)),
@@ -90,5 +128,4 @@ fun main() {
         println("FALLO: segmentos avisados $segmentos")
         exitProcess(1)
     }
-    println("OK: compilado con Kotlin 1.9; biblioteca estándar en ejecución ${KotlinVersion.CURRENT}")
 }

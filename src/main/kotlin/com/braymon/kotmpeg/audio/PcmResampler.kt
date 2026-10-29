@@ -58,6 +58,10 @@ public class PcmResampler(
      * eficiente para el caso en que no hay nada que convertir, pero significa que mutar el
      * resultado muta la entrada. Copia tú si necesitas que sean independientes.
      *
+     * Un [input] con un frame incompleto se rechaza siempre, también con frecuencias iguales: hasta
+     * la 4.0 ese caso devolvía la entrada sin mirarla, y el mismo buffer valía o no según la
+     * frecuencia de la fuente.
+     *
      * El número de frames de salida se calcula **exacto** antes de reservar, con la misma
      * aritmética entera que la fase, así que el array sale del tamaño justo: ni falta sitio ni
      * hay que recortarlo con una copia al final. `ShortArray` y no una lista a propósito: una
@@ -65,11 +69,11 @@ public class PcmResampler(
      * captura, donde un GC a destiempo se oye.
      */
     public fun resample(input: ShortArray): ShortArray {
-        if (isPassthrough) return input
         require(input.size % channels == 0) {
             "el buffer de entrada (${input.size}) no es múltiplo de $channels canales: " +
                 "hay un frame incompleto que se perdería en silencio"
         }
+        if (isPassthrough) return input
         val inFrames = input.size / channels
         if (inFrames == 0) return ShortArray(0)
 

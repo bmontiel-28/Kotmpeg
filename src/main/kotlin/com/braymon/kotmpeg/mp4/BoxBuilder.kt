@@ -1,5 +1,7 @@
 package com.braymon.kotmpeg.mp4
 
+import com.braymon.kotmpeg.io.SeekableOutput
+
 /**
  * Serializador en memoria de cajas ISO BMFF; con él se construye el árbol `moov`/`moof`.
  *
@@ -8,14 +10,35 @@ package com.braymon.kotmpeg.mp4
  * padre, así que una tabla `stsz` de un archivo largo se copiaba entera una vez por nivel de
  * anidamiento (seis hasta `stbl`), y cada byte pasaba por un `ByteArrayOutputStream`, cuyos
  * métodos están sincronizados. Aquí cada byte se escribe una sola vez y sin cerrojos.
+ *
+ * El array empieza en [initialCapacity] y crece duplicándose. Para un árbol grande —el `moov` de una
+ * grabación larga, de varios MB— conviene reservarlo de una vez con lo que va a ocupar: crecer
+ * desde 256 bytes reserva por el camino el doble de lo que acaba ocupando.
  */
-internal class BoxBuilder {
-    private var buf = ByteArray(INITIAL_CAPACITY)
+internal class BoxBuilder(initialCapacity: Int = INITIAL_CAPACITY) {
+    private var buf = ByteArray(initialCapacity.coerceIn(1, MAX_CAPACITY))
     private var count = 0
 
     val size: Int get() = count
 
     fun toByteArray(): ByteArray = buf.copyOf(count)
+
+    /**
+     * Lo escrito, para quien ya no va a escribir más: si llena justo la capacidad, el propio array,
+     * sin copiarlo. El builder queda vacío, así que nada de lo que se escriba después puede alterar el
+     * array devuelto. Con una capacidad exacta, es lo que evita tener dos copias del árbol a la vez.
+     */
+    fun release(): ByteArray {
+        val content = if (count == buf.size) buf else buf.copyOf(count)
+        buf = ByteArray(1)
+        count = 0
+        return content
+    }
+
+    /** Escribe en [out] lo que hay escrito, sin copiarlo antes a un array propio. */
+    fun writeTo(out: SeekableOutput) {
+        out.write(buf, 0, count)
+    }
 
     private fun ensureCapacity(extra: Int) {
         val needed = count.toLong() + extra
@@ -80,20 +103,17 @@ internal class BoxBuilder {
     /**
      * Escribe una caja hija del tipo dado; el contenido lo produce [content].
      *
-     * El campo de tamaño es de 32 bits: las cajas construidas en memoria (todo el árbol
-     * `moov`/`moof`) no pueden pasar de 4 GiB. El `mdat`, que es el único que crece con los
-     * datos, no se construye aquí — se escribe en streaming con `largesize` de 64 bits.
+     * El campo de tamaño es de 32 bits, y siempre basta: todo el árbol vive en un único array, que
+     * no pasa de [MAX_CAPACITY] —por debajo de 2 GiB—, y lo que no quepa lo rechaza
+     * [ensureCapacity] antes de llegar aquí. El `mdat`, que es el único que crece con los datos, no
+     * se construye aquí: cada muxer lo escribe directamente en el archivo.
      */
     fun box(type: String, content: BoxBuilder.() -> Unit) {
         val start = count
         u32(0)
         fourcc(type)
         content()
-        val total = (count - start).toLong()
-        require(total <= 0xFFFFFFFFL) {
-            "la caja '$type' ocupa $total bytes y no cabe en un tamaño de 32 bits"
-        }
-        writeU32At(start, total)
+        writeU32At(start, (count - start).toLong())
     }
 
     /** Escribe una full box (versión + flags de 24 bits). */

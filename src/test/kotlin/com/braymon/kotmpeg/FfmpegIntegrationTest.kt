@@ -6,12 +6,10 @@ import com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
 import com.braymon.kotmpeg.mp4.Mp4Segment
 import com.braymon.kotmpeg.pipeline.Remuxer
 import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -23,33 +21,15 @@ import kotlin.test.assertTrue
  */
 class FfmpegIntegrationTest {
 
-    companion object {
-        private var available = false
-
-        @JvmStatic
-        @BeforeAll
-        fun checkFfmpeg() {
-            available = try {
-                run("ffmpeg", "-version").second == 0
-            } catch (_: Exception) {
-                false
-            }
-        }
-
-        private fun run(vararg cmd: String): Pair<String, Int> {
-            val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
-            val out = p.inputStream.bufferedReader().readText()
-            p.waitFor(120, TimeUnit.SECONDS)
-            return out to p.exitValue()
-        }
-    }
+    /** Si esta máquina tiene FFmpeg; sin él, cada test se omite. */
+    private val available: Boolean get() = ffmpegInstalled
 
     @TempDir
     lateinit var dir: File
 
     private fun makeReference(name: String, vararg extraArgs: String): File {
         val f = File(dir, name)
-        val (out, code) = run(
+        val (out, code) = runProcess(
             "ffmpeg", "-y", "-v", "error",
             "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=3",
             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
@@ -62,7 +42,7 @@ class FfmpegIntegrationTest {
     }
 
     private fun ffprobeStreams(f: File): List<String> {
-        val (out, code) = run(
+        val (out, code) = runProcess(
             "ffprobe", "-v", "error", "-show_entries", "stream=codec_name",
             "-of", "csv=p=0", f.absolutePath,
         )
@@ -71,13 +51,13 @@ class FfmpegIntegrationTest {
     }
 
     private fun assertDecodesCleanly(f: File) {
-        val (out, code) = run("ffmpeg", "-v", "error", "-i", f.absolutePath, "-f", "null", "-")
+        val (out, code) = runProcess("ffmpeg", "-v", "error", "-i", f.absolutePath, "-f", "null", "-")
         assertEquals(0, code, "decode failed for ${f.name}: $out")
         assertTrue(out.isBlank(), "decoder reported errors for ${f.name}: $out")
     }
 
     private fun countFrames(f: File, streamSelector: String): Int {
-        val (out, code) = run(
+        val (out, code) = runProcess(
             "ffprobe", "-v", "error", "-select_streams", streamSelector,
             "-count_packets", "-show_entries", "stream=nb_read_packets",
             "-of", "csv=p=0", f.absolutePath,
@@ -87,7 +67,7 @@ class FfmpegIntegrationTest {
     }
 
     private fun probeDurationSeconds(f: File): Double {
-        val (out, code) = run(
+        val (out, code) = runProcess(
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "csv=p=0", f.absolutePath,
         )
@@ -162,7 +142,7 @@ class FfmpegIntegrationTest {
         assertEquals(countFrames(src, "v:0"), countFrames(mkv, "v:0"))
 
         fun firstVideoPts(f: File): Double {
-            val (out, _) = run(
+            val (out, _) = runProcess(
                 "ffprobe", "-v", "error", "-select_streams", "v:0",
                 "-show_entries", "packet=pts_time", "-read_intervals", "%+0.5",
                 "-of", "csv=p=0", f.absolutePath,
@@ -250,7 +230,7 @@ class FfmpegIntegrationTest {
 
         val out = File(dir, "color-out.mp4")
         Kotmpeg.remux(src, out)
-        val (info, code) = run(
+        val (info, code) = runProcess(
             "ffprobe", "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=color_primaries,color_transfer,color_space",
             "-of", "csv=p=0", out.absolutePath,
@@ -277,7 +257,7 @@ class FfmpegIntegrationTest {
         muxer.stop()
         demux.close()
 
-        val (info, code) = run(
+        val (info, code) = runProcess(
             "ffprobe", "-v", "error", "-select_streams", "v:0",
             "-show_entries", "side_data=rotation",
             "-of", "csv=p=0", out.absolutePath,
@@ -324,7 +304,7 @@ class FfmpegIntegrationTest {
         val out = File(dir, "probe-out.mp4")
         Kotmpeg.remux(src, out)
 
-        val (info, code) = run(
+        val (info, code) = runProcess(
             "ffprobe", "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=width,height,avg_frame_rate",
             "-of", "csv=p=0", out.absolutePath,
@@ -370,7 +350,7 @@ class FfmpegIntegrationTest {
                 }
             }
         }
-        val (probe, code) = run(
+        val (probe, code) = runProcess(
             "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
             "-of", "csv=p=0", out.absolutePath,
         )
@@ -406,7 +386,7 @@ class FfmpegIntegrationTest {
                 nonNegativeCompositionOffsets = nonNegative
             }
             assertDecodesCleanly(out)
-            val (probe, code) = run(
+            val (probe, code) = runProcess(
                 "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
                 "-of", "csv=p=0", out.absolutePath,
             )
@@ -430,7 +410,7 @@ class FfmpegIntegrationTest {
     fun `an mkv whose keyframes fall mid cluster seeks onto the keyframe`() {
         assumeTrue(available, "ffmpeg not installed")
         val src = File(dir, "mitad-cluster.mkv")
-        val (log, code) = run(
+        val (log, code) = runProcess(
             "ffmpeg", "-y", "-v", "error",
             "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=30:duration=4",
             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
@@ -462,7 +442,7 @@ class FfmpegIntegrationTest {
                 this.fragmented = fragmented
                 writingApp = "Grabadora 2.1"
             }
-            val (probe, code) = run("ffprobe", "-v", "error", "-show_entries", "format_tags=encoder", "-of", "csv=p=0", out.absolutePath)
+            val (probe, code) = runProcess("ffprobe", "-v", "error", "-show_entries", "format_tags=encoder", "-of", "csv=p=0", out.absolutePath)
             assertEquals(0, code, "ffprobe failed: $probe")
             assertEquals("Grabadora 2.1", probe.trim(), "fragmentado: $fragmented")
             assertDecodesCleanly(out)
@@ -471,7 +451,7 @@ class FfmpegIntegrationTest {
 
     /** `start_time` de cada stream según ffprobe, por tipo (`video`, `audio`). */
     private fun streamStartTimes(f: File): Map<String, Double> {
-        val (out, code) = run(
+        val (out, code) = runProcess(
             "ffprobe", "-v", "error", "-show_entries", "stream=codec_type,start_time",
             "-of", "csv=p=0", f.absolutePath,
         )
@@ -570,7 +550,7 @@ class FfmpegIntegrationTest {
         assertDecodesCleanly(out)
         assertEquals(countFrames(src, "v:0"), countFrames(out, "v:0"), "fotogramas de vídeo")
         assertEquals(countFrames(src, "a:0"), countFrames(out, "a:0"), "paquetes de audio")
-        val (seekLog, seekCode) = run("ffmpeg", "-v", "error", "-ss", "1.5", "-i", out.absolutePath, "-frames:v", "10", "-f", "null", "-")
+        val (seekLog, seekCode) = runProcess("ffmpeg", "-v", "error", "-ss", "1.5", "-i", out.absolutePath, "-frames:v", "10", "-f", "null", "-")
         assertEquals(0, seekCode, "buscar falló: $seekLog")
         assertTrue(seekLog.isBlank(), "errores al buscar: $seekLog")
 

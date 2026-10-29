@@ -5,7 +5,6 @@ import com.braymon.kotmpeg.io.SeekableInput
 import com.braymon.kotmpeg.mkv.MkvDemuxer
 import com.braymon.kotmpeg.mp4.Mp4Demuxer
 import java.io.IOException
-import java.lang.management.ManagementFactory
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -28,7 +27,10 @@ import java.util.concurrent.TimeoutException
  *   que son las que la documentación promete para un archivo corrupto. Un
  *   `IndexOutOfBoundsException` o un `ArithmeticException` es un caso que el parser no previó.
  * - **Memoria desproporcionada**: reservar más de [MAX_ALLOCATED_BYTES] para un archivo de unos KB.
- *   Se mide con lo que el hilo reserva en total, no con el heap, así que no depende del recolector.
+ *   Se mide con lo que el hilo reserva en total, no con el heap, así que no depende del recolector
+ *   (ver `allocatedBytes`). Un JDK que no lo mide no puede comprobar la política entera, y el test
+ *   que crea el árbitro se omite al crearlo, en su propio hilo: omitirlo desde el hilo de la
+ *   ejecución lo convertiría en un fallo.
  * - **Paquetes desproporcionados**: más de los que caben físicamente en el archivo.
  * - **Un paquete de una pista que no se anunció** en `tracks`.
  * - **El archivo abierto** después de que el constructor fallara.
@@ -46,8 +48,11 @@ internal class FuzzHarness {
                 )
     }
 
-    private val threads = ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
     private var executor: ExecutorService = newExecutor()
+
+    init {
+        allocatedBytes {}
+    }
 
     /** Reserva de la última ejecución que terminó. */
     @Volatile
@@ -81,42 +86,46 @@ internal class FuzzHarness {
 
     private fun exercise(bytes: ByteArray, container: FuzzSeeds.Container, strict: Boolean): Violation? {
         val fileSize = bytes.size
-        val before = threads?.currentThreadAllocatedBytes ?: 0
-        val channel = MemoryFileChannel(bytes)
         var demuxer: Demuxer? = null
         var stage = "abrir"
         var packets = 0L
         val packetCap = 64L * fileSize + 10_000
-        val failure: Throwable? = try {
-            val input = SeekableInput(channel)
-            demuxer = when (container) {
-                FuzzSeeds.Container.MKV -> MkvDemuxer(input) {}
-                FuzzSeeds.Container.MP4 -> Mp4Demuxer(input) {}
+        var thrown: Throwable? = null
+        var leaked = false
+        val allocated = allocatedBytes {
+            val memory = MemoryFileChannel(bytes)
+            thrown = try {
+                val input = SeekableInput(memory)
+                val opened = when (container) {
+                    FuzzSeeds.Container.MKV -> MkvDemuxer(input) {}
+                    FuzzSeeds.Container.MP4 -> Mp4Demuxer(input) {}
+                }
+                demuxer = opened
+                stage = "pistas"
+                val ids = opened.tracks.map { it.id }.toSet()
+                val duration = opened.durationUs
+                stage = "leer"
+                while (true) {
+                    val packet = opened.readPacket() ?: break
+                    if (packet.trackId !in ids) return Violation("pista no anunciada", "paquete de la pista ${packet.trackId}; anunciadas: $ids")
+                    if (++packets > packetCap) return Violation("paquetes desproporcionados", "más de $packetCap en $fileSize bytes")
+                }
+                for (target in listOf(0L, duration / 2, duration, duration + 1_000_000, Long.MAX_VALUE, 1L)) {
+                    stage = "seekTo($target)"
+                    opened.seekTo(target)
+                    stage = "leer tras seekTo($target)"
+                    for (k in 0 until 16) opened.readPacket() ?: break
+                }
+                null
+            } catch (t: Throwable) {
+                t
+            } finally {
+                demuxer?.let { opened -> runCatching { opened.close() } }
             }
-            stage = "pistas"
-            val ids = demuxer.tracks.map { it.id }.toSet()
-            val duration = demuxer.durationUs
-            stage = "leer"
-            while (true) {
-                val packet = demuxer.readPacket() ?: break
-                if (packet.trackId !in ids) return Violation("pista no anunciada", "paquete de la pista ${packet.trackId}; anunciadas: $ids")
-                if (++packets > packetCap) return Violation("paquetes desproporcionados", "más de $packetCap en $fileSize bytes")
-            }
-            for (target in listOf(0L, duration / 2, duration, duration + 1_000_000, Long.MAX_VALUE, 1L)) {
-                stage = "seekTo($target)"
-                demuxer.seekTo(target)
-                stage = "leer tras seekTo($target)"
-                for (k in 0 until 16) demuxer.readPacket() ?: break
-            }
-            null
-        } catch (t: Throwable) {
-            t
-        } finally {
-            demuxer?.let { opened -> runCatching { opened.close() } }
+            leaked = demuxer == null && memory.isOpen
+            runCatching { memory.close() }
         }
-        val leaked = demuxer == null && channel.isOpen
-        runCatching { channel.close() }
-        val allocated = (threads?.currentThreadAllocatedBytes ?: 0) - before
+        val failure = thrown
         lastAllocatedBytes = allocated
         val phase = when {
             demuxer == null -> "falla al abrir"

@@ -3,6 +3,7 @@ package com.braymon.kotmpeg
 import com.braymon.kotmpeg.codecconfig.AacConfig
 import com.braymon.kotmpeg.codecconfig.NalUnits
 import com.braymon.kotmpeg.codecconfig.OpusConfig
+import com.braymon.kotmpeg.ebml.EbmlElement
 import com.braymon.kotmpeg.ebml.EbmlReader
 import com.braymon.kotmpeg.ebml.MatroskaIds
 import com.braymon.kotmpeg.io.SeekableInput
@@ -119,12 +120,12 @@ class TrackMetadataTest {
                         while (input.position < hijo.dataEnd) {
                             val nieto = reader.readElement()
                             if (nieto.id == id) {
-                                encontrados += if (signed) reader.readSInt(nieto) else reader.readUInt(nieto)
+                                encontrados += if (signed) readSigned(reader, nieto) else reader.readUInt(nieto)
                             }
                             input.position = nieto.dataEnd
                         }
                     } else if (hijo.id == id) {
-                        encontrados += if (signed) reader.readSInt(hijo) else reader.readUInt(hijo)
+                        encontrados += if (signed) readSigned(reader, hijo) else reader.readUInt(hijo)
                     }
                     input.position = hijo.dataEnd
                 }
@@ -132,6 +133,15 @@ class TrackMetadataTest {
             }
         }
         return encontrados
+    }
+
+    /**
+     * Un entero con signo de EBML, como `DateUTC`: sus bytes en big-endian con el signo del primero.
+     * La librería solo lo escribe, así que la lectura vive aquí.
+     */
+    private fun readSigned(reader: EbmlReader, element: EbmlElement): Long {
+        val bytes = reader.readBinary(element)
+        return bytes.fold(if (bytes.isNotEmpty() && bytes[0] < 0) -1L else 0L) { acc, b -> (acc shl 8) or (b.toLong() and 0xFF) }
     }
 
     @Test

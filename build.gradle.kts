@@ -5,7 +5,7 @@ plugins {
 
 // La versión vive aquí y no como texto suelto en el README: es la que acaba en el POM y en el
 // nombre del jar, así que cualquier otra copia acabaría desincronizándose.
-version = "4.0.0"
+version = "4.1.0"
 group = "com.braymon"
 
 // El nombre del jar sigue al del artefacto publicado, no al de la carpeta del repositorio.
@@ -55,6 +55,16 @@ dependencies {
     androidApiSignature(variantOf(libs.android.api.signature) { artifactType("signature") })
 }
 
+// Si hay un ejecutable `ffmpeg` en el PATH. Es un `ValueSource` y no un cálculo suelto porque la
+// caché de configuración vuelve a evaluarlo en cada build: instalar FFmpeg en una carpeta que ya
+// estaba en el PATH no cambia la variable, y un valor calculado una vez se quedaría con el de antes.
+abstract class FfmpegEnElPath : ValueSource<Boolean, ValueSourceParameters.None> {
+    override fun obtain(): Boolean =
+        System.getenv("PATH").orEmpty().split(File.pathSeparator).filter { it.isNotBlank() }.any { carpeta ->
+            listOf("ffmpeg", "ffmpeg.exe").any { File(carpeta, it).let { f -> f.isFile && f.canExecute() } }
+        }
+}
+
 tasks.test {
     useJUnitPlatform()
 
@@ -63,11 +73,31 @@ tasks.test {
     systemProperty("kotmpeg.api.update", providers.systemProperty("kotmpeg.api.update").orNull ?: "false")
 
     // La campaña de fuzzing larga se pide igual, con `-D` en la línea de comandos (ver
-    // `DemuxerFuzzTest`). Sin ellas corre la pasada corta y fija de siempre.
-    for (propiedad in listOf("kotmpeg.fuzz.iterations", "kotmpeg.fuzz.seconds", "kotmpeg.fuzz.seed")) {
-        providers.systemProperty(propiedad).orNull?.let { systemProperty(propiedad, it) }
-    }
+    // `DemuxerFuzzTest` y el fuzzing de `repair` en `InterruptedRecordingTest`). Sin ellas corre la
+    // pasada corta y fija de siempre.
+    val propiedadesFuzzing = listOf("kotmpeg.fuzz.iterations", "kotmpeg.fuzz.seconds", "kotmpeg.fuzz.seed")
+        .mapNotNull { propiedad -> providers.systemProperty(propiedad).orNull?.let { propiedad to it } }
+    for ((propiedad, valor) in propiedadesFuzzing) systemProperty(propiedad, valor)
     systemProperty("kotmpeg.fuzz.findings", layout.buildDirectory.dir("fuzz-findings").get().asFile.absolutePath)
+
+    // Ningún test de la suite tarda más de un par de minutos: uno que pase de cinco está colgado, y
+    // así falla él solo, con su nombre, en vez de agotar el tiempo del job entero sin decir cuál
+    // era. JUnit lo lee de las propiedades del sistema. No se aplica a la campaña de fuzzing, que
+    // dura lo que se le pida.
+    //
+    // Cada test corre en un hilo aparte (`SEPARATE_THREAD`) para que el plazo corte también un
+    // cuelgue de CPU. En el modo por defecto, al vencer solo se interrumpe el hilo del test, y un
+    // parser en bucle no mira la interrupción: el test no terminaba nunca. Lo que mide el hilo
+    // actual, como `allocatedBytes`, sigue valiendo, porque el código medido corre en ese mismo hilo
+    // (lo comprueba `ApiFinalTestTimeoutTest`).
+    if (propiedadesFuzzing.isEmpty()) {
+        systemProperty("junit.jupiter.execution.timeout.default", "5 m")
+        systemProperty("junit.jupiter.execution.timeout.thread.mode.default", "SEPARATE_THREAD")
+    }
+
+    // Los tests que necesitan FFmpeg se omiten sin él. Sin esta entrada, instalarlo no cambiaba
+    // nada que Gradle mire, y `test` seguía UP-TO-DATE con las omisiones de la ejecución anterior.
+    inputs.property("ffmpegEnElPath", providers.of(FfmpegEnElPath::class) {})
 
     // `AndroidApiCompatibilityTest` necesita la firma de Android y las clases compiladas de la
     // librería; se le pasan como rutas para que no dependa del directorio de trabajo.

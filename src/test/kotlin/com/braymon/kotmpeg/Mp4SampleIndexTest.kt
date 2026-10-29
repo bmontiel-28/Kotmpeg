@@ -9,11 +9,9 @@ import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.model.VideoCodec
 import com.braymon.kotmpeg.mp4.Mp4Demuxer
 import com.braymon.kotmpeg.mp4.TrackSamples
-import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.lang.management.ManagementFactory
 import kotlin.random.Random
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -182,8 +180,6 @@ class Mp4SampleIndexTest {
      */
     @Test
     fun `opening a file with a million samples does not allocate per sample`() {
-        val threads = ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
-        assumeTrue(threads != null, "este JDK no mide la memoria por hilo")
         val samples = 1_000_000
         for ((name, fragmented) in listOf("millon.mp4" to false, "millon-fragmentado.mp4" to true)) {
             val file = File(dir, name)
@@ -197,10 +193,9 @@ class Mp4SampleIndexTest {
             muxer.stop()
 
             Mp4Demuxer(file).close()
-            val before = threads!!.currentThreadAllocatedBytes
-            val demuxer = Mp4Demuxer(file)
-            val allocated = threads.currentThreadAllocatedBytes - before
-            demuxer.use {
+            var opened: Mp4Demuxer? = null
+            val allocated = allocatedBytes { opened = Mp4Demuxer(file) }
+            checkNotNull(opened).use {
                 assertTrue(allocated < 8L * 1024 * 1024, "$name: abrir reservó ${allocated / 1024} KiB para $samples muestras")
                 assertEquals(500_000_000L, it.seekTo(500_000_000L), "$name: seek a la mitad")
                 assertEquals(500_000_000L, it.readPacket()?.ptsUs)

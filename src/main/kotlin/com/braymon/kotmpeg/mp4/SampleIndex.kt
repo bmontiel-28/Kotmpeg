@@ -8,9 +8,65 @@ import java.util.BitSet
  * Destino de las muestras que produce el parser: el índice al abrir, que solo las cuenta, o el
  * cursor al leer, que guarda las de su pista. Así las dos pasadas comparten el mismo código de
  * parseo y no pueden discrepar.
+ *
+ * [add] devuelve false cuando no quiere más muestras de esa pista en lo que queda de recorrido
+ * —el índice, porque se agotó el [SampleBudget]; el cursor, porque llenó su ventana—, y el parser
+ * deja de entregárselas. Es lo que hace que lo que se descarta no cueste una vuelta por muestra.
  */
 internal fun interface SampleSink {
-    fun add(offset: Long, size: Int, ptsUs: Long, dtsUs: Long, key: Boolean, durationUs: Long)
+    fun add(offset: Long, size: Int, ptsUs: Long, dtsUs: Long, key: Boolean, durationUs: Long): Boolean
+}
+
+/**
+ * Lo que un archivo puede declarar en muestras, entre todas sus pistas, antes de que se deje de
+ * creer: las que caben por su tamaño y un máximo absoluto. Se consume al abrir, en el orden en que
+ * se recorren las pistas, y la que lo agota termina ahí, con aviso.
+ *
+ * Cada tabla ya se acotaba por separado contra el archivo entero, pero la cota no se sumaba: 125 000
+ * chunks apuntando al mismo megabyte, o 60 000 `trun` que repiten el mismo tramo, pasan cada uno su
+ * comprobación y juntos declaran miles de veces el archivo. Lo que eso costaba era memoria al abrir
+ * —un punto de control cada 256 muestras—, segundos de CPU y, al leer, gigabytes copiados del mismo
+ * sitio.
+ *
+ * - **Bytes**: las muestras que están dentro del archivo no pueden sumar más de [BYTES_FACTOR]
+ *   veces su tamaño. En un archivo íntegro no se solapan y suman menos que él; el margen es para
+ *   uno dañado que repita algún chunk, que se sigue leyendo entero. Cada muestra cuenta al menos un
+ *   byte, para que las de tamaño cero, que no ocupan nada, no salgan gratis.
+ * - **Muestras**: [MAX_FILE_SAMPLES] entre todas las pistas, estén o no dentro del archivo. Es lo
+ *   que acota los puntos de control y el `BitSet` de keyframes de un archivo grande hecho de
+ *   muestras de un byte, que la cota de bytes no frena.
+ */
+internal class SampleBudget(private val fileLength: Long) {
+    private var bytesLeft =
+        if (fileLength > Long.MAX_VALUE / BYTES_FACTOR) Long.MAX_VALUE else fileLength * BYTES_FACTOR
+    private var samplesLeft = MAX_FILE_SAMPLES
+
+    /**
+     * Cuenta una muestra de [size] bytes en [offset]. Devuelve null si cabe, o el motivo, para el
+     * aviso, si ya no: entonces no consume nada.
+     */
+    fun take(offset: Long, size: Long): String? {
+        if (samplesLeft == 0) return "el archivo declara más de $MAX_FILE_SAMPLES muestras entre todas sus pistas"
+        if (offset >= 0 && size >= 0 && offset <= fileLength && size <= fileLength - offset) {
+            val cost = size.coerceAtLeast(1)
+            if (cost > bytesLeft) return "sus muestras suman más de $BYTES_FACTOR veces el tamaño del archivo (se solapan)"
+            bytesLeft -= cost
+        }
+        samplesLeft--
+        return null
+    }
+
+    companion object {
+        /** Veces el tamaño del archivo que pueden sumar sus muestras. */
+        const val BYTES_FACTOR: Long = 2
+
+        /**
+         * Muestras de todas las pistas juntas: más de seis días de vídeo a 60 fps con su audio
+         * AAC. Con este techo, los puntos de control de un archivo manipulado no pasan de unos
+         * 32 MB y la pasada al abrir, de un segundo.
+         */
+        const val MAX_FILE_SAMPLES: Int = 1 shl 26
+    }
 }
 
 /**
@@ -62,7 +118,9 @@ internal abstract class SampleCursor {
  * bisección sobre arrays: se biseca entre los puntos de control y se recorren como mucho
  * [CHECKPOINT_INTERVAL] muestras.
  *
- * Las búsquedas dan **exactamente** el resultado de las de la 3.0.0; los nombres son los mismos.
+ * Las búsquedas dan **exactamente** lo que daría recorrer la pista entera con el mismo criterio,
+ * también justo en los bordes de los puntos de control: es lo que comprueba `Mp4SampleIndexTest`
+ * contra un modelo sobre arrays.
  */
 internal abstract class TrackSamples {
     abstract val size: Int
@@ -91,6 +149,11 @@ internal abstract class TrackSamples {
      * control y recorrer hasta [CHECKPOINT_INTERVAL] muestras, y en una búsqueda era la mitad de
      * su coste. Si el cursor no sabe el DTS siguiente —al final del último fragmento cargado—,
      * avanza y, si se pasa, vuelve.
+     *
+     * En fMP4 los puntos de control posteriores al final de una pista apuntan a [size] con DTS
+     * `Long.MAX_VALUE`, y con `value = Long.MAX_VALUE` la bisección aterriza en uno de ellos: por
+     * eso el índice se acota a la última muestra, que es además la respuesta correcta. Sin la cota,
+     * `seekTo` lanzaba al colocar el cursor en una muestra que no existe.
      */
     fun lastIndexWithDtsAtMost(value: Long, scan: SampleCursor): Int {
         var low = 0
@@ -103,7 +166,7 @@ internal abstract class TrackSamples {
             scan.moveTo(0)
             return 0
         }
-        var index = checkpointIndex(low - 1)
+        var index = checkpointIndex(low - 1).coerceAtMost(size - 1)
         scan.moveTo(index)
         while (index + 1 < size) {
             if (scan.knowsNextDts) {
@@ -190,12 +253,6 @@ internal abstract class TrackSamples {
          * cuarta parte, pero buscar costaba más de 100 µs.
          */
         const val CHECKPOINT_INTERVAL: Int = 256
-
-        /**
-         * Máximo de muestras por pista: el mismo que tenía el mapa completo de la 3.0.0, con el mismo
-         * mensaje, para que una pista imposible se descarte igual que antes.
-         */
-        const val MAX_SAMPLES: Int = Int.MAX_VALUE - 4096
     }
 }
 
@@ -249,6 +306,13 @@ internal class FileTable(
  * completo de la 3.0.0, con las mismas reglas para los archivos dañados: el reparto en chunks de
  * `stsc` termina donde se acaban los chunks o las muestras, una muestra sin entrada en `stts` o
  * `ctts` toma tiempo y desfase cero, y sin `stss` todas son clave.
+ *
+ * Cada muestra recorrida se descuenta de [budget], y la pista termina en la primera que ya no cabe:
+ * el motivo queda en [truncation] para que el demuxer avise.
+ *
+ * Los keyframes van en un `BitSet` que crece hasta el último que declara `stss`, y no en uno del
+ * tamaño de la pista reservado de antemano: con 500 millones de muestras de un byte eran 62 MB
+ * aunque `stss` tuviera una sola entrada.
  */
 internal class StblSamples(
     private val sampleCount: Int,
@@ -263,12 +327,23 @@ internal class StblSamples(
     private val mediaTimescale: Long,
     private val elstMediaTime: Long,
     private val elstEmptyDurationUs: Long,
+    budget: SampleBudget,
 ) : TrackSamples() {
 
     override var size: Int = 0
         private set
     override var dtsMonotonic: Boolean = true
         private set
+
+    /** Por qué la pista termina antes de lo que declaran sus tablas, o null si no lo hace. */
+    var truncation: String? = null
+        private set
+
+    /**
+     * Dónde acaba la pista en µs: el mayor `dts + duración` de sus muestras, con la lista de edición
+     * aplicada. Es la duración de respaldo cuando el `mvhd` no la declara.
+     */
+    val endUs: Long
 
     private var checkpoints = LongArray(16 * FIELDS)
     override var checkpointCount: Int = 0
@@ -278,19 +353,23 @@ internal class StblSamples(
 
     init {
         val walker = Cursor()
+        var endTick = Long.MIN_VALUE
         if (walker.start()) {
             var previousDts = Long.MIN_VALUE
             do {
-                require(walker.index < MAX_SAMPLES) { "demasiadas muestras en una pista: ${walker.index}" }
+                truncation = budget.take(walker.position, sizeOf(walker.index))
+                if (truncation != null) break
                 if (walker.index % CHECKPOINT_INTERVAL == 0) walker.saveCheckpoint()
                 if (walker.dtsUs < previousDts) dtsMonotonic = false
                 previousDts = walker.dtsUs
+                endTick = maxOf(endTick, walker.endTick)
                 size = walker.index + 1
             } while (walker.advance())
         }
+        endUs = if (size == 0) 0L else dtsUs(endTick)
         checkpoints = checkpoints.copyOf(checkpointCount * FIELDS)
         keys = stss?.let { table ->
-            val flags = BitSet(size)
+            val flags = BitSet()
             for (k in 0 until table.entries) {
                 val index = table.u32(k, 0) - 1
                 if (index in 0 until size) flags.set(index.toInt())
@@ -382,13 +461,24 @@ internal class StblSamples(
         private var cttsValue = 0L
         private var sampleCtts = 0L
 
+        /** Fin de la muestra actual en tics, `dts + duración`, saturado. */
+        val endTick: Long
+            get() = if (dtsTick > Long.MAX_VALUE - sampleDelta) Long.MAX_VALUE else dtsTick + sampleDelta
+
         /** Muestra a la que corresponde el estado de posiciones; -1 si todavía no hay ninguno. */
         private var positionIndex = -1
         private var chunk = 0
         private var stscEntry = 0
         private var samplesInChunk = 0L
         private var inChunk = 0L
-        private var position = 0L
+
+        /**
+         * Offset de la muestra [positionIndex]. En la pasada al abrir va siempre a la par de [index],
+         * y allí se lee directamente para descontar la muestra del presupuesto sin pasar por
+         * [offset].
+         */
+        var position = 0L
+            private set
 
         override fun moveTo(target: Int) {
             val samples = this@StblSamples.size
@@ -554,8 +644,9 @@ internal class StblSamples(
 }
 
 /**
- * Muestras de una pista recogidas de un solo `moof`, el buffer de los cursores de fMP4. Crece
- * duplicando, porque un fragmento normal trae unas decenas o cientos de muestras por pista.
+ * Muestras de una pista recogidas de un `moof` —o de una ventana de él, como mucho
+ * [FragmentCursor.WINDOW]—, el buffer de los cursores de fMP4. Crece duplicando, porque un
+ * fragmento normal trae unas decenas o cientos de muestras por pista.
  */
 internal class SampleBuffer : SampleSink {
     var size: Int = 0
@@ -567,7 +658,7 @@ internal class SampleBuffer : SampleSink {
     private var durations = LongArray(64)
     private var keys = BooleanArray(64)
 
-    override fun add(offset: Long, size: Int, ptsUs: Long, dtsUs: Long, key: Boolean, durationUs: Long) {
+    override fun add(offset: Long, size: Int, ptsUs: Long, dtsUs: Long, key: Boolean, durationUs: Long): Boolean {
         val i = this.size
         if (i == offsets.size) {
             val capacity = i * 2
@@ -585,6 +676,7 @@ internal class SampleBuffer : SampleSink {
         durations[i] = durationUs
         keys[i] = key
         this.size = i + 1
+        return true
     }
 
     fun clear() {

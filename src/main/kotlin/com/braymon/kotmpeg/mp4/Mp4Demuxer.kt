@@ -1,16 +1,10 @@
 package com.braymon.kotmpeg.mp4
 
 import com.braymon.kotmpeg.Demuxer
-import com.braymon.kotmpeg.codecconfig.AacConfig
-import com.braymon.kotmpeg.codecconfig.OpusConfig
 import com.braymon.kotmpeg.io.SeekableInput
-import com.braymon.kotmpeg.model.AudioCodec
-import com.braymon.kotmpeg.model.ColorInfo
-import com.braymon.kotmpeg.model.HdrStaticInfo
 import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.Timestamps
 import com.braymon.kotmpeg.model.TrackInfo
-import com.braymon.kotmpeg.model.VideoCodec
 import java.io.File
 
 /**
@@ -20,24 +14,31 @@ import java.io.File
  * (stts/ctts/stss/stsc/stsz/stco/co64), respetando las edit lists para los offsets de
  * presentación. Archivos fragmentados (`moov` vacío + pares `moof`/`mdat`): recorre cada
  * fragmento leyendo tfhd/tfdt/trun —incluidos los defaults de trex, el direccionamiento
- * default-base-is-moof y los offsets de composición firmados (versión 1)— y aplicando la misma
- * edit list que a una pista plana. Los paquetes se emiten intercalados en orden de decodificación
- * entre pistas; las no soportadas se saltan.
+ * default-base-is-moof y los offsets de composición firmados— y aplicando la misma edit list que a
+ * una pista plana (ver [FragmentWalker]). Los paquetes se emiten intercalados en orden de
+ * decodificación entre pistas; las no soportadas se saltan, con aviso.
+ *
+ * Un MP4 **híbrido** —muestras en el `moov` y además fragmentos, lo que escribe FFmpeg con
+ * `-movflags frag_keyframe` sin `empty_moov`— no se lee entero: de las pistas que tienen muestras
+ * en el `moov` solo se entregan esas, y se avisa. Se abre y se lee sin errores; lo que falta es el
+ * resto de sus fragmentos.
  *
  * Las muestras **no se cargan en memoria**: al abrir se recorren una vez para validarlas y dejar
  * un punto de control cada pocos cientos, y después se leen del archivo a medida que hacen falta
  * (ver [TrackSamples]). Un archivo de dos horas a 60 fps con audio se abre con menos de 0,5 MB,
- * donde la 3.0.0 necesitaba unos 28, y la diferencia crece con la duración.
+ * donde la 3.0.0 necesitaba unos 28, y la diferencia crece con la duración. Lo que un archivo
+ * manipulado puede declarar está acotado por su tamaño (ver [SampleBudget]) y por [MAX_TRACKS].
  */
 public class Mp4Demuxer(
     private val input: SeekableInput,
     /**
-     * Avisos no fatales: pistas que no se pueden parsear y fragmentos ilegibles, que se
-     * descartan para que el resto del archivo siga siendo usable.
+     * Avisos no fatales: pistas que no se pueden parsear o que no se soportan, fragmentos
+     * ilegibles y metadatos que se ignoran. Lo que se descarta se descarta para que el resto del
+     * archivo siga siendo usable, y siempre con un aviso por aquí.
      *
      * Es la **única** forma de enterarse de que algo se perdió: sin él, una pista ilegible
-     * desaparece en silencio absoluto y el síntoma que llega —"mi vídeo se abre pero sin
-     * audio"— se queda sin ningún diagnóstico posible.
+     * desaparece sin rastro y el síntoma que llega —"mi vídeo se abre pero sin audio"— se queda
+     * sin ningún diagnóstico posible.
      */
     private val onWarning: (String) -> Unit = {},
 ) : Demuxer {
@@ -50,17 +51,18 @@ public class Mp4Demuxer(
     public constructor(file: File, onWarning: (String) -> Unit = {}) :
         this(SeekableInput(file), onWarning = onWarning)
 
-    private class Box(val type: String, val dataStart: Long, val dataEnd: Long)
+    private val boxes = Mp4BoxReader(input)
+    private val sampleEntries = Mp4SampleEntryReader(boxes, ::warn)
 
     /**
-     * Pista ya leída. [cursor] es la siguiente muestra que entregará [readPacket], y [reader] está
-     * siempre colocado en ella mientras quede alguna. `samples.dtsMonotonic` decide si [seekTo]
-     * puede buscar por bisección: es lo normal, pero un fMP4 manipulado puede traer `tfdt` que
-     * retroceden, y ahí se recorre la pista entera.
+     * Pista ya leída. [nextIndex] es la siguiente muestra que entregará [readPacket], y [reader]
+     * está siempre colocado en ella mientras quede alguna. `samples.dtsMonotonic` decide si
+     * [seekTo] puede buscar por bisección: es lo normal, pero un fMP4 manipulado puede traer `tfdt`
+     * que retroceden, y ahí se recorre la pista entera.
      */
     private class ParsedTrack(val info: TrackInfo, val samples: TrackSamples) {
         val reader: SampleCursor = samples.cursor()
-        var cursor: Int = 0
+        var nextIndex: Int = 0
 
         /**
          * Cuánto va la presentación de la pista por delante de su decodificación, medido en su
@@ -84,7 +86,10 @@ public class Mp4Demuxer(
      * Lleva la lista de edición de su `trak` igual que una pista plana: el `elst` del `moov` vale
      * para toda la línea de tiempo de la pista, fragmentos incluidos. Hasta la 3.0.0 se perdía. En
      * audio, la edición inicial es el cebado y llega ya convertida en `codecDelayUs` (ver
-     * [audioPriming]), así que aquí solo queda lo que afecta a los tiempos.
+     * [audioPriming]), así que en [elstMediaTime] solo queda lo que afecta a los tiempos.
+     *
+     * [primingTicks] es ese cebado en tics del medio, o cero. No mueve ningún paquete, pero la
+     * duración no lo cuenta (ver [parseFragments]).
      */
     private class FragmentShell(
         val trackId: Int,
@@ -97,17 +102,32 @@ public class Mp4Demuxer(
         val header: TrackHeader,
         val elstMediaTime: Long,
         val elstEmptyDurationUs: Long,
+        val primingTicks: Long,
     )
 
-    private class TrexDefaults(val duration: Long, val size: Long, val flags: Long)
+    /**
+     * La parte de una lista de edición que se aplica: el tiempo del medio en que empieza la primera
+     * edición con medios, los huecos (ediciones vacías) que la preceden, en tics de la película, y
+     * cuántas ediciones más trae, que no se aplican.
+     */
+    private class EditList(val mediaTime: Long, val emptyTicks: Long, val ignored: Int)
 
     private val parsedTracks = ArrayList<ParsedTrack>()
     private var trackList: List<TrackInfo> = emptyList()
-    private val fragmentShells = LinkedHashMap<Int, FragmentShell>()
+    private val fragmentShells = ArrayList<FragmentShell>()
     private val trexDefaults = HashMap<Int, TrexDefaults>()
+
+    /** `track_ID` de las pistas ya aceptadas, planas o de fragmentos, para descartar los repetidos. */
+    private val acceptedTrackIds = HashSet<Int>()
+
+    /** Pistas usables que no se leen por pasar de [MAX_TRACKS]. */
+    private var tracksOverLimit = 0
 
     /** Pistas ya anunciadas como ilegibles, para no repetir el aviso por cada muestra. */
     private val unreadableWarned = HashSet<Int>()
+
+    /** Si ya se llamó a [close]: desde entonces [readPacket] y [seekTo] lanzan. */
+    private var closed = false
 
     override var durationUs: Long = 0
         private set
@@ -124,105 +144,44 @@ public class Mp4Demuxer(
         trackList = parsedTracks.map { it.info }
     }
 
+    /** Pasa un aviso a [onWarning], sin dejar que una excepción suya interrumpa la lectura. */
+    private fun warn(message: String) {
+        runCatching { onWarning(message) }
+    }
+
     /**
-     * Lee la cabecera de la siguiente caja, o null si no cabe o es imposible.
+     * Lee el `moov` y, si tiene pistas sin muestras propias, los fragmentos.
      *
-     * El fin de la caja se calcula con [Math.addExact] porque solo la vía de `largesize` puede
-     * desbordar el `Long`: es el patrón crudo de 64 bits del archivo, y un desbordamiento en
-     * Kotlin no lanza, da la vuelta en silencio. Un valor elegido a propósito puede hacer que el
-     * resultado caiga de vuelta dentro de la ventana válida, y entonces el parser seguiría
-     * leyendo desde un offset inventado como si fuera una cabecera. Se trata como fin de
-     * escaneo, igual que cualquier otra cabecera imposible.
+     * Una duración del `mvhd` a cero o «todo unos» (ISO/IEC 14496-12 §8.2.2: desconocida) no es
+     * una duración: el valor de 32 bits daba 49 días y el de 64, -1000 µs. Entonces manda el final
+     * de las pistas, que en fMP4 ya se tomaba siempre que fuera mayor.
      */
-    private fun readBoxHeader(end: Long): Box? {
-        if (input.position + 8 > end || input.remaining < 8) return null
-        val start = input.position
-        var size = input.readInt32().toLong() and 0xFFFFFFFFL
-        val type = String(input.readBytes(4), Charsets.US_ASCII)
-        var headerLen = 8L
-        if (size == 1L) {
-            if (input.position + 8 > end || input.remaining < 8) return null
-            size = input.readInt64()
-            headerLen = 16
-        } else if (size == 0L) {
-            size = end - start
-        }
-        if (size < headerLen) return null
-        val dataEnd = try {
-            Math.addExact(start, size)
-        } catch (_: ArithmeticException) {
-            return null
-        }
-        return Box(type, start + headerLen, dataEnd)
-    }
-
-    /**
-     * Número de entradas que caben realmente en lo que queda de la caja. Las cuentas de
-     * las tablas vienen del archivo: reservar `LongArray(n)` sin validarlas permite que
-     * unos pocos bytes manipulados provoquen un OutOfMemoryError (que es `Error`, no
-     * `Exception`, así que ni siquiera lo atrapa el try/catch por pista).
-     */
-    private fun boundedCount(declared: Int, bytesPerEntry: Int, end: Long): Int {
-        val declaredUnsigned = declared.toLong() and 0xFFFFFFFFL
-        if (declaredUnsigned == 0L) return 0
-        val available = end - input.position
-        if (available <= 0) return 0
-        val fits = available / bytesPerEntry
-        return minOf(declaredUnsigned, fits).toInt()
-    }
-
-    /**
-     * Cota para las tablas que **no** guardan una entrada por muestra —`stsz` con tamaño
-     * constante y `trun` sin campos por muestra—, donde el tamaño de la caja no dice nada
-     * de la cuenta. El límite lo pone la física del archivo: cada muestra ocupa al menos
-     * [bytesPerSampleInFile] bytes de datos, así que no puede haber más de
-     * `length / bytesPerSampleInFile`.
-     *
-     * Se mide contra el archivo **completo**, no contra lo que queda por leer: con el `moov`
-     * al final las muestras están *detrás* de la caja que se está parseando, y acotar por
-     * el remanente truncaría pistas legítimas.
-     */
-    private fun physicalCount(declared: Int, bytesPerSampleInFile: Long): Int {
-        val declaredUnsigned = declared.toLong() and 0xFFFFFFFFL
-        val physicalMax = input.length / bytesPerSampleInFile.coerceAtLeast(1)
-        return minOf(declaredUnsigned, physicalMax).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-    }
-
-    private inline fun scanChildren(start: Long, end: Long, handler: (Box) -> Unit) {
-        input.position = start
-        while (input.position + 8 <= end) {
-            val boxStart = input.position
-            val box = readBoxHeader(end) ?: break
-            if (box.dataEnd <= boxStart || box.dataEnd > end) break // corrupto; evita bucles
-            handler(box)
-            input.position = box.dataEnd
-        }
-    }
-
     private fun parse() {
-        var moov: Box? = null
+        var moov: Mp4Box? = null
+        var sawMoof = false
         runCatching {
-            scanChildren(0, input.length) { box ->
+            boxes.scanChildren(0, input.length) { box ->
                 if (box.type == "moov") moov = box
+                if (box.type == "moof") sawMoof = true
             }
         }
         val moovBox = moov ?: throw IllegalStateException("no se encontró la caja moov (¿archivo truncado?)")
 
         var movieTimescale = 1000L
         var movieDuration = 0L
-        val trakBoxes = ArrayList<Box>()
+        val trakBoxes = ArrayList<Mp4Box>()
         runCatching {
-            scanChildren(moovBox.dataStart, moovBox.dataEnd) { box ->
+            boxes.scanChildren(moovBox.dataStart, moovBox.dataEnd) { box ->
                 when (box.type) {
-                    "mvex" -> scanChildren(box.dataStart, box.dataEnd) { child ->
+                    "mvex" -> boxes.scanChildren(box.dataStart, box.dataEnd) { child ->
                         if (child.type == "trex") {
                             input.position = child.dataStart
                             input.skip(4)
                             val trackId = input.readInt32()
                             input.skip(4) // default_sample_description_index
-                            val duration = input.readInt32().toLong() and 0xFFFFFFFFL
-                            val size = input.readInt32().toLong() and 0xFFFFFFFFL
-                            val flags = input.readInt32().toLong() and 0xFFFFFFFFL
+                            val duration = input.readUInt(4) // default_sample_duration
+                            val size = input.readUInt(4) // default_sample_size
+                            val flags = input.readUInt(4) // default_sample_flags
                             trexDefaults[trackId] = TrexDefaults(duration, size, flags)
                         }
                     }
@@ -232,29 +191,42 @@ public class Mp4Demuxer(
                         input.skip(3)
                         if (version == 1) {
                             input.skip(16)
-                            movieTimescale = input.readInt32().toLong() and 0xFFFFFFFFL
+                            movieTimescale = input.readUInt(4)
                             movieDuration = input.readInt64()
                         } else {
                             input.skip(8)
-                            movieTimescale = input.readInt32().toLong() and 0xFFFFFFFFL
-                            movieDuration = input.readInt32().toLong() and 0xFFFFFFFFL
+                            movieTimescale = input.readUInt(4)
+                            movieDuration = input.readUInt(4).let { if (it == 0xFFFFFFFFL) 0L else it }
                         }
                     }
                     "trak" -> trakBoxes.add(box)
                 }
             }
         }
-        if (movieTimescale > 0) durationUs = Timestamps.rescaleFloor(movieDuration, 1_000_000, movieTimescale)
+        val movieDurationKnown = movieTimescale > 0 && movieDuration > 0
+        if (movieDurationKnown) durationUs = Timestamps.rescaleFloor(movieDuration, 1_000_000, movieTimescale)
 
+        val budget = SampleBudget(input.length)
+        var plainEndUs = 0L
         for (trak in trakBoxes) {
             try {
-                parseTrak(trak, movieTimescale)
+                parseTrak(trak, movieTimescale, budget)?.let { endUs -> plainEndUs = maxOf(plainEndUs, endUs) }
             } catch (e: Exception) {
-                runCatching { onWarning("pista descartada: no se pudo parsear su trak (${e.message})") }
+                warn("pista descartada: no se pudo parsear su trak (${e.message})")
             }
         }
+        if (!movieDurationKnown) durationUs = plainEndUs
+        if (tracksOverLimit > 0) {
+            warn("el archivo tiene más de $MAX_TRACKS pistas de audio y vídeo: se ignoran las $tracksOverLimit últimas")
+        }
+        if (sawMoof && parsedTracks.isNotEmpty()) {
+            warn(
+                "MP4 híbrido: las pistas ${parsedTracks.joinToString { it.info.id.toString() }} tienen " +
+                    "muestras en el moov y solo se leen esas; sus fragmentos se ignoran",
+            )
+        }
 
-        if (fragmentShells.isNotEmpty()) parseFragments()
+        if (fragmentShells.isNotEmpty()) parseFragments(budget)
     }
 
     /** Mapea la parte de rotación de la matriz tkhd de vuelta a 0/90/180/270 grados. */
@@ -279,27 +251,31 @@ public class Mp4Demuxer(
      * La escala de la película se valida antes de dividir por ella: un `mvhd` con escala cero
      * hacía que cualquier pista con lista de edición se descartara por una división entre cero.
      *
-     * El reparto de muestras en chunks avanza por `stsc` **una sola vez**, en paralelo a los chunks.
-     * Antes, para cada chunk se recorría `stsc` desde el principio: con audio y vídeo intercalados
-     * hay casi tantas entradas como chunks, y abrir un MP4 de dos horas costaba unos 10 segundos
-     * de CPU antes de entregar el primer paquete.
+     * Cada pista que no se lee se avisa, también las que antes desaparecían en silencio: sin
+     * `stbl`, con escala de tiempo cero, de un tipo que no es audio ni vídeo, o con tablas que no
+     * ubican ninguna muestra (un `stco` vacío). Una que repite el `track_ID` de otra ya leída se
+     * descarta: con dos pistas con el mismo id, en MP4 plano salían dos `TrackInfo` indistinguibles
+     * y en fMP4 la segunda pisaba a la primera.
+     *
+     * Devuelve dónde acaba la pista en µs si es plana y se lee, para la duración de respaldo. Sin el
+     * cebado del audio, como la del `mvhd`, que desde la 4.1.0 es la suma de las ediciones: con él,
+     * un archivo con la duración del `mvhd` perdida declaraba 21 ms más que con ella.
      */
-    private fun parseTrak(trak: Box, movieTimescale: Long) {
+    private fun parseTrak(trak: Mp4Box, movieTimescale: Long, budget: SampleBudget): Long? {
         var trackId = 0
         var mediaTimescale = 0L
         var handlerType = ""
         var width = 0
         var height = 0
         var rotationDegrees = 0
-        var stblBox: Box? = null
-        var elstMediaTime = 0L
-        var elstEmptyDurationUs = 0L
+        var stblBox: Mp4Box? = null
+        var edits = EditList(0L, 0L, 0)
         var sampleDescription: SampleDescription? = null
         var language = "und"
         var name: String? = null
         var enabled = true
 
-        scanChildren(trak.dataStart, trak.dataEnd) { box ->
+        boxes.scanChildren(trak.dataStart, trak.dataEnd) { box ->
             when (box.type) {
                 "tkhd" -> {
                     input.position = box.dataStart
@@ -315,40 +291,17 @@ public class Mp4Demuxer(
                     width = (input.readInt32() ushr 16)
                     height = (input.readInt32() ushr 16)
                 }
-                "edts" -> scanChildren(box.dataStart, box.dataEnd) { elst ->
-                    if (elst.type == "elst") {
-                        input.position = elst.dataStart
-                        val version = input.readByte()
-                        input.skip(3)
-                        val count = boundedCount(input.readInt32(), if (version == 1) 20 else 12, elst.dataEnd)
-                        repeat(count) {
-                            val segDuration: Long
-                            val mediaTime: Long
-                            if (version == 1) {
-                                segDuration = input.readInt64(); mediaTime = input.readInt64()
-                            } else {
-                                segDuration = input.readInt32().toLong() and 0xFFFFFFFFL
-                                mediaTime = input.readInt32().toLong()
-                            }
-                            input.skip(4) // media_rate
-                            if (mediaTime == -1L) {
-                                if (movieTimescale > 0) {
-                                    elstEmptyDurationUs = Timestamps.rescaleFloor(segDuration, 1_000_000, movieTimescale)
-                                }
-                            } else if (elstMediaTime == 0L) {
-                                elstMediaTime = mediaTime
-                            }
-                        }
-                    }
+                "edts" -> boxes.scanChildren(box.dataStart, box.dataEnd) { elst ->
+                    if (elst.type == "elst") edits = readEditList(elst)
                 }
-                "mdia" -> scanChildren(box.dataStart, box.dataEnd) { child ->
+                "mdia" -> boxes.scanChildren(box.dataStart, box.dataEnd) { child ->
                     when (child.type) {
                         "mdhd" -> {
                             input.position = child.dataStart
                             val version = input.readByte()
                             input.skip(3)
                             input.skip(if (version == 1) 16L else 8L)
-                            mediaTimescale = input.readInt32().toLong() and 0xFFFFFFFFL
+                            mediaTimescale = input.readUInt(4)
                             input.skip(if (version == 1) 8L else 4L)
                             language = SampleEntries.unpackLanguage(input.readUInt(2).toInt()) // idioma ISO 639-2/T
                         }
@@ -357,21 +310,41 @@ public class Mp4Demuxer(
                             input.skip(8)
                             handlerType = String(input.readBytes(4), Charsets.US_ASCII)
                         }
-                        "minf" -> scanChildren(child.dataStart, child.dataEnd) { minfChild ->
+                        "minf" -> boxes.scanChildren(child.dataStart, child.dataEnd) { minfChild ->
                             if (minfChild.type == "stbl") stblBox = minfChild
                         }
                     }
                 }
-                "udta" -> scanChildren(box.dataStart, box.dataEnd) { child ->
+                "udta" -> boxes.scanChildren(box.dataStart, box.dataEnd) { child ->
                     if (child.type == "name") name = readTrackName(child)
                 }
             }
         }
         val header = TrackHeader(language, name, enabled)
+        val elstEmptyDurationUs = if (movieTimescale > 0) {
+            Timestamps.rescaleFloor(edits.emptyTicks, 1_000_000, movieTimescale)
+        } else {
+            0L
+        }
 
-        val stbl = stblBox ?: return
-        if (mediaTimescale <= 0) return
-        if (handlerType != "vide" && handlerType != "soun") return
+        if (handlerType != "vide" && handlerType != "soun") {
+            warn("pista $trackId ('$handlerType') descartada: solo se leen pistas de audio y vídeo")
+            return null
+        }
+        val stbl = stblBox ?: run {
+            warn("pista $trackId ($handlerType) descartada: no tiene tabla de muestras (stbl)")
+            return null
+        }
+        if (mediaTimescale <= 0) {
+            warn("pista $trackId ($handlerType) descartada: su escala de tiempo (mdhd) es cero")
+            return null
+        }
+        if (edits.ignored > 0) {
+            warn(
+                "pista $trackId: su lista de edición trae ${edits.ignored} ediciones más tras la primera " +
+                    "con medios, que no se aplican",
+            )
+        }
 
         var stts = FileTable(input, 0, 0, 8)
         var ctts = FileTable(input, 0, 0, 8)
@@ -383,55 +356,56 @@ public class Mp4Demuxer(
         var chunkOffsets = FileTable(input, 0, 0, 4)
         var chunkOffsets64 = false
 
-        scanChildren(stbl.dataStart, stbl.dataEnd) { box ->
+        boxes.scanChildren(stbl.dataStart, stbl.dataEnd) { box ->
             input.position = box.dataStart
             when (box.type) {
                 "stsd" -> {
-                    input.skip(4)
+                    val stsdVersion = input.readByte()
+                    input.skip(3)
                     val count = input.readInt32()
-                    if (count >= 1) sampleDescription = parseSampleDescription(box.dataEnd)
+                    if (count >= 1) sampleDescription = sampleEntries.read(box.dataEnd, stsdVersion, trackId)
                 }
                 "stts" -> {
                     input.skip(4)
-                    val n = boundedCount(input.readInt32(), 8, box.dataEnd)
+                    val n = boxes.boundedCount(input.readInt32(), 8, box.dataEnd)
                     stts = FileTable(input, input.position, n, 8) // sample_count, sample_delta
                 }
                 "ctts" -> {
                     input.skip(4)
-                    val n = boundedCount(input.readInt32(), 8, box.dataEnd)
+                    val n = boxes.boundedCount(input.readInt32(), 8, box.dataEnd)
                     ctts = FileTable(input, input.position, n, 8) // sample_count, sample_offset (may be signed, v1)
                 }
                 "stss" -> {
                     input.skip(4)
-                    val n = boundedCount(input.readInt32(), 4, box.dataEnd)
+                    val n = boxes.boundedCount(input.readInt32(), 4, box.dataEnd)
                     stss = FileTable(input, input.position, n, 4) // sample_number, desde 1
                 }
                 "stsc" -> {
                     input.skip(4)
-                    val n = boundedCount(input.readInt32(), 12, box.dataEnd)
+                    val n = boxes.boundedCount(input.readInt32(), 12, box.dataEnd)
                     stsc = FileTable(input, input.position, n, 12) // first_chunk, samples_per_chunk, sample_description_index
                 }
                 "stsz" -> {
                     input.skip(4)
-                    constantSize = input.readInt32().toLong() and 0xFFFFFFFFL // sample_size
+                    constantSize = input.readUInt(4) // sample_size
                     val declared = input.readInt32() // sample_count
                     if (constantSize != 0L) {
-                        sampleCount = physicalCount(declared, constantSize)
+                        sampleCount = boxes.physicalCount(declared, constantSize)
                         sampleSizes = null
                     } else {
-                        sampleCount = boundedCount(declared, 4, box.dataEnd)
+                        sampleCount = boxes.boundedCount(declared, 4, box.dataEnd)
                         sampleSizes = FileTable(input, input.position, sampleCount, 4) // entry_size
                     }
                 }
                 "stco" -> {
                     input.skip(4)
-                    val n = boundedCount(input.readInt32(), 4, box.dataEnd)
+                    val n = boxes.boundedCount(input.readInt32(), 4, box.dataEnd)
                     chunkOffsets = FileTable(input, input.position, n, 4) // chunk_offset
                     chunkOffsets64 = false
                 }
                 "co64" -> {
                     input.skip(4)
-                    val n = boundedCount(input.readInt32(), 8, box.dataEnd)
+                    val n = boxes.boundedCount(input.readInt32(), 8, box.dataEnd)
                     chunkOffsets = FileTable(input, input.position, n, 8) // chunk_offset de 64 bits
                     chunkOffsets64 = true
                 }
@@ -439,41 +413,98 @@ public class Mp4Demuxer(
         }
 
         val desc = sampleDescription ?: run {
-            runCatching {
-                onWarning(
-                    "pista $trackId ($handlerType) descartada: su formato no se pudo " +
-                        "interpretar (códec no soportado o stsd ilegible)",
-                )
-            }
-            return
-        }
-        val priming = audioPriming(handlerType, desc, elstMediaTime, mediaTimescale)
-        val trackDesc = priming?.let { delayUs ->
-            SampleDescription(
-                desc.videoCodec, desc.audioCodec, desc.codecConfig, desc.width, desc.height,
-                desc.sampleRate, desc.channels, delayUs, desc.color,
+            warn(
+                "pista $trackId ($handlerType) descartada: su formato no se pudo " +
+                    "interpretar (códec no soportado o stsd ilegible)",
             )
-        } ?: desc
-        val mediaTime = if (priming != null) 0L else elstMediaTime
+            return null
+        }
+        if (trackId in acceptedTrackIds) {
+            warn("pista $trackId ($handlerType) descartada: otra pista anterior ya usa ese track_ID")
+            return null
+        }
+        if (acceptedTrackIds.size >= MAX_TRACKS) {
+            tracksOverLimit++
+            return null
+        }
+        val priming = audioPriming(handlerType, desc, edits.mediaTime, mediaTimescale)
+        val trackDesc = priming?.let { desc.withCodecDelay(it) } ?: desc
+        val primingTicks = if (priming != null) edits.mediaTime else 0L
+        val mediaTime = edits.mediaTime - primingTicks
 
         if (sampleCount == 0) {
-            fragmentShells[trackId] =
+            acceptedTrackIds.add(trackId)
+            fragmentShells.add(
                 FragmentShell(
                     trackId, handlerType, trackDesc, mediaTimescale, width, height, rotationDegrees, header,
-                    mediaTime, elstEmptyDurationUs,
-                )
-            return
+                    mediaTime, elstEmptyDurationUs, primingTicks,
+                ),
+            )
+            return null
         }
 
         val samples = StblSamples(
             sampleCount, constantSize, sampleSizes, chunkOffsets, chunkOffsets64, stsc, stts, ctts, stss,
-            mediaTimescale, mediaTime, elstEmptyDurationUs,
+            mediaTimescale, mediaTime, elstEmptyDurationUs, budget,
         )
-        if (samples.size == 0) return
+        val truncation = samples.truncation
+        if (samples.size == 0) {
+            warn(
+                "pista $trackId ($handlerType) descartada: " +
+                    (truncation ?: "sus tablas no ubican ninguna muestra en un chunk (stsc o stco vacíos)"),
+            )
+            return null
+        }
+        if (truncation != null) {
+            warn("pista $trackId: se ignoran sus muestras a partir de la ${samples.size}: $truncation")
+        }
 
         val frameRateHint = samples.firstPositiveDelta()?.let { mediaTimescale.toDouble() / it } ?: 0.0
         val info = buildTrackInfo(handlerType, trackDesc, trackId, width, height, frameRateHint, rotationDegrees, header)
-        if (info != null) parsedTracks.add(ParsedTrack(info, samples))
+            ?: return null
+        acceptedTrackIds.add(trackId)
+        parsedTracks.add(ParsedTrack(info, samples))
+        return (samples.endUs - (priming ?: 0L)).coerceAtLeast(0L)
+    }
+
+    /**
+     * Lee un `elst`: suma los huecos —las ediciones vacías, `media_time` = -1— que hay **antes** de
+     * la primera edición con medios, toma el `media_time` de esa, y cuenta las que vienen detrás,
+     * que no se aplican. Hasta ahora `[{0}, {M}]` adelantaba la pista entera M tics, de dos huecos
+     * solo contaba el último, y uno al final se tomaba por un hueco inicial.
+     */
+    private fun readEditList(elst: Mp4Box): EditList {
+        input.position = elst.dataStart
+        val version = input.readByte()
+        input.skip(3)
+        val count = boxes.boundedCount(input.readInt32(), if (version == 1) 20 else 12, elst.dataEnd)
+        var emptyTicks = 0L
+        var mediaTime = 0L
+        var foundMedia = false
+        var ignored = 0
+        repeat(count) {
+            val segmentDuration: Long
+            val entryMediaTime: Long
+            if (version == 1) {
+                segmentDuration = input.readInt64(); entryMediaTime = input.readInt64()
+            } else {
+                segmentDuration = input.readUInt(4) // segment_duration
+                entryMediaTime = input.readInt32().toLong() // media_time
+            }
+            input.skip(4) // media_rate
+            when {
+                foundMedia -> ignored++
+                entryMediaTime == -1L -> {
+                    val gap = segmentDuration.coerceAtLeast(0)
+                    emptyTicks = if (emptyTicks > Long.MAX_VALUE - gap) Long.MAX_VALUE else emptyTicks + gap
+                }
+                else -> {
+                    mediaTime = entryMediaTime
+                    foundMedia = true
+                }
+            }
+        }
+        return EditList(mediaTime, emptyTicks, ignored)
     }
 
     /**
@@ -500,7 +531,7 @@ public class Mp4Demuxer(
      * Texto de `udta`/`name`. Puede venir con un terminador nulo (QuickTime) o sin él (lo que
      * escriben los muxers de aquí); se corta en el primero y se ignora si queda vacío.
      */
-    private fun readTrackName(box: Box): String? {
+    private fun readTrackName(box: Mp4Box): String? {
         val length = box.dataEnd - box.dataStart
         if (length <= 0 || length > MAX_TRACK_NAME_BYTES) return null
         input.position = box.dataStart
@@ -510,7 +541,8 @@ public class Mp4Demuxer(
     }
 
     /**
-     * Convierte una pista ya parseada en [TrackInfo].
+     * Convierte una pista ya parseada en [TrackInfo], o null —con aviso— si su formato no
+     * corresponde a su tipo: una pista de vídeo con una entrada de audio, o al revés.
      *
      * El tamaño **codificado** lo manda el `SampleEntry`; el `tkhd` hace de respaldo suyo y es,
      * por definición (ISO/IEC 14496-12), el tamaño de **presentación**: aquel al que se escalan
@@ -522,6 +554,11 @@ public class Mp4Demuxer(
      * reconoce porque el par es exactamente la transpuesta del codificado: entonces no aporta
      * ninguna información y se ignora, que es lo que evita darle la vuelta a las dimensiones de
      * todo vídeo vertical.
+     *
+     * El `pasp` es el **respaldo** del `tkhd`, no al revés: solo cuenta cuando el `tkhd` no da un
+     * tamaño de presentación distinto del codificado, o cuando no vale y se ignora. Un archivo con
+     * los dos coherentes, como los de `ffmpeg -aspect`, se lee igual que antes, y uno que solo
+     * declara la proporción en el `pasp` ya no la pierde.
      */
     private fun buildTrackInfo(
         handlerType: String,
@@ -540,10 +577,12 @@ public class Mp4Demuxer(
             val rotatedQuarter = rotationDegrees == 90 || rotationDegrees == 270
             val transposed = rotatedQuarter && tkhdWidth == height && tkhdHeight == width
             val usable = tkhdWidth > 0 && tkhdHeight > 0 && !transposed
+            val fromTkhd = usable && (tkhdWidth != width || tkhdHeight != height)
+            val fromPasp = if (fromTkhd) null else desc.pixelAspectWidth(width)
 
             TrackInfo.Video(desc.videoCodec, width, height) {
-                displayWidth = if (usable) tkhdWidth else width
-                displayHeight = if (usable) tkhdHeight else height
+                displayWidth = if (fromTkhd) tkhdWidth else fromPasp ?: width
+                displayHeight = if (fromTkhd) tkhdHeight else height
                 frameRate = frameRateHint
                 this.rotationDegrees = rotationDegrees
                 color = desc.color
@@ -560,614 +599,58 @@ public class Mp4Demuxer(
             name = header.name
             default = header.default
         }.withId(trackId)
-        else -> null
+        else -> {
+            warn("pista $trackId ($handlerType) descartada: su formato no corresponde a su tipo")
+            null
+        }
     }
 
     /**
-     * Recorre los fragmentos una vez, sin guardar sus muestras: solo las cuenta por pista, comprueba
-     * si sus DTS avanzan, y deja puntos de control desde los que [FragmentCursor] retoma el
-     * recorrido. Los avisos de fragmentos ilegibles salen aquí, una vez; los cursores repiten el
-     * mismo recorrido en silencio.
+     * Recorre los fragmentos (ver [FragmentWalker.scan]) y convierte en pistas las candidatas que
+     * tienen muestras. La duración es el mayor final de pista, calculado en tics de cada una y
+     * convertido una sola vez: sumar el DTS y la duración ya redondeados a µs daba 1 µs de
+     * diferencia entre dos archivos que acaban en el mismo tic.
+     *
+     * El final de una pista de audio con cebado no lo cuenta ([FragmentShell.primingTicks]), igual
+     * que el `mvhd`, el `mehd` y el `tkhd`, que son la suma de sus ediciones, y que `Mp4Muxer` y
+     * `RepairResult`. Hasta ahora sí: con el audio como pista más larga, un fMP4 duraba 21 ms más que
+     * el mismo contenido en MP4 plano con AAC, y `Kotmpeg.repair` devolvía esos 21 ms menos de lo
+     * que luego leía este demuxer. La resta satura para que un `tfdt` manipulado no dé la vuelta.
      */
-    private fun parseFragments() {
-        val ids = fragmentShells.keys.toIntArray()
-        val checkpoints = FragmentCheckpoints(ids)
-        val stats = Array(ids.size) { FragmentStats(it, checkpoints) }
-        val sinks = HashMap<Int, SampleSink>()
-        for ((j, id) in ids.withIndex()) sinks[id] = SampleSink { _, _, _, dtsUs, _, durationUs -> stats[j].add(dtsUs, durationUs) }
-        val ticks = HashMap<Int, Long>()
-
-        input.position = 0
-        while (true) {
-            if (checkpoints.count == 0 || stats.any { it.count - it.countAtCheckpoint >= TrackSamples.CHECKPOINT_INTERVAL }) {
-                checkpoints.record(input.position, ticks, stats)
-            }
-            val next = walkTopLevelBox(ticks, sinks) { boxStart, e ->
-                runCatching { onWarning("fragmento ilegible en el offset $boxStart (${e.message})") }
-            } ?: break
-            input.position = next
+    private fun parseFragments(budget: SampleBudget) {
+        val fragmentTracks = fragmentShells.map {
+            FragmentTrack(it.trackId, it.mediaTimescale, it.elstMediaTime, it.elstEmptyDurationUs)
         }
-        for (track in stats) track.closePendingCheckpoints()
-        checkpoints.trim()
+        val walker = FragmentWalker(boxes, fragmentTracks, trexDefaults)
+        val scan = walker.scan(budget, ::warn)
 
-        for ((j, shell) in fragmentShells.values.withIndex()) {
-            val track = stats[j]
+        for ((j, shell) in fragmentShells.withIndex()) {
+            val track = scan.stats[j]
             if (track.count == 0) continue
             val frameRateHint = if (track.firstPositiveDurationUs > 0) 1_000_000.0 / track.firstPositiveDurationUs else 0.0
-            val info = runCatching {
+            val info = try {
                 buildTrackInfo(
                     shell.handlerType, shell.desc, shell.trackId, shell.width, shell.height,
                     frameRateHint, shell.rotationDegrees, shell.header,
                 )
-            }.getOrNull() ?: continue
-            parsedTracks.add(ParsedTrack(info, FragmentSamples(j, track, checkpoints)))
-            val end = track.lastDtsUs + track.lastDurationUs
+            } catch (e: Exception) {
+                warn("pista ${shell.trackId} (${shell.handlerType}) descartada: ${e.message}")
+                null
+            } ?: continue
+            parsedTracks.add(ParsedTrack(info, FragmentSamples(walker, j, track, scan.checkpoints)))
+            val priming = shell.primingTicks
+            val end = fragmentTracks[j].timeUs(maxOf(scan.endTicks(j), Long.MIN_VALUE + priming) - priming)
             if (end > durationUs) durationUs = end
         }
     }
 
-    /**
-     * Lee la caja de primer nivel que empieza en la posición actual y, si es un `moof`, la parsea.
-     * Devuelve dónde empieza la siguiente, o null si el recorrido termina ahí. Es el paso común de
-     * la pasada al abrir y de los cursores, que así recorren el archivo exactamente igual.
-     */
-    private fun walkTopLevelBox(
-        ticks: HashMap<Int, Long>,
-        sinks: Map<Int, SampleSink>,
-        onError: ((Long, Exception) -> Unit)?,
-    ): Long? {
-        if (input.position + 8 > input.length) return null
-        val boxStart = input.position
-        val box = readBoxHeader(input.length) ?: return null
-        if (box.dataEnd <= boxStart || box.dataEnd > input.length) return null
-        if (box.type == "moof") {
-            try {
-                parseMoof(boxStart, box, sinks, ticks)
-            } catch (e: Exception) {
-                onError?.invoke(boxStart, e)
-            }
-        }
-        return box.dataEnd
-    }
-
-    /**
-     * Cuenta de una pista de fMP4 durante la pasada al abrir. Además rellena, en los puntos de
-     * control que la esperan, el DTS de la primera muestra de esta pista que llega tras ellos.
-     */
-    private class FragmentStats(private val shell: Int, private val checkpoints: FragmentCheckpoints) {
-        var count = 0
-        var countAtCheckpoint = 0
-        var monotonic = true
-        var lastDtsUs = 0L
-        var lastDurationUs = 0L
-        var firstPositiveDurationUs = 0L
-
-        /**
-         * Primer punto de control que aún espera el DTS de esta pista. Se sigue por posición y no
-         * con un valor centinela, porque cualquier `Long` puede ser un DTS real: un `elst` dañado da
-         * `Long.MIN_VALUE`, y con ese centinela la búsqueda empezaba en la muestra equivocada.
-         */
-        private var pendingCheckpoint = 0
-
-        fun add(dtsUs: Long, durationUs: Long) {
-            require(count < TrackSamples.MAX_SAMPLES) { "demasiadas muestras en una pista: $count" }
-            while (pendingCheckpoint < checkpoints.count && checkpoints.index(pendingCheckpoint, shell) == count) {
-                checkpoints.setDts(pendingCheckpoint, shell, dtsUs)
-                pendingCheckpoint++
-            }
-            if (count > 0 && dtsUs < lastDtsUs) monotonic = false
-            if (firstPositiveDurationUs == 0L && durationUs > 0) firstPositiveDurationUs = durationUs
-            lastDtsUs = dtsUs
-            lastDurationUs = durationUs
-            count++
-        }
-
-        /** Los puntos tras los que esta pista ya no tiene muestras se quedan con el DTS máximo. */
-        fun closePendingCheckpoints() {
-            for (c in pendingCheckpoint until checkpoints.count) checkpoints.setDts(c, shell, Long.MAX_VALUE)
-            pendingCheckpoint = checkpoints.count
-        }
-    }
-
-    /**
-     * Puntos de control del recorrido de fragmentos, compartidos por todas las pistas: dónde
-     * retomar, el tiempo de decodificación acumulado de cada pista (para los `traf` sin `tfdt`), y
-     * cuántas muestras de cada una van ya, con el DTS de la siguiente.
-     */
-    private class FragmentCheckpoints(private val ids: IntArray) {
-        var count = 0
-            private set
-        private var positions = LongArray(16)
-        private var ticks = LongArray(16 * ids.size)
-        private var indices = IntArray(16 * ids.size)
-        private var dts = LongArray(16 * ids.size)
-
-        fun record(position: Long, decodeTicks: Map<Int, Long>, stats: Array<FragmentStats>) {
-            if (count == positions.size) {
-                positions = positions.copyOf(count * 2)
-                ticks = ticks.copyOf(count * 2 * ids.size)
-                indices = indices.copyOf(count * 2 * ids.size)
-                dts = dts.copyOf(count * 2 * ids.size)
-            }
-            positions[count] = position
-            for (j in ids.indices) {
-                ticks[count * ids.size + j] = decodeTicks[ids[j]] ?: 0L
-                indices[count * ids.size + j] = stats[j].count
-                stats[j].countAtCheckpoint = stats[j].count
-            }
-            count++
-        }
-
-        fun position(c: Int): Long = positions[c]
-        fun ticks(c: Int, shell: Int): Long = ticks[c * ids.size + shell]
-        fun index(c: Int, shell: Int): Int = indices[c * ids.size + shell]
-        fun dts(c: Int, shell: Int): Long = dts[c * ids.size + shell]
-
-        fun setDts(c: Int, shell: Int, value: Long) {
-            dts[c * ids.size + shell] = value
-        }
-
-        /** Suelta la holgura de los arrays, que crecen duplicando, cuando ya no se añaden puntos. */
-        fun trim() {
-            positions = positions.copyOf(count)
-            ticks = ticks.copyOf(count * ids.size)
-            indices = indices.copyOf(count * ids.size)
-            dts = dts.copyOf(count * ids.size)
-        }
-    }
-
-    /** Las muestras de una pista de fMP4, la [shell]-ésima de [fragmentShells]. */
-    private inner class FragmentSamples(
-        val shell: Int,
-        stats: FragmentStats,
-        val checkpoints: FragmentCheckpoints,
-    ) : TrackSamples() {
-        override val size: Int = stats.count
-        override val dtsMonotonic: Boolean = stats.monotonic
-        override val checkpointCount: Int get() = checkpoints.count
-        override fun checkpointIndex(c: Int): Int = checkpoints.index(c, shell)
-        override fun checkpointDtsUs(c: Int): Long = checkpoints.dts(c, shell)
-        override fun cursor(): SampleCursor = FragmentCursor(this).also { it.moveTo(0) }
-
-        /** El último punto de control que no ha pasado de la muestra [target]. */
-        fun checkpointFor(target: Int): Int {
-            var low = 0
-            var high = checkpoints.count
-            while (low < high) {
-                val mid = (low + high) ushr 1
-                if (checkpoints.index(mid, shell) <= target) low = mid + 1 else high = mid
-            }
-            return low - 1
-        }
-    }
-
-    /**
-     * Cursor de una pista de fMP4: retoma el recorrido de fragmentos desde un punto de control y
-     * guarda en [buffer] las muestras de su pista del último `moof` leído, y en [previous] las del
-     * anterior. Parsea los fragmentos completos —todas las pistas— porque el tiempo de un `traf` sin
-     * `tfdt` depende de lo anterior, pero solo se queda con lo suyo.
-     *
-     * Guardar también el fragmento anterior es lo que deja volver una muestra atrás sin repetir el
-     * recorrido. Los fragmentos se cortan en los keyframes, así que el paquete de audio que suena en
-     * un keyframe suele ser el último del fragmento anterior: para encontrarlo, la búsqueda llega al
-     * final de ese fragmento, carga el siguiente para ver que se ha pasado y retrocede una. Con un
-     * solo fragmento, retroceder obligaba a volver al punto de control y parsear otra vez hasta tres
-     * fragmentos, y cada búsqueda reservaba el doble de memoria que en la 3.1.0.
-     */
-    private inner class FragmentCursor(private val owner: FragmentSamples) : SampleCursor() {
-        private val ids = fragmentShells.keys.toIntArray()
-        private val ticks = HashMap<Int, Long>()
-        private var buffer = SampleBuffer()
-        private var previous = SampleBuffer()
-        private var current = buffer
-        private val sinks: Map<Int, SampleSink> = ids.associateWith { id ->
-            if (id == ids[owner.shell]) {
-                SampleSink { offset, size, ptsUs, dtsUs, key, durationUs -> buffer.add(offset, size, ptsUs, dtsUs, key, durationUs) }
-            } else {
-                IGNORED_SAMPLES
-            }
-        }
-        private var walkPosition = 0L
-        private var bufferStart = 0
-        private var previousStart = 0
-        private var restored = false
-        private var at = 0
-
-        override var index: Int = -1
-            private set
-        override val offset: Long get() = current.offset(at)
-        override val size: Int get() = current.size(at)
-        override val ptsUs: Long get() = current.ptsUs(at)
-        override val dtsUs: Long get() = current.dtsUs(at)
-        override val key: Boolean get() = current.isKey(at)
-        override val durationUs: Long get() = current.durationUs(at)
-
-        /**
-         * Se conoce la siguiente dentro del fragmento en que está y, al final del anterior, la
-         * primera del último cargado; al final de este, no.
-         */
-        override val knowsNextDts: Boolean
-            get() = at + 1 < current.size || (current === previous && buffer.size > 0)
-
-        override val nextDtsUs: Long
-            get() = if (at + 1 < current.size) current.dtsUs(at + 1) else buffer.dtsUs(0)
-
-        override fun moveTo(target: Int) {
-            require(target in 0 until owner.size) { "muestra $target fuera de 0..${owner.size - 1}" }
-            val bufferEnd = bufferStart + buffer.size
-            if (!restored || target < previousStart || target - bufferEnd >= TrackSamples.CHECKPOINT_INTERVAL) {
-                restore(owner.checkpointFor(target))
-            }
-            while (bufferStart + buffer.size <= target) {
-                check(loadNextFragment()) { "el recorrido de fragmentos terminó antes de la muestra $target" }
-            }
-            if (target >= bufferStart) {
-                current = buffer
-                at = target - bufferStart
-            } else {
-                current = previous
-                at = target - previousStart
-            }
-            index = target
-        }
-
-        private fun restore(c: Int) {
-            val checkpoints = owner.checkpoints
-            walkPosition = checkpoints.position(c)
-            ticks.clear()
-            for ((j, id) in ids.withIndex()) ticks[id] = checkpoints.ticks(c, j)
-            bufferStart = checkpoints.index(c, owner.shell)
-            buffer.clear()
-            previous.clear()
-            previousStart = bufferStart
-            restored = true
-        }
-
-        /** El último cargado pasa a ser el anterior, y su búfer se reutiliza para el siguiente. */
-        private fun loadNextFragment(): Boolean {
-            val reused = previous
-            previous = buffer
-            previousStart = bufferStart
-            bufferStart += buffer.size
-            buffer = reused
-            buffer.clear()
-            input.position = walkPosition
-            while (true) {
-                val next = walkTopLevelBox(ticks, sinks, null) ?: return false
-                walkPosition = next
-                input.position = next
-                if (buffer.size > 0) return true
-            }
-        }
-    }
-
-    private fun parseMoof(moofStart: Long, moof: Box, sinks: Map<Int, SampleSink>, ticks: HashMap<Int, Long>) {
-        var chainedOffset = -1L
-        scanChildren(moof.dataStart, moof.dataEnd) { child ->
-            if (child.type == "traf") chainedOffset = parseTraf(moofStart, child, sinks, chainedOffset, ticks)
-        }
-    }
-
-    /**
-     * Devuelve el offset de archivo donde terminan los datos de este traf. [ticks] es el tiempo de
-     * decodificación acumulado por pista, para los traf que no llevan tfdt.
-     */
-    private fun parseTraf(
-        moofStart: Long,
-        traf: Box,
-        sinks: Map<Int, SampleSink>,
-        chainedOffset: Long,
-        ticks: HashMap<Int, Long>,
-    ): Long {
-        var trackId = 0
-        var baseDataOffset: Long? = null
-        var defaultDuration = 0L
-        var defaultSize = 0L
-        var defaultFlags = 0L
-        var baseDecodeTicks = 0L
-        var nextSampleOffset = -1L
-        var dtsTicks = 0L
-        var sawTfdt = false
-        var defaultBaseIsMoof = false
-        var shell: FragmentShell? = null
-        var collected: SampleSink? = null
-
-        scanChildren(traf.dataStart, traf.dataEnd) { child ->
-            input.position = child.dataStart
-            when (child.type) {
-                "tfhd" -> {
-                    val versionAndFlags = input.readInt32()
-                    val flags = versionAndFlags and 0xFFFFFF
-                    defaultBaseIsMoof = flags and 0x020000 != 0
-                    trackId = input.readInt32()
-                    if (flags and 0x01 != 0) baseDataOffset = input.readInt64()
-                    if (flags and 0x02 != 0) input.skip(4)
-                    val trex = trexDefaults[trackId]
-                    defaultDuration = if (flags and 0x08 != 0) {
-                        input.readInt32().toLong() and 0xFFFFFFFFL
-                    } else trex?.duration ?: 0
-                    defaultSize = if (flags and 0x10 != 0) {
-                        input.readInt32().toLong() and 0xFFFFFFFFL
-                    } else trex?.size ?: 0
-                    defaultFlags = if (flags and 0x20 != 0) {
-                        input.readInt32().toLong() and 0xFFFFFFFFL
-                    } else trex?.flags ?: 0
-                    shell = fragmentShells[trackId]
-                    collected = sinks[trackId]
-                    if (!sawTfdt) dtsTicks = ticks[trackId] ?: 0L
-                }
-                "tfdt" -> {
-                    val version = input.readByte()
-                    input.skip(3)
-                    baseDecodeTicks = if (version == 1) input.readInt64()
-                    else input.readInt32().toLong() and 0xFFFFFFFFL
-                    dtsTicks = baseDecodeTicks
-                    sawTfdt = true
-                }
-                "trun" -> {
-                    val currentShell = shell
-                    val sink = collected
-                    if (currentShell != null && sink != null) {
-                        val versionAndFlags = input.readInt32()
-                        val version = versionAndFlags ushr 24
-                        val flags = versionAndFlags and 0xFFFFFF
-                        val declaredCount = input.readInt32()
-                        val trafBase = baseDataOffset ?: when {
-                            defaultBaseIsMoof -> moofStart
-                            chainedOffset >= 0 -> chainedOffset
-                            else -> moofStart
-                        }
-                        var offset = when {
-                            flags and 0x01 != 0 -> trafBase + input.readInt32()
-                            nextSampleOffset >= 0 -> nextSampleOffset
-                            else -> trafBase
-                        }
-                        val firstSampleFlags: Long? = if (flags and 0x04 != 0) {
-                            input.readInt32().toLong() and 0xFFFFFFFFL
-                        } else null
-                        val ts = currentShell.mediaTimescale
-                        val mediaTime = currentShell.elstMediaTime
-                        val emptyUs = currentShell.elstEmptyDurationUs
-                        fun ticksToUs(t: Long): Long = Timestamps.rescaleFloor(t, 1_000_000, ts)
-
-                        var bytesPerSample = 0
-                        if (flags and 0x100 != 0) bytesPerSample += 4
-                        if (flags and 0x200 != 0) bytesPerSample += 4
-                        if (flags and 0x400 != 0) bytesPerSample += 4
-                        if (flags and 0x800 != 0) bytesPerSample += 4
-                        val count = if (bytesPerSample > 0) {
-                            boundedCount(declaredCount, bytesPerSample, child.dataEnd)
-                        } else {
-                            physicalCount(declaredCount, defaultSize)
-                        }
-
-                        repeat(count) { s ->
-                            val duration = if (flags and 0x100 != 0) {
-                                input.readInt32().toLong() and 0xFFFFFFFFL
-                            } else defaultDuration
-                            val size = if (flags and 0x200 != 0) {
-                                input.readInt32().toLong() and 0xFFFFFFFFL
-                            } else defaultSize
-                            val sampleFlags = when {
-                                flags and 0x400 != 0 -> input.readInt32().toLong() and 0xFFFFFFFFL
-                                s == 0 && firstSampleFlags != null -> firstSampleFlags
-                                else -> defaultFlags
-                            }
-                            val ctts = if (flags and 0x800 != 0) {
-                                val raw = input.readInt32()
-                                if (version == 0) raw.toLong() and 0xFFFFFFFFL else raw.toLong()
-                            } else 0L
-                            if (offset >= 0 && size >= 0 &&
-                                offset <= input.length && size <= input.length - offset
-                            ) {
-                                sink.add(
-                                    offset = offset,
-                                    size = if (size > Int.MAX_VALUE) UNREADABLE_SIZE else size.toInt(),
-                                    ptsUs = ticksToUs(dtsTicks + ctts - mediaTime) + emptyUs,
-                                    dtsUs = ticksToUs(dtsTicks - mediaTime) + emptyUs,
-                                    key = sampleFlags and 0x10000L == 0L, // !non_sync
-                                    durationUs = ticksToUs(duration),
-                                )
-                            }
-                            offset += size
-                            dtsTicks += duration
-                        }
-                        nextSampleOffset = offset
-                        ticks[trackId] = dtsTicks
-                    }
-                }
-            }
-        }
-        return if (nextSampleOffset >= 0) nextSampleOffset else chainedOffset
-    }
-
-    private class SampleDescription(
-        val videoCodec: VideoCodec? = null,
-        val audioCodec: AudioCodec? = null,
-        val codecConfig: ByteArray? = null,
-        val width: Int = 0,
-        val height: Int = 0,
-        val sampleRate: Int = 0,
-        val channels: Int = 0,
-        val codecDelayUs: Long = 0,
-        val color: ColorInfo? = null,
-    )
-
-    /** Se llama con la entrada posicionada justo tras el contador de entradas del stsd. */
-    private fun parseSampleDescription(end: Long): SampleDescription? {
-        val start = input.position
-        val entry = readBoxHeader(end) ?: return null
-        if (entry.dataEnd <= start || entry.dataEnd > end) return null
-        return when (entry.type) {
-            "avc1", "avc3" -> parseVisual(entry, VideoCodec.H264, "avcC")
-            "hvc1", "hev1" -> parseVisual(entry, VideoCodec.H265, "hvcC")
-            "mp4a" -> parseMp4a(entry)
-            "Opus" -> parseOpus(entry)
-            else -> null
-        }
-    }
-
-    private fun parseVisual(entry: Box, codec: VideoCodec, configBoxType: String): SampleDescription {
-        input.position = entry.dataStart
-        input.skip(6 + 2 + 2 + 2 + 12)
-        val w = input.readUInt(2).toInt()
-        val h = input.readUInt(2).toInt()
-        input.skip(4 + 4 + 4 + 2 + 32 + 2 + 2)
-        var config: ByteArray? = null
-        var primaries = ColorInfo.UNSPECIFIED
-        var transfer = ColorInfo.UNSPECIFIED
-        var matrix = ColorInfo.UNSPECIFIED
-        var fullRange = false
-        var hasColr = false
-        var mastering: DoubleArray? = null
-        var maxCll = 0
-        var maxFall = 0
-        scanChildren(input.position, entry.dataEnd) { box ->
-            input.position = box.dataStart
-            when (box.type) {
-                configBoxType -> config = input.readBytes((box.dataEnd - box.dataStart).toInt())
-                "colr" -> {
-                    val kind = String(input.readBytes(4), Charsets.US_ASCII)
-                    if (kind == "nclx" || kind == "nclc") {
-                        hasColr = true
-                        primaries = input.readUInt(2).toInt()
-                        transfer = input.readUInt(2).toInt()
-                        matrix = input.readUInt(2).toInt()
-                        if (kind == "nclx") fullRange = input.readByte() and 0x80 != 0
-                    }
-                }
-                "mdcv" -> {
-                    val v = DoubleArray(8) { (input.readUInt(2)) * 0.00002 }
-                    val maxLum = (input.readInt32().toLong() and 0xFFFFFFFFL) * 0.0001
-                    val minLum = (input.readInt32().toLong() and 0xFFFFFFFFL) * 0.0001
-                    mastering = doubleArrayOf(v[4], v[5], v[0], v[1], v[2], v[3], v[6], v[7], maxLum, minLum)
-                }
-                "clli" -> {
-                    maxCll = input.readUInt(2).toInt()
-                    maxFall = input.readUInt(2).toInt()
-                }
-            }
-        }
-        val hdr = mastering?.let {
-            HdrStaticInfo(
-                it[0],
-                it[1],
-                it[2],
-                it[3],
-                it[4],
-                it[5],
-                it[6],
-                it[7],
-                it[8],
-                it[9],
-                maxCll,
-                maxFall
-            )
-        } ?: if (maxCll > 0 || maxFall > 0) {
-            HdrStaticInfo(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, maxCll, maxFall)
-        } else null
-        val color = if (hasColr || hdr != null) {
-            ColorInfo {
-                this.primaries = primaries
-                this.transfer = transfer
-                this.matrix = matrix
-                this.fullRange = fullRange
-                this.hdr = hdr
-            }
-        } else {
-            null
-        }
-        return SampleDescription(videoCodec = codec, codecConfig = config, width = w, height = h, color = color)
-    }
-
-    private fun parseMp4a(entry: Box): SampleDescription {
-        input.position = entry.dataStart
-        input.skip(6 + 2 + 8)
-        var channels = input.readUInt(2).toInt()
-        input.skip(2 + 2 + 2)
-        var sampleRate = (input.readInt32() ushr 16)
-        var asc: ByteArray? = null
-        scanChildren(input.position, entry.dataEnd) { box ->
-            if (box.type == "esds") {
-                input.position = box.dataStart
-                input.skip(4)
-                asc = extractAscFromEsds(box.dataEnd)
-            }
-        }
-        asc?.let {
-            runCatching { AacConfig.parse(it) }.getOrNull()?.let { parsed ->
-                sampleRate = parsed.sampleRate
-                channels = parsed.channelCount
-            }
-        }
-        return SampleDescription(
-            audioCodec = AudioCodec.AAC, codecConfig = asc,
-            sampleRate = sampleRate, channels = channels,
-        )
-    }
-
-    private fun parseOpus(entry: Box): SampleDescription {
-        input.position = entry.dataStart
-        input.skip(6 + 2 + 8)
-        val channels = input.readUInt(2).toInt()
-        input.skip(2 + 2 + 2)
-        val sampleRate = (input.readInt32() ushr 16)
-        var head: ByteArray? = null
-        var delayUs = 0L
-        scanChildren(input.position, entry.dataEnd) { box ->
-            if (box.type == "dOps") {
-                input.position = box.dataStart
-                val dops = input.readBytes((box.dataEnd - box.dataStart).toInt())
-                head = OpusConfig.dopsToOpusHead(dops)
-                delayUs = OpusConfig.parseOpusHead(head!!).codecDelayUs
-            }
-        }
-        return SampleDescription(
-            audioCodec = AudioCodec.OPUS, codecConfig = head,
-            sampleRate = if (sampleRate > 0) sampleRate else 48000, channels = channels,
-            codecDelayUs = delayUs,
-        )
-    }
-
-    /** Recorre el árbol de descriptores MPEG-4 del esds hasta el DecoderSpecificInfo. */
-    private fun extractAscFromEsds(end: Long): ByteArray? {
-        fun readDescriptorLength(): Int {
-            var length = 0
-            var count = 0
-            while (count < 4) {
-                val b = input.readByte()
-                length = (length shl 7) or (b and 0x7F)
-                count++
-                if (b and 0x80 == 0) break
-            }
-            return length
-        }
-        while (input.position < end) {
-            val tag = input.readByte()
-            val len = readDescriptorLength()
-            val payloadEnd = input.position + len
-            when (tag) {
-                0x03 -> {
-                    input.skip(2)
-                    val flags = input.readByte()
-                    if (flags and 0x80 != 0) input.skip(2)             // streamDependenceFlag
-                    if (flags and 0x40 != 0) input.skip(input.readByte().toLong()) // URL_Flag
-                    if (flags and 0x20 != 0) input.skip(2)             // OCRstreamFlag
-                }
-                0x04 -> input.skip(13)                                  // luego hijos en línea
-                0x05 -> return if (payloadEnd <= end) input.readBytes(len) else null
-                else -> input.position = payloadEnd
-            }
-        }
-        return null
-    }
-
     override fun readPacket(): MediaPacket? {
+        check(!closed) { CLOSED }
         while (true) {
             var best: ParsedTrack? = null
             var bestDts = Long.MAX_VALUE
             for (t in parsedTracks) {
-                if (t.cursor < t.samples.size) {
+                if (t.nextIndex < t.samples.size) {
                     val dts = t.reader.dtsUs
                     if (dts < bestDts) {
                         bestDts = dts
@@ -1183,17 +666,15 @@ public class Mp4Demuxer(
             val dtsUs = sample.dtsUs
             val key = sample.key
             val durationUs = sample.durationUs
-            track.cursor++
-            if (track.cursor < track.samples.size) sample.next()
+            track.nextIndex++
+            if (track.nextIndex < track.samples.size) sample.next()
 
             if (offset < 0 || size < 0 || offset > input.length || size > input.length - offset) {
                 if (unreadableWarned.add(track.info.id)) {
-                    runCatching {
-                        onWarning(
-                            "pista ${track.info.id}: se saltan muestras cuyos bytes no están " +
-                                "en el archivo (¿grabación cortada o archivo dañado?)",
-                        )
-                    }
+                    warn(
+                        "pista ${track.info.id}: se saltan muestras cuyos bytes no están " +
+                            "en el archivo (¿grabación cortada o archivo dañado?)",
+                    )
                 }
                 continue
             }
@@ -1232,13 +713,14 @@ public class Mp4Demuxer(
      * sirven también para buscar, porque al terminar se recolocan todos.
      */
     override fun seekTo(timestampUs: Long): Long {
+        check(!closed) { CLOSED }
         val anchor = parsedTracks.firstOrNull { it.info is TrackInfo.Video } ?: parsedTracks.firstOrNull() ?: return 0
         val target = keyFrameAtOrBefore(anchor, timestampUs)
         anchor.reader.moveTo(target)
         val targetPts = anchor.reader.ptsUs
         for (t in parsedTracks) {
-            t.cursor = if (t === anchor) target else startAfterSeek(t, targetPts)
-            if (t.cursor < t.samples.size) t.reader.moveTo(t.cursor)
+            t.nextIndex = if (t === anchor) target else startAfterSeek(t, targetPts)
+            if (t.nextIndex < t.samples.size) t.reader.moveTo(t.nextIndex)
         }
         return targetPts
     }
@@ -1331,12 +813,19 @@ public class Mp4Demuxer(
         return (firstAfter - 1).coerceAtLeast(0)
     }
 
-    override fun close(): Unit = input.close()
+    /**
+     * Cierra la entrada. Idempotente, y desde aquí [readPacket] y [seekTo] lanzan
+     * `IllegalStateException`, como en `MkvDemuxer`. Antes seguían sirviendo paquetes de lo que
+     * quedaba en el búfer de la entrada ya cerrada, y solo fallaban, con un error de E/S, cuando
+     * tocaba leer del archivo: según dónde cayera la lectura, un uso tras cerrar pasaba sin aviso.
+     */
+    override fun close() {
+        if (closed) return
+        closed = true
+        input.close()
+    }
 
     private companion object {
-        /** Destino de las muestras de las pistas que un cursor de fMP4 no está leyendo. */
-        private val IGNORED_SAMPLES = SampleSink { _, _, _, _, _, _ -> }
-
         /** Bit `track_enabled` de los flags del `tkhd`. */
         private const val TKHD_TRACK_ENABLED = 0x1L
 
@@ -1344,9 +833,13 @@ public class Mp4Demuxer(
         private const val MAX_TRACK_NAME_BYTES = 4096L
 
         /**
-         * Tamaño que marca una muestra como ilegible: una muestra de más de 2 GiB no cabe en un
-         * array, y `readPacket` la salta con aviso en vez de intentar reservarla.
+         * Pistas de audio y vídeo que se leen de un archivo. Un archivo real lleva unas pocas; sin
+         * límite, cada pista declarada costaba memoria en cada punto de control y en cada cursor de
+         * fMP4, y 3 300 `trak` mínimos con 10 000 `moof` de 48 bytes pedían unos 660 MB con 1 MB de
+         * archivo.
          */
-        private const val UNREADABLE_SIZE = -1
+        private const val MAX_TRACKS = 64
+
+        private const val CLOSED = "el Mp4Demuxer está cerrado"
     }
 }

@@ -127,8 +127,6 @@ class UntrustedTableSizesTest {
      */
     @Test
     fun `a fragment with enormous decode times does not allocate per sample`() {
-        val threads = java.lang.management.ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
-        org.junit.jupiter.api.Assumptions.assumeTrue(threads != null, "este JDK no mide la memoria por hilo")
         val bytes = writeFragmented(File(dir, "sano.mp4"), packets = 60).readBytes()
         val moof = boxAt(bytes, 0, bytes.size, "moof")
         val traf = boxAt(bytes, moof + 8, moof + u32(bytes, moof).toInt(), "traf")
@@ -144,9 +142,7 @@ class UntrustedTableSizesTest {
 
         fun readAll(): Int = Kotmpeg.openDemuxer(file).use { d -> generateSequence { d.readPacket() }.count() }
         val packets = readAll()
-        val before = threads!!.currentThreadAllocatedBytes
-        assertEquals(packets, readAll())
-        val allocated = threads.currentThreadAllocatedBytes - before
+        val allocated = allocatedBytes { assertEquals(packets, readAll()) }
 
         assertTrue(packets > 1_000, "el trun manipulado tenía que dar miles de muestras: $packets")
         assertTrue(allocated < 8L * 1024 * 1024, "leer ${bytes.size} bytes reservó ${allocated / 1024} KiB")

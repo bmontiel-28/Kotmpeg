@@ -4,8 +4,8 @@ import com.braymon.kotmpeg.Muxer
 import com.braymon.kotmpeg.MuxerOptions
 import com.braymon.kotmpeg.TimelineGate
 import com.braymon.kotmpeg.codecconfig.AacConfig
+import com.braymon.kotmpeg.codecconfig.AudioPriming
 import com.braymon.kotmpeg.codecconfig.DefaultCodecPrivate
-import com.braymon.kotmpeg.codecconfig.OpusConfig
 import com.braymon.kotmpeg.ebml.EbmlWriter
 import com.braymon.kotmpeg.ebml.MatroskaIds
 import com.braymon.kotmpeg.io.SeekableOutput
@@ -14,6 +14,7 @@ import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.Timestamps
 import com.braymon.kotmpeg.model.TrackDefaults
 import com.braymon.kotmpeg.model.TrackInfo
+import com.braymon.kotmpeg.model.TrackRequirements
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Random
@@ -21,9 +22,21 @@ import java.util.Random
 /**
  * Muxer Matroska (.mkv).
  *
- * Produce archivos conformes a la especificación: cabecera EBML, SeekHead, Info (con la
- * duración parcheada al finalizar), Tracks, Clusters alineados a keyframe con SimpleBlocks
- * y un índice Cues para búsqueda fiable en reproductores.
+ * Produce archivos conformes a la especificación: cabecera EBML, SeekHead, Info, Tracks, un
+ * índice Cues para búsqueda fiable en reproductores y Clusters alineados a keyframe con
+ * SimpleBlocks.
+ *
+ * **El archivo es válido en todo momento**, también si el proceso muere antes de [stop]. El
+ * `SeekHead` se escribe al empezar, y el índice va en un hueco reservado delante de los clusters
+ * (`cuesReserveBytes` de [MuxerOptions]): cada vez que se cierra un cluster —con su tamaño ya
+ * escrito y sus datos en el archivo— se actualiza la `Duration` y se amplía el índice con él. Un
+ * archivo cortado se abre con la duración y el índice hasta el último cluster cerrado, sin
+ * reempaquetarlo. Lo único que deja a medias el corte es el cluster en curso, que se lee hasta
+ * donde llegue; `Kotmpeg.repair` lo cierra en el sitio. Cómo se amplía el índice sin que un corte
+ * a mitad lo rompa está en `MkvLayout`.
+ *
+ * Si el índice no cabe en la reserva, deja de crecer ahí —lo publicado sigue valiendo— y [stop]
+ * lo escribe entero al final, como cuando la reserva es 0.
  *
  * Las marcas de tiempo usan el TimestampScale estándar de 1 ms. Los bloques llevan tiempos
  * de presentación; los paquetes deben llegar en orden de decodificación por pista (Matroska
@@ -42,8 +55,8 @@ import java.util.Random
  * ejecutarse desde un solo hilo, o serializarse por fuera. Es lo que hace falta en cuanto hay un
  * hilo por pista, que es el caso normal cuando los paquetes vienen de varios codificadores.
  *
- * De [MuxerOptions] usa `maxClusterDurationMs`, `writingApp` y `creationTimeMillis` (el
- * `DateUTC`); las de MP4 no le afectan.
+ * De [MuxerOptions] usa `maxClusterDurationMs`, `cuesReserveBytes`, `writingApp` y
+ * `creationTimeMillis` (el `DateUTC`); las de MP4 no le afectan.
  */
 public class MkvMuxer internal constructor(
     private val out: SeekableOutput,
@@ -61,6 +74,7 @@ public class MkvMuxer internal constructor(
     internal constructor(options: MuxerOptions, file: File) : this(SeekableOutput(file), options)
 
     private val maxClusterDurationMs = options.maxClusterDurationMs
+    private val cuesReserveBytes = options.cuesReserveBytes
     private val writingApp = options.writingApp
     private val dateUtcMillis = options.creationTimeMillis
 
@@ -76,13 +90,32 @@ public class MkvMuxer internal constructor(
     private var seekHeadPos = 0L
     private var infoPos = 0L
     private var tracksPos = 0L
-    private var cuesPos = 0L
+
     private var durationValuePos = 0L
+
+    /** Duración ya escrita en `Duration`, en ms, para no reescribirla si no cambia. */
+    private var declaredDurationMs = 0L
+
+    /** Inicio de la reserva del índice, o -1 sin reserva (ver `MkvLayout`). */
+    private var cuesReservePos = -1L
+
+    /** Cabecera del `Void` libre de la reserva y cuánto mide; -1 cuando se ha llenado. */
+    private var cuesFreePos = -1L
+    private var cuesFreeHeaderLength = 0
+
+    /** Cuántas entradas de [cues] están ya publicadas en la reserva. */
+    private var cuesPublished = 0
+
+    /** Cabecera del `Void` libre dentro del `SeekHead` y cuánto mide (ver `MkvLayout`). */
+    private var seekFreePos = -1L
+    private var seekFreeHeaderLength = 0
+
+    /** Dónde están los 8 bytes de la posición de la entrada `Cues` del `SeekHead`, o -1 si no la tiene. */
+    private var cuesSeekPositionPos = -1L
 
     private var clusterSizePos = -1L
     private var clusterStartPos = 0L
     private var clusterTimestampMs = 0L
-    private var maxEndTimestampMs = 0L
 
     /**
      * Origen de la línea de tiempo en µs. Se fija cuando [gate] lo permite: con el primer paquete
@@ -94,23 +127,15 @@ public class MkvMuxer internal constructor(
     private var gate: TimelineGate? = null
 
     /**
-     * Los dos mayores PTS escritos por pista (ms). Con B-frames el orden de llegada no es el de
-     * presentación, pero los dos mayores siempre son fotogramas consecutivos: su diferencia es la
-     * duración del último.
+     * El índice que se va deduciendo de los bloques escritos, con el mismo código con el que lo
+     * deduce la reparación (ver `MkvTimeline`). Se crea en [start], con las pistas.
      */
-    private var trackMaxPtsMs = LongArray(0)
-    private var trackSecondMaxPtsMs = LongArray(0)
-    private var trackHasDurations = BooleanArray(0)
+    private var timeline = MkvTimeline(0)
 
-    private class CueEntry(val timeMs: Long, val trackNumber: Int, val clusterPosition: Long)
-
-    private val cues = ArrayList<CueEntry>()
-    private var cueTrackNumber = 0
-    private var lastCuedClusterPos = -1L
+    /** Dónde acaba cada pista, por número de pista menos uno, para la `Duration`. */
+    private var trackEnds: List<MkvTimeline.Track> = emptyList()
 
     private companion object {
-        /** Espacio fijo reservado al inicio del segmento para el SeekHead final. */
-        private const val SEEK_HEAD_RESERVED = 120
         /** TimestampScale de Matroska: 1_000_000 ns = ticks de 1 ms. */
         private const val TIMESTAMP_SCALE_NS = 1_000_000L
 
@@ -142,14 +167,12 @@ public class MkvMuxer internal constructor(
         check(!started) { "no se pueden añadir pistas después de start()" }
         val trackNumber = tracks.size + 1
         require(trackNumber in 1..126) { "Matroska admite como máximo 126 pistas en este muxer" }
+        TrackRequirements.requireVideoCodecPrivate(track) {
+            "las pistas de vídeo MKV requieren codecPrivate (avcC/hvcC): sin él, " +
+                "los reproductores de Android no pueden abrirlas"
+        }
         val complete = when (track) {
-            is TrackInfo.Video -> {
-                requireNotNull(track.codecPrivate) {
-                    "las pistas de vídeo MKV requieren codecPrivate (avcC/hvcC): sin él, " +
-                        "los reproductores de Android no pueden abrirlas"
-                }
-                track
-            }
+            is TrackInfo.Video -> track
             is TrackInfo.Audio ->
                 if (track.codecPrivate != null) track else track.copy { codecPrivate = DefaultCodecPrivate.forAudio(track) }
         }
@@ -157,15 +180,21 @@ public class MkvMuxer internal constructor(
         return trackNumber
     }
 
+    /**
+     * Escribe la cabecera entera: `SeekHead`, `Info`, `Tracks` y la reserva del índice.
+     *
+     * El `SeekHead` se escribe antes que el cuerpo de la reserva —ya se sabe dónde va a estar— para
+     * que llegue al archivo en la misma escritura que el resto de la cabecera. Escrito después, sobre
+     * su `Void`, era una escritura propia de 120 bytes tras los 64 KiB de la reserva, y un corte a
+     * mitad dejaba un `SeekHead` con ceros que ni el demuxer ni `Kotmpeg.repair` sabían leer.
+     */
     override fun start() {
         check(!started) { "ya iniciado" }
         check(tracks.isNotEmpty()) { "sin pistas" }
         started = true
 
-        cueTrackNumber = (tracks.firstOrNull { it is TrackInfo.Video } ?: tracks.first()).id
-        trackMaxPtsMs = LongArray(tracks.size) { Long.MIN_VALUE }
-        trackSecondMaxPtsMs = LongArray(tracks.size) { Long.MIN_VALUE }
-        trackHasDurations = BooleanArray(tracks.size)
+        timeline = MkvTimeline(MkvTimeline.cueTrack(tracks) { it is TrackInfo.Video }.id.toLong())
+        trackEnds = tracks.map { MkvTimeline.Track(it.defaultDurationNs) }
         gate = TimelineGate(tracks.size, START_WAIT_US, START_HELD_BYTES)
 
         writeEbmlHeader()
@@ -176,10 +205,29 @@ public class MkvMuxer internal constructor(
         segmentDataStart = out.position
 
         seekHeadPos = out.position
-        ebml.writeVoid(SEEK_HEAD_RESERVED)
+        ebml.writeVoid(MkvLayout.SEEK_HEAD_RESERVED)
 
         writeInfo()
         writeTracks()
+        if (cuesReserveBytes > 0) cuesReservePos = out.position
+        writeSeekHead()
+        if (cuesReservePos >= 0) reserveCues()
+        out.flush()
+    }
+
+    /** Escribe en [cuesReservePos] la reserva del índice: un `Cues` vacío que la ocupa entera (ver `MkvLayout`). */
+    private fun reserveCues() {
+        val header = MkvLayout.reserveHeader(cuesReserveBytes)
+        out.write(header)
+        val zeros = ByteArray(minOf(cuesReserveBytes - header.size, 1 shl 16))
+        var remaining = cuesReserveBytes - header.size
+        while (remaining > 0) {
+            val n = minOf(remaining, zeros.size)
+            out.write(zeros, 0, n)
+            remaining -= n
+        }
+        cuesFreePos = cuesReservePos + MkvLayout.MASTER_HEADER_SIZE
+        cuesFreeHeaderLength = header.size - MkvLayout.MASTER_HEADER_SIZE
     }
 
     private fun writeEbmlHeader() {
@@ -231,8 +279,8 @@ public class MkvMuxer internal constructor(
      * ~21 ms que tarda en arrancar un codificador AAC-LC a 48 kHz.
      *
      * Para Opus el `OpusHead` sigue mandando sobre el campo, porque es el dato que de verdad
-     * describe el bitstream; el `takeIf` es lo que mantiene esa preferencia sin extenderla a los
-     * demás códecs, que no tienen ninguna cabecera de la que deducirlo.
+     * describe el bitstream; los demás códecs no tienen ninguna cabecera de la que deducirlo. Esa
+     * preferencia está en `AudioPriming`, que es de donde sacan el cebado también los dos muxers MP4.
      */
     private fun writeTrackEntry(track: TrackInfo, default: Boolean) {
         val entryPos = ebml.beginMaster(MatroskaIds.TRACK_ENTRY)
@@ -299,10 +347,7 @@ public class MkvMuxer internal constructor(
                 ebml.writeUInt(MatroskaIds.TRACK_TYPE, MatroskaIds.TRACK_TYPE_AUDIO)
                 ebml.writeString(MatroskaIds.CODEC_ID, track.codec.matroskaId)
                 track.codecPrivate?.let { ebml.writeElement(MatroskaIds.CODEC_PRIVATE, it) }
-                val delayNs = track.codecPrivate
-                    ?.takeIf { track.codec == AudioCodec.OPUS }
-                    ?.let { runCatching { OpusConfig.parseOpusHead(it).codecDelayUs * 1000 }.getOrNull() }
-                    ?: (track.codecDelayUs * 1000)
+                val delayNs = AudioPriming.us(track) * 1000
                 if (delayNs > 0) ebml.writeUInt(MatroskaIds.CODEC_DELAY, delayNs)
                 if (track.codec == AudioCodec.OPUS) {
                     ebml.writeUInt(MatroskaIds.SEEK_PRE_ROLL, 80_000_000)
@@ -396,7 +441,6 @@ public class MkvMuxer internal constructor(
         val ptsMs = Timestamps.rescaleRounded(relativePtsUs, 1, 1000)
         val isVideo = track is TrackInfo.Video
         val isKeyFrame = packet.isKeyFrame || track is TrackInfo.Audio
-        val isCueTrack = track.id == cueTrackNumber
 
         val needNewCluster = clusterSizePos < 0 ||
             (isVideo && isKeyFrame) ||
@@ -405,11 +449,7 @@ public class MkvMuxer internal constructor(
             ptsMs < clusterTimestampMs + Short.MIN_VALUE
 
         if (needNewCluster) startCluster(ptsMs)
-
-        if (isCueTrack && isKeyFrame && clusterStartPos != lastCuedClusterPos) {
-            cues.add(CueEntry(ptsMs.coerceAtLeast(0), track.id, clusterStartPos - segmentDataStart))
-            lastCuedClusterPos = clusterStartPos
-        }
+        timeline.block(clusterStartPos - segmentDataStart, track.id.toLong(), isKeyFrame, ptsMs)
 
         val relative = ptsMs - clusterTimestampMs
         require(relative >= Short.MIN_VALUE && relative <= Short.MAX_VALUE) {
@@ -424,40 +464,7 @@ public class MkvMuxer internal constructor(
         out.writeUInt(relative and 0xFFFF, 2)
         out.writeByte(if (isKeyFrame) 0x80 else 0x00)
         out.write(packet.data)
-
-        val durMs = if (packet.durationUs > 0) (packet.durationUs + 500) / 1000 else 0
-        maxEndTimestampMs = maxOf(maxEndTimestampMs, ptsMs + durMs)
-        val index = track.id - 1
-        if (ptsMs > trackMaxPtsMs[index]) {
-            trackSecondMaxPtsMs[index] = trackMaxPtsMs[index]
-            trackMaxPtsMs[index] = ptsMs
-        } else if (ptsMs < trackMaxPtsMs[index] && ptsMs > trackSecondMaxPtsMs[index]) {
-            trackSecondMaxPtsMs[index] = ptsMs
-        }
-        if (packet.durationUs > 0) trackHasDurations[index] = true
-    }
-
-    /**
-     * Fin de la línea de tiempo para `Duration`. Si los paquetes no traen duración —lo normal con
-     * `MediaCodec`—, el último fotograma de cada pista se cuenta con el intervalo entre sus dos
-     * mayores PTS, o con su `DefaultDuration` si no hubo dos. Sin eso, la duración declarada se
-     * quedaba un fotograma corta respecto a la que dan los muxers MP4 para la misma entrada. Las
-     * pistas que sí traen duraciones ya están contadas en [maxEndTimestampMs] y no se estiman.
-     */
-    private fun endTimestampMs(): Long {
-        var end = maxEndTimestampMs
-        for ((index, track) in tracks.withIndex()) {
-            val maxPts = trackMaxPtsMs[index]
-            if (maxPts == Long.MIN_VALUE || trackHasDurations[index]) continue
-            val secondPts = trackSecondMaxPtsMs[index]
-            val lastDuration = when {
-                secondPts != Long.MIN_VALUE -> maxPts - secondPts
-                track.defaultDurationNs > 0 -> (track.defaultDurationNs + 500_000) / 1_000_000
-                else -> 0L
-            }
-            end = maxOf(end, maxPts + lastDuration)
-        }
-        return end
+        trackEnds[track.id - 1].add(ptsMs, packet.durationUs)
     }
 
     private fun trackNumberVint(number: Int): ByteArray {
@@ -475,11 +482,48 @@ public class MkvMuxer internal constructor(
         ebml.writeUInt(MatroskaIds.CLUSTER_TIMESTAMP, clusterTimestampMs)
     }
 
+    /**
+     * Cierra el cluster en curso escribiendo su tamaño y lo publica: actualiza la `Duration` y
+     * amplía el índice reservado con su cue. Las dos son parches de la cabecera, que ya está en el
+     * archivo, así que cada una lleva antes al archivo todo lo pendiente —el cluster entero, con su
+     * tamaño— (ver `SeekableOutput.patch`). En ese orden, un corte en cualquier punto deja un
+     * índice que solo apunta a clusters completos y una duración que llega al menos hasta ellos.
+     */
     private fun closeCluster() {
         if (clusterSizePos >= 0) {
             ebml.endMaster(clusterSizePos)
             clusterSizePos = -1
+            declareDuration()
+            publishCues()
         }
+    }
+
+    /**
+     * Añade a la reserva los cues que aún no están en ella, en las dos escrituras que describe
+     * `MkvLayout`. Si no caben, la reserva deja de crecer y [stop] escribirá el índice al final.
+     */
+    private fun publishCues() {
+        val cues = timeline.cues
+        if (cuesFreePos < 0 || cuesPublished == cues.size) return
+        val points = ByteArrayOutputStream()
+        for (i in cuesPublished until cues.size) points.write(cues[i].encoded())
+        val append = MkvLayout.append(cuesFreePos, cuesFreeHeaderLength, cuesReservePos + cuesReserveBytes, points.toByteArray())
+        if (append == null) {
+            cuesFreePos = -1
+            return
+        }
+        for ((at, bytes) in append.writes) out.patch(at, bytes)
+        cuesFreePos = append.nextFreePos
+        cuesFreeHeaderLength = append.nextFreeHeaderLength
+        cuesPublished = cues.size
+    }
+
+    /** Escribe en `Duration` el fin de la línea de tiempo (ver `MkvTimeline`), si ha cambiado. */
+    private fun declareDuration() {
+        val end = MkvTimeline.endMs(trackEnds)
+        if (end == declaredDurationMs) return
+        out.patch(durationValuePos, EbmlWriter.bigEndian(end.toDouble().toRawBits(), 8))
+        declaredDurationMs = end
     }
 
     override fun stop() {
@@ -492,78 +536,59 @@ public class MkvMuxer internal constructor(
         try {
             gate?.let { openTimeline(it) }
             closeCluster()
-            writeCues()
-
-            out.patch(
-                durationValuePos,
-                longToBytes(endTimestampMs().toDouble().toRawBits()),
-            )
-            writeSeekHead()
-
+            if (cuesReservePos < 0 || cuesFreePos < 0) moveCuesToEnd()
+            declareDuration()
             out.patch(segmentSizePos, EbmlWriter.encodeVintSize(out.position - segmentDataStart, 8))
         } finally {
             out.close()
         }
     }
 
-    private fun writeCues() {
-        cuesPos = out.position
-        val sizePos = ebml.beginMaster(MatroskaIds.CUES)
-        for (cue in cues) {
-            val pointPos = ebml.beginMaster(MatroskaIds.CUE_POINT)
-            ebml.writeUInt(MatroskaIds.CUE_TIME, cue.timeMs)
-            val posPos = ebml.beginMaster(MatroskaIds.CUE_TRACK_POSITIONS)
-            ebml.writeUInt(MatroskaIds.CUE_TRACK, cue.trackNumber.toLong())
-            ebml.writeUInt(MatroskaIds.CUE_CLUSTER_POSITION, cue.clusterPosition)
-            ebml.endMaster(posPos)
-            ebml.endMaster(pointPos)
+    /**
+     * Sin reserva, o con la reserva llena, escribe el índice entero al final, apunta a él el
+     * `SeekHead` y convierte la reserva en relleno: un segmento solo puede tener un `Cues`.
+     *
+     * Ninguna de esas escrituras deja el archivo roto si se corta: la entrada del `SeekHead` se añade
+     * en su hueco libre como en `MkvLayout`, o se mueve con un parche de 8 bytes, y la reserva se
+     * anula con otro de 9. Entre el segundo y el tercero hay dos `Cues` a la vez, los dos válidos.
+     */
+    private fun moveCuesToEnd() {
+        val position = out.position
+        val points = ByteArrayOutputStream()
+        for (cue in timeline.cues) points.write(cue.encoded())
+        out.write(MkvLayout.cues(points.toByteArray()))
+        if (cuesSeekPositionPos >= 0) {
+            out.patch(cuesSeekPositionPos, EbmlWriter.bigEndian(position - segmentDataStart, 8))
+        } else {
+            addSeekEntry(MkvLayout.seekEntry(MatroskaIds.CUES, position - segmentDataStart))
         }
-        ebml.endMaster(sizePos)
+        if (cuesReservePos >= 0) out.patch(cuesReservePos, MkvLayout.voidOver(cuesReserveBytes.toLong()))
     }
 
+    /**
+     * Escribe el `SeekHead` en su hueco: Info, Tracks y, si ya se sabe dónde va a estar, el índice,
+     * con el resto del hueco libre para añadirle la entrada del índice en [stop] si hace falta.
+     */
     private fun writeSeekHead() {
-        val bytes = ByteArrayOutputStream()
-
-        fun seekEntry(targetId: Long, position: Long): ByteArray {
-            val idBytes = when {
-                targetId <= 0xFFFF -> 2
-                targetId <= 0xFFFFFF -> 3
-                else -> 4
-            }
-            val body = ByteArrayOutputStream()
-            body.write(0x53); body.write(0xAB)
-            body.write(0x80 or idBytes)
-            for (i in idBytes - 1 downTo 0) body.write(((targetId ushr (8 * i)) and 0xFF).toInt())
-            body.write(0x53); body.write(0xAC)
-            body.write(0x88)
-            for (i in 7 downTo 0) body.write(((position ushr (8 * i)) and 0xFF).toInt())
-            val entry = ByteArrayOutputStream()
-            entry.write(0x4D); entry.write(0xBB)
-            entry.write(0x80 or body.size())
-            body.writeTo(entry)
-            return entry.toByteArray()
-        }
-
-        val entries = listOf(
-            seekEntry(MatroskaIds.INFO, infoPos - segmentDataStart),
-            seekEntry(MatroskaIds.TRACKS, tracksPos - segmentDataStart),
-            seekEntry(MatroskaIds.CUES, cuesPos - segmentDataStart),
+        val targets = arrayListOf(
+            MatroskaIds.INFO to infoPos - segmentDataStart,
+            MatroskaIds.TRACKS to tracksPos - segmentDataStart,
         )
-        val contentSize = entries.sumOf { it.size }
-        bytes.write(0x11); bytes.write(0x4D); bytes.write(0x9B); bytes.write(0x74)
-        bytes.write(EbmlWriter.encodeVintSize(contentSize.toLong(), 8))
-        for (e in entries) bytes.write(e)
-        val seekHead = bytes.toByteArray()
-        require(seekHead.size <= SEEK_HEAD_RESERVED - 2) { "el SeekHead excede el espacio reservado" }
-
-        val voidSize = SEEK_HEAD_RESERVED - seekHead.size
-        out.patch(seekHeadPos, seekHead + EbmlWriter.encodeVoid(voidSize))
+        if (cuesReservePos >= 0) targets += MatroskaIds.CUES to cuesReservePos - segmentDataStart
+        val seekHead = checkNotNull(MkvLayout.seekHead(targets, MkvLayout.SEEK_HEAD_RESERVED)) { "el SeekHead excede el espacio reservado" }
+        out.patch(seekHeadPos, seekHead.bytes)
+        if (seekHead.cuesPositionOffset >= 0) cuesSeekPositionPos = seekHeadPos + seekHead.cuesPositionOffset
+        seekFreePos = if (seekHead.freeOffset >= 0) seekHeadPos + seekHead.freeOffset else -1
+        seekFreeHeaderLength = seekHead.freeHeaderLength
     }
 
-    private fun longToBytes(v: Long): ByteArray {
-        val b = ByteArray(8)
-        for (i in 0 until 8) b[i] = ((v ushr (8 * (7 - i))) and 0xFF).toByte()
-        return b
+    /** Añade [entry] al `SeekHead` en su hueco libre, en las dos escrituras de `MkvLayout`. */
+    private fun addSeekEntry(entry: ByteArray) {
+        val append = if (seekFreePos < 0) null else MkvLayout.append(seekFreePos, seekFreeHeaderLength, seekHeadPos + MkvLayout.SEEK_HEAD_RESERVED, entry)
+        checkNotNull(append) { "el SeekHead no tiene sitio para la entrada del índice" }
+        for ((at, bytes) in append.writes) out.patch(at, bytes)
+        seekFreePos = append.nextFreePos
+        seekFreeHeaderLength = append.nextFreeHeaderLength
     }
 
     override fun close() {

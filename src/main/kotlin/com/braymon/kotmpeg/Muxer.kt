@@ -19,6 +19,13 @@ public interface Muxer : Closeable {
     /** Escribe las cabeceras. Después no se pueden añadir más pistas. */
     public fun start()
 
+    /**
+     * Escribe [packet] en la pista [MediaPacket.trackId], después de [start]. Dentro de cada pista
+     * los paquetes llegan en orden de decodificación; entre pistas, en el orden que se quiera.
+     *
+     * El array de [MediaPacket.data] se puede reutilizar en cuanto vuelve: ningún muxer guarda una
+     * referencia a él (ver [MediaPacket]).
+     */
     public fun writePacket(packet: MediaPacket)
 
     /** Finaliza índices/cabeceras y cierra el archivo. Idempotente. */
@@ -27,8 +34,22 @@ public interface Muxer : Closeable {
 
 /**
  * Lee paquetes codificados de un archivo contenedor.
+ *
+ * **Ante una entrada dañada lanza siempre una excepción tipada**, al abrir o al leer: en Matroska,
+ * `EbmlException`; en MP4, `IllegalStateException`; un campo fuera de rango en cualquiera de los
+ * dos, `IllegalArgumentException`; un archivo que se acaba antes de lo que declara, `EOFException`,
+ * y cualquier otro fallo de lectura, `IOException`. Nunca otra cosa, ni un cuelgue ni una reserva de
+ * memoria desproporcionada: es la política de `SECURITY.md`, y el fuzzing de `DemuxerFuzzTest` la
+ * comprueba. Un archivo solo truncado, si abre, no lanza al leer: entrega hasta su último paquete
+ * completo y termina con `null`. `Kotmpeg.repair`, que sí escribe, es más estricto: lo que no
+ * reconoce lo rechaza con `IllegalArgumentException` sin tocarlo.
  */
 public interface Demuxer : Closeable {
+    /**
+     * Las pistas que se pueden leer, en el orden del archivo, cada una con el id que llevan sus
+     * paquetes en [MediaPacket.trackId]. Las de un códec que no se soporta, o cuya cabecera no se
+     * puede leer, no están: se descartan al abrir y se avisa por `onWarning`.
+     */
     public val tracks: List<TrackInfo>
 
     /** Duración total en microsegundos, 0 si se desconoce. */

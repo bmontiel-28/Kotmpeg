@@ -241,7 +241,9 @@ public sealed class TrackInfo {
          * decodificación ni al round-trip —la frecuencia real viaja en `esds`/`dOps`, que es
          * de donde la lee cualquier decodificador y también nuestro demuxer—, pero una
          * herramienta que inspeccione esa cabecera del contenedor verá 65 535. MKV no tiene
-         * este límite: su `SamplingFrequency` es un float.
+         * este límite: su `SamplingFrequency` es un float. En Opus ese campo de MP4 vale siempre
+         * 48 000, como exige su encapsulado, y la frecuencia que se relee es la de entrada de la
+         * `OpusHead`, que viaja en el `dOps`: la de la pista, si no se le pasa `codecPrivate`.
          */
         public val sampleRate: Int = builder.sampleRate
         public val channelCount: Int = builder.channelCount
@@ -368,5 +370,20 @@ internal object TrackDefaults {
             val isVideo = track is TrackInfo.Video
             track.default ?: (isVideo !in explicit && chosen.add(isVideo))
         }
+    }
+}
+
+/** Lo que los tres muxers exigen de una pista antes de registrarla, y que `Remuxer` comprueba antes de abrir la salida. */
+internal object TrackRequirements {
+    /**
+     * Que una pista de vídeo traiga su configuración de códec (`avcC`/`hvcC`). Sin ella, ningún
+     * reproductor de Android abre la pista, y en MP4 ni siquiera hay entrada de muestra que escribir.
+     *
+     * Estaba escrita cuatro veces, cada una con su propia condición. El mensaje sigue siendo de quien
+     * llama, porque cada uno explica la exigencia en los términos de su contenedor; lanza
+     * `IllegalArgumentException` con él.
+     */
+    fun requireVideoCodecPrivate(track: TrackInfo, lazyMessage: () -> Any) {
+        require(track !is TrackInfo.Video || track.codecPrivate != null, lazyMessage)
     }
 }

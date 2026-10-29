@@ -8,6 +8,7 @@ import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.Timestamps
 import com.braymon.kotmpeg.model.TrackDefaults
 import com.braymon.kotmpeg.model.TrackInfo
+import com.braymon.kotmpeg.model.TrackRequirements
 import com.braymon.kotmpeg.model.VideoCodec
 import java.io.EOFException
 import java.io.File
@@ -38,6 +39,8 @@ import java.nio.file.StandardCopyOption.REPLACE_EXISTING
  *    `dts_i = sortedPts_i - delta` con `delta = max(sortedPts_i - pts_i)`, lo que
  *    garantiza `dts_i <= pts_i`, conserva las duraciones y produce offsets `ctts` mínimos
  *    no negativos.
+ *  - Eso es en vídeo. En audio no hay reordenación: el DTS es la secuencia de PTS, ordenada
+ *    si algún paquete llega con un PTS que retrocede, y no se escribe `ctts` (ver `TrackTiming`).
  *  - Una edit list alinea el inicio de presentación a cero (y conserva los offsets de
  *    inicio por pista), así que los streams con B-frames quedan en sincronía perfecta.
  */
@@ -66,8 +69,10 @@ public class Mp4Muxer internal constructor(
     internal constructor(options: MuxerOptions, file: File) : this(SeekableOutput(file), file, options)
 
     private val fastStart = options.fastStart
-    private val creationTimeMillis = options.creationTimeMillis
     private val writingApp = options.writingApp
+
+    /** La fecha de creación en la escala de MP4, o 0 si no hay ninguna que escribir. */
+    private val created = MovieBoxes.mp4Time(options.creationTimeMillis)
 
     init {
         if (fastStart && file == null) {
@@ -81,39 +86,32 @@ public class Mp4Muxer internal constructor(
     }
 
     private companion object {
-        /**
-         * Escala de la película, en milésimas, como la escribe FFmpeg. En ella van las duraciones
-         * de `mvhd` y `tkhd` y las de la lista de edición, así que el hueco inicial de una pista que
-         * arranca después que las demás se expresa al milisegundo: su primera muestra puede leerse
-         * hasta medio milisegundo antes o después de donde se escribió.
-         */
-        private const val MOVIE_TIMESCALE = 1000L
-        private const val VIDEO_TIMESCALE = 90000L
         /** Mayor offset que puede expresar una entrada stco (32 bits sin signo). */
         private const val UINT32_MAX = 0xFFFFFFFFL
 
         /**
-         * El origen de tiempos de MP4 es 1904-01-01 UTC y no 1970, así que hay que sumar estos
-         * segundos a una marca de Unix. Con `version = 0` el campo es de 32 bits sin signo, que
-         * alcanza hasta 2040.
+         * Lo que ocupa como mucho un `moov` aparte de sus pistas y del nombre de la aplicación: su
+         * cabecera, el `mvhd` de la versión 1 y la etiqueta del codificador (ver [moovCapacity]).
          */
-        private const val MP4_EPOCH_OFFSET_S = 2_082_844_800L
+        private const val MOOV_FIXED_BYTES = 256L
 
-        /** Flags de `tkhd`: `track_enabled` (0x1) y `track_in_movie` (0x2). */
-        private const val TKHD_ENABLED_IN_MOVIE = 3
-        private const val TKHD_IN_MOVIE_ONLY = 2
+        /**
+         * Lo que ocupa como mucho un `trak` aparte de su entrada de muestra, su nombre y el contenido de
+         * sus tablas: `tkhd` y `mdhd` de la versión 1, una lista de edición de dos entradas, `hdlr`,
+         * `minf`, `dinf` y las cabeceras de las seis tablas, unos 470 bytes.
+         */
+        private const val TRAK_FIXED_BYTES = 512L
     }
 
-    /** La fecha en la escala de MP4, o 0 si no hay ninguna que escribir. */
-    private fun mp4Time(): Long =
-        creationTimeMillis?.let { (Math.floorDiv(it, 1000L) + MP4_EPOCH_OFFSET_S).coerceAtLeast(0L) } ?: 0L
-
-    private class TrackState(val info: TrackInfo) {
+    /**
+     * Una pista registrada, con su entrada de `stsd` ya construida (ver [addTrack]) y su cebado en
+     * µs y en tics de su escala, que no cambian y se consultan en cada construcción del `moov`.
+     */
+    private class TrackState(val info: TrackInfo, val sampleEntry: ByteArray) {
         val samples = SampleTable()
-        val timescale: Long = when (info) {
-            is TrackInfo.Video -> VIDEO_TIMESCALE
-            is TrackInfo.Audio -> info.sampleRate.toLong()
-        }
+        val timescale: Long = MovieBoxes.mediaTimescale(info)
+        val primingUs: Long = MovieBoxes.primingUs(info, timescale)
+        val primingTicks: Long = MovieBoxes.primingTicks(info, timescale)
     }
 
     private val tracks = ArrayList<TrackState>()
@@ -131,13 +129,22 @@ public class Mp4Muxer internal constructor(
      */
     private var useCo64 = false
 
+    /**
+     * Registra una pista y construye ya su entrada de `stsd`, que [stop] copia tal cual.
+     *
+     * Construirla aquí es lo que valida la pista: un Opus de más de dos canales sin tabla de mapeo,
+     * un AAC sin `codecPrivate` con un número de canales que el ASC no expresa o un `codecPrivate`
+     * Opus que no es una `OpusHead` se rechazan con [IllegalArgumentException] antes de grabar nada,
+     * como en `MkvMuxer`. Hasta ahora la entrada se construía por primera vez en [stop]: se grababa
+     * una hora entera y el error salía al cerrar, con el `mdat` escrito y sin `moov`, un archivo que
+     * no se puede reproducir ni reparar. Una pista rechazada no se registra y no consume id.
+     */
     override fun addTrack(track: TrackInfo): Int {
         check(!started) { "no se pueden añadir pistas después de start()" }
-        if (track is TrackInfo.Video) {
-            requireNotNull(track.codecPrivate) { "las pistas de vídeo MP4 requieren codecPrivate (avcC/hvcC)" }
-        }
+        TrackRequirements.requireVideoCodecPrivate(track) { "las pistas de vídeo MP4 requieren codecPrivate (avcC/hvcC)" }
         val id = tracks.size + 1
-        tracks.add(TrackState(track.withId(id)))
+        val info = track.withId(id)
+        tracks.add(TrackState(info, SampleEntries.sampleEntry(info)))
         return id
     }
 
@@ -192,9 +199,18 @@ public class Mp4Muxer internal constructor(
      * dentro y ningún índice, que es irreproducible.
      *
      * Ese mismo `moov` de cola se reutiliza para conocer su tamaño en vez de construirlo otra
-     * vez, y las tablas de tiempos se calculan una sola vez para las dos construcciones: cada
-     * una recorre todas las muestras de todas las pistas, y en una grabación larga se nota en lo
-     * que tarda este método.
+     * vez, y las tablas de tiempos y de chunks se calculan una sola vez para las dos
+     * construcciones ([TrackTables]): cada una recorre todas las muestras de todas las pistas, y
+     * en una grabación larga se nota en lo que tarda este método.
+     *
+     * Y en lo que reserva, que es lo que de verdad importa aquí: un `OutOfMemoryError` al cerrar
+     * deja el archivo sin `moov`. Ninguna tabla lleva una entrada por muestra salvo la que no se
+     * puede evitar —los PTS ordenados, cuando hay que derivar el DTS— y **nunca hay dos `moov`
+     * vivos a la vez**: el de cola se suelta al escribirlo, y para conocer el tamaño del de cabeza
+     * en el sitio basta con construirlo, sin copiarlo. Antes se reservaban ocho arrays por muestra
+     * para los tiempos, otros cuatro en cada construcción del `moov`, y el de cola seguía vivo
+     * mientras se construía el otro: unos 250 bytes por muestra con inicio rápido, cuando la tabla
+     * de muestras entera ocupa 37.
      *
      * Sobre un [SeekableOutput] no hay ruta con la que crear un temporal, así que el inicio rápido
      * se hace **en el sitio**: el `moov` se inserta delante del `mdat` desplazando los datos hacia
@@ -227,21 +243,21 @@ public class Mp4Muxer internal constructor(
 
             val globalStartUs = globalStartUs()
             val tables = tracks.map { computeTables(it, globalStartUs) }
-            val tailMoov = buildMoov(tables, 0)
             if (fastStart && file == null) {
-                out.insert(mdatStart, buildMoov(tables, frontMoovSize(tables, tailMoov.size.toLong(), maxOffset)))
+                val tailSize = moovBuilder(tables, 0, moovCapacity(tables)).size.toLong()
+                out.insert(mdatStart, frontMoov(tables, frontMoovSize(tables, tailSize, maxOffset)))
                 out.close()
                 closed = true
                 return
             }
-            out.write(tailMoov)
+            val tailSize = writeTailMoov(tables)
             out.close()
             closed = true
 
             if (fastStart && file != null) {
-                val moovSize = frontMoovSize(tables, tailMoov.size.toLong(), maxOffset)
+                val moovSize = frontMoovSize(tables, tailSize, maxOffset)
                 try {
-                    rewriteFastStart(file, buildMoov(tables, moovSize), mdatSize)
+                    rewriteFastStart(file, frontMoov(tables, moovSize), mdatSize)
                 } catch (t: Throwable) {
                     throw IOException(
                         "no se pudo recolocar el moov al principio de ${file.name} " +
@@ -267,8 +283,26 @@ public class Mp4Muxer internal constructor(
     private fun frontMoovSize(tables: List<TrackTables>, tailSize: Long, maxOffset: Long): Long {
         if (useCo64 || maxOffset + tailSize <= UINT32_MAX) return tailSize
         useCo64 = true
-        return buildMoov(tables, 0).size.toLong()
+        return moovBuilder(tables, 0, moovCapacity(tables)).size.toLong()
     }
+
+    /**
+     * Escribe el `moov` de cola y devuelve su tamaño. Va del builder al archivo sin copiarse a un
+     * array propio, y el builder vive solo dentro de esta función, así que ya no existe cuando [stop]
+     * construye el de cabeza.
+     */
+    private fun writeTailMoov(tables: List<TrackTables>): Long {
+        val moov = moovBuilder(tables, 0, moovCapacity(tables))
+        moov.writeTo(out)
+        return moov.size.toLong()
+    }
+
+    /**
+     * El `moov` de cabeza, que mide exactamente [moovSize] bytes —lo que también desplaza los datos—:
+     * se construye en un array de ese tamaño y se entrega sin copiarlo.
+     */
+    private fun frontMoov(tables: List<TrackTables>, moovSize: Long): ByteArray =
+        moovBuilder(tables, moovSize, moovSize).release()
 
     /**
      * Reescribe [target] como `ftyp moov mdat` (moov recolocado antes de los datos).
@@ -331,10 +365,18 @@ public class Mp4Muxer internal constructor(
 
     override fun close(): Unit = stop()
 
+    /**
+     * Lo que [stop] calcula de una pista una sola vez para todas las construcciones del `moov`:
+     * todo menos los offsets de chunk, que dependen de dónde vaya el `moov`. Las series del
+     * `stts` y del `ctts` y la lista de chunks tienen el tamaño justo, una entrada por serie o por
+     * chunk; las columnas por muestra (`stsz`, `stss`) se escriben leyendo la tabla de muestras.
+     */
     private class TrackTables(
-        val dtsTicks: LongArray,
-        val cttsTicks: LongArray,
-        val sttsDeltas: LongArray,
+        val stts: Runs,
+        /** Null si todos los desfases de composición son cero, y entonces no hay `ctts`. */
+        val ctts: Runs?,
+        /** Primera muestra de cada chunk, en orden: ver [chunkStarts]. */
+        val chunkStarts: IntArray,
         /** Duración de la pista en ticks de la escala de tiempo del medio. */
         val mediaDuration: Long,
         /** Tiempo de presentación más temprano en ticks (media_time de la edit list). */
@@ -343,6 +385,10 @@ public class Mp4Muxer internal constructor(
         val startOffsetUs: Long,
         /** Duración de presentación en us (para tkhd/mvhd). */
         val presentationDurationUs: Long,
+        /** Muestras de sincronización: si son todas, no hay `stss`. */
+        val keyCount: Int,
+        /** Entradas del `stsc`: una cada vez que cambia el número de muestras por chunk. */
+        val stscEntries: Int,
     )
 
     /** Inicio de presentación de la película: el menor PTS entre todas las pistas. */
@@ -355,190 +401,253 @@ public class Mp4Muxer internal constructor(
     private fun computeTables(t: TrackState, globalStartUs: Long): TrackTables {
         val samples = t.samples
         val n = samples.size
-        val pts = LongArray(n) { samples.ptsUs(it) - globalStartUs }
-        var dts = LongArray(n) { samples.dtsUs(it) - globalStartUs }
+        if (n == 0) return TrackTables(Runs(IntArray(0), LongArray(0)), null, IntArray(0), 0L, 0L, 0L, 0L, 0, 0)
+        val timing = TrackTiming.of(samples, t.timescale, audio = t.info is TrackInfo.Audio)
 
-        var dtsValid = true
+        val lastDelta = when {
+            samples.durationUs(n - 1) > 0 -> timing.toTicks(samples.durationUs(n - 1))
+            n > 1 -> timing.dtsTicks(n - 1) - timing.dtsTicks(n - 2)
+            else -> timing.toTicks(MovieBoxes.defaultSampleDurationUs(t.info))
+        }
+        val stts = RunLengths()
+        val ctts = RunLengths()
+        timing.forEachSample(lastDelta) { duration, offset -> stts.add(duration); ctts.add(offset) }
+        stts.allocate()
+        val hasCtts = ctts.anyNonZero
+        if (hasCtts) ctts.allocate()
+        timing.forEachSample(lastDelta) { duration, offset ->
+            stts.add(duration)
+            if (hasCtts) ctts.add(offset)
+        }
+
+        var minPtsUs = Long.MAX_VALUE
+        var maxPtsUs = Long.MIN_VALUE
         for (i in 0 until n) {
-            if (dts[i] > pts[i] || (i > 0 && dts[i] < dts[i - 1])) { dtsValid = false; break }
+            val pts = timing.ptsUs(i)
+            minPtsUs = minOf(minPtsUs, pts)
+            maxPtsUs = maxOf(maxPtsUs, pts)
         }
-        if (!dtsValid) {
-            val sorted = pts.sortedArray()
-            var delta = 0L
-            for (i in 0 until n) delta = maxOf(delta, sorted[i] - pts[i])
-            dts = LongArray(n) { sorted[it] - delta }
-        }
-
-        val ts = t.timescale
-        fun toTicks(us: Long): Long = Timestamps.rescaleRounded(us, ts, 1_000_000)
-
-        val dts0 = if (n > 0) dts[0] else 0L
-        val dtsTicks = LongArray(n) { toTicks(dts[it] - dts0) }
-        val ptsTicks = LongArray(n) { toTicks(pts[it] - dts0) }
-        val ctts = LongArray(n) { ptsTicks[it] - dtsTicks[it] }
-
-        val stts = LongArray(n)
-        for (i in 0 until n - 1) stts[i] = dtsTicks[i + 1] - dtsTicks[i]
-        if (n > 0) {
-            val lastDurationUs = samples.durationUs(n - 1)
-            stts[n - 1] = when {
-                lastDurationUs > 0 -> toTicks(lastDurationUs)
-                n > 1 -> stts[n - 2]
-                else -> toTicks(defaultSampleDurationUs(t.info))
-            }
-        }
-
-        val mediaDuration = if (n > 0) dtsTicks[n - 1] + stts[n - 1] else 0
-        val earliestPts = ptsTicks.minOrNull() ?: 0L
-        val startOffsetUs = maxOf(0L, (pts.minOrNull() ?: 0L))
-        val lastEndUs = if (n > 0) (pts.maxOrNull() ?: 0L) + Timestamps.rescaleFloor(stts[n - 1], 1_000_000, ts) else 0L
-        return TrackTables(dtsTicks, ctts, stts, mediaDuration, earliestPts, startOffsetUs, lastEndUs - startOffsetUs)
+        val mediaDuration = timing.dtsTicks(n - 1) + lastDelta
+        val earliestPts = timing.ptsTicks(minPtsUs)
+        val startOffsetUs = maxOf(0L, minPtsUs - globalStartUs)
+        val lastEndUs = maxPtsUs - globalStartUs + Timestamps.rescaleFloor(lastDelta, 1_000_000, t.timescale)
+        var keyCount = 0
+        for (i in 0 until n) if (samples.isKey(i)) keyCount++
+        val chunkStarts = chunkStarts(samples)
+        return TrackTables(
+            stts.toRuns(), if (hasCtts) ctts.toRuns() else null, chunkStarts,
+            mediaDuration, earliestPts, startOffsetUs, lastEndUs - startOffsetUs,
+            keyCount, stscEntries(chunkStarts, n),
+        )
     }
 
     /**
-     * Duración estimada de una muestra cuando no hay ninguna otra de la que deducirla: un
-     * frame de AAC (1024 muestras) en audio, 30 fps en vídeo. Los mismos valores que usa
-     * [FragmentedMp4Muxer] para el caso equivalente.
+     * Los tiempos de una pista en orden de decodificación, leídos de la tabla de muestras sin copiar
+     * ninguna columna: el único array por muestra es el de los PTS ordenados, y solo cuando hace
+     * falta derivar con él el DTS.
+     *
+     * El DTS sale de tres sitios:
+     *  - **El del paquete**, en vídeo, si es monótono y nunca posterior a su PTS.
+     *  - **El PTS**, si los PTS ya llegan en orden, que es lo normal sin B-frames.
+     *  - **Los PTS ordenados**, en vídeo menos el mayor adelanto de una muestra sobre su orden
+     *    (ver el KDoc de [Mp4Muxer]): `dts_i = sortedPts_i - delta`.
+     *
+     * **En audio el DTS nunca sale del paquete ni hay desfases de composición**: AAC y Opus se
+     * decodifican en el orden en que se presentan, así que el DTS es la secuencia de PTS (ordenada
+     * si hace falta) y el PTS se iguala a él. Antes la derivación para B-frames se aplicaba también
+     * al audio, y un paquete que llegaba unos milisegundos tarde respecto al siguiente —un PTS que
+     * retrocede, que es jitter de la fuente y no reordenación— generaba un `ctts` y desplazaba el
+     * `media_time` de la lista de edición; el demuxer, que en audio toma esa edición como cebado,
+     * devolvía un `codecDelayUs` mayor que el declarado. Ahora cada paquete suena en su turno con
+     * el siguiente PTS de la secuencia ordenada, a lo sumo a la distancia del retroceso del suyo, y
+     * el cebado vuelve tal cual. `MkvMuxer` escribe los tiempos como llegan, porque Matroska no
+     * tiene DTS; el resultado al releer cada contenedor es una línea de tiempo monótona.
      */
-    private fun defaultSampleDurationUs(info: TrackInfo): Long = when (info) {
-        is TrackInfo.Audio -> 1024L * 1_000_000 / info.sampleRate
-        is TrackInfo.Video -> 33_333L
+    private class TrackTiming private constructor(
+        val samples: SampleTable,
+        private val timescale: Long,
+        val audio: Boolean,
+        private val callerDts: Boolean,
+        private val sortedPtsUs: LongArray?,
+        private val reorderDeltaUs: Long,
+    ) {
+        /** DTS de la primera muestra, el cero de los tics de la pista. */
+        private val originUs = if (samples.size > 0) dtsUs(0) else 0L
+
+        fun dtsUs(i: Int): Long = when {
+            sortedPtsUs != null -> sortedPtsUs[i] - reorderDeltaUs
+            callerDts -> samples.dtsUs(i)
+            else -> samples.ptsUs(i)
+        }
+
+        fun ptsUs(i: Int): Long = if (audio) dtsUs(i) else samples.ptsUs(i)
+
+        fun toTicks(us: Long): Long = Timestamps.rescaleRounded(us, timescale, 1_000_000)
+
+        fun dtsTicks(i: Int): Long = toTicks(dtsUs(i) - originUs)
+
+        /** Un PTS en µs, en tics desde [originUs]. */
+        fun ptsTicks(ptsUs: Long): Long = toTicks(ptsUs - originUs)
+
+        /**
+         * Para cada muestra, en orden de decodificación, su duración en el `stts` y su desfase en
+         * el `ctts`, en tics; la última dura [lastDelta]. Cada DTS se convierte una sola vez.
+         */
+        inline fun forEachSample(lastDelta: Long, action: (duration: Long, offset: Long) -> Unit) {
+            val n = samples.size
+            if (n == 0) return
+            var dts = dtsTicks(0)
+            for (i in 0 until n) {
+                val next = if (i + 1 < n) dtsTicks(i + 1) else dts + lastDelta
+                action(next - dts, if (audio) 0L else ptsTicks(ptsUs(i)) - dts)
+                dts = next
+            }
+        }
+
+        companion object {
+            fun of(samples: SampleTable, timescale: Long, audio: Boolean): TrackTiming {
+                val n = samples.size
+                if (!audio && hasValidDts(samples)) return TrackTiming(samples, timescale, audio, true, null, 0L)
+                var ordered = true
+                for (i in 1 until n) if (samples.ptsUs(i) < samples.ptsUs(i - 1)) { ordered = false; break }
+                if (ordered) return TrackTiming(samples, timescale, audio, false, null, 0L)
+                val sorted = LongArray(n) { samples.ptsUs(it) }
+                sorted.sort()
+                var delta = 0L
+                if (!audio) for (i in 0 until n) delta = maxOf(delta, sorted[i] - samples.ptsUs(i))
+                return TrackTiming(samples, timescale, audio, false, sorted, delta)
+            }
+
+            /** El DTS de los paquetes vale si es monótono y ninguno es posterior a su PTS. */
+            private fun hasValidDts(samples: SampleTable): Boolean {
+                for (i in 0 until samples.size) {
+                    val dts = samples.dtsUs(i)
+                    if (dts > samples.ptsUs(i) || (i > 0 && dts < samples.dtsUs(i - 1))) return false
+                }
+                return true
+            }
+        }
     }
 
-    /** Microsegundos -> ticks de la escala de la película, con el mismo redondeo que el resto. */
-    private fun toMovieTicks(us: Long): Long = Timestamps.rescaleRounded(us, MOVIE_TIMESCALE, 1_000_000)
+    /**
+     * Series de valores repetidos consecutivos, en arrays primitivos del tamaño justo. Se llenan en
+     * dos pasadas: la primera ([add] antes de [allocate]) solo cuenta las series, la segunda las
+     * guarda. Contar antes cuesta recorrer otra vez los tiempos, que es aritmética, y evita la
+     * holgura de un array que crece duplicándose, que con vídeo de frecuencia variable —una serie
+     * por muestra— dobla lo que ocupa la tabla.
+     */
+    private class RunLengths {
+        private var counts: IntArray? = null
+        private var values: LongArray? = null
+        private var runs = 0
+        private var last = 0L
 
-    /** Una duración solo cabe en las cajas versión 0 si entra en 32 bits sin signo. */
-    private fun versionFor(duration: Long): Int = if (duration > 0xFFFFFFFFL) 1 else 0
+        /** Si algún valor de la primera pasada no es cero: un `ctts` todo a cero no se escribe. */
+        var anyNonZero: Boolean = false
+            private set
 
-    private fun buildMoov(tables: List<TrackTables>, offsetDelta: Long): ByteArray {
-        val movieDurationMs = tracks.indices.maxOfOrNull { i ->
-            toMovieTicks(tables[i].startOffsetUs + tables[i].presentationDurationUs)
-        } ?: 0L
-        val mvhdVersion = versionFor(movieDurationMs)
-
-        val moov = BoxBuilder()
-        moov.box("moov") {
-            val created = mp4Time()
-            fullBox("mvhd", mvhdVersion, 0) {
-                if (mvhdVersion == 1) {
-                    u64(created); u64(created)       // tiempos de creación/modificación
-                    u32(MOVIE_TIMESCALE)
-                    u64(movieDurationMs)
-                } else {
-                    u32(created); u32(created)
-                    u32(MOVIE_TIMESCALE)
-                    u32(movieDurationMs)
-                }
-                u32(0x00010000)                      // velocidad 1.0
-                u16(0x0100)                          // volumen 1.0
-                u16(0); u32(0); u32(0)               // reservado
-                identityMatrix()
-                zeros(24)                            // pre_defined
-                u32(tracks.size + 1)                 // next_track_ID
+        fun add(value: Long) {
+            if (runs > 0 && value == last) {
+                counts?.let { it[runs - 1]++ }
+                return
             }
+            counts?.let { it[runs] = 1; values!![runs] = value }
+            if (value != 0L) anyNonZero = true
+            last = value
+            runs++
+        }
+
+        fun allocate() {
+            counts = IntArray(runs)
+            values = LongArray(runs)
+            runs = 0
+        }
+
+        fun toRuns(): Runs = Runs(counts ?: IntArray(0), values ?: LongArray(0))
+    }
+
+    /**
+     * Primera muestra de cada chunk: una serie de muestras contiguas en el `mdat`, que es lo que
+     * indexan `stsc` y `stco`. Se cuenta en una pasada y se guarda en otra, con el tamaño justo.
+     */
+    private fun chunkStarts(samples: SampleTable): IntArray {
+        var count = 0
+        forEachChunkStart(samples) { count++ }
+        val starts = IntArray(count)
+        var c = 0
+        forEachChunkStart(samples) { starts[c++] = it }
+        return starts
+    }
+
+    private inline fun forEachChunkStart(samples: SampleTable, action: (Int) -> Unit) {
+        for (i in 0 until samples.size) {
+            if (i == 0 || samples.offset(i) != samples.offset(i - 1) + samples.size(i - 1)) action(i)
+        }
+    }
+
+    /**
+     * Lo que va a ocupar el `moov`, por arriba y con menos de un KiB de holgura por pista, para
+     * reservar su [BoxBuilder] de una vez. Las tablas, que en una grabación larga son casi todo, se
+     * cuentan exactas; las cajas de tamaño fijo, por su máximo, el de la versión 1.
+     *
+     * Antes el builder empezaba en 256 bytes y crecía duplicándose: para un `moov` de S bytes
+     * reservaba por el camino entre 2S y 4S en arrays que se tiraban, más S de la copia final, y con
+     * inicio rápido todo dos veces. Ahora el de cola se escribe desde el builder y el de cabeza, cuyo
+     * tamaño ya se conoce, se entrega sin copiar ([BoxBuilder.release]). Con 200 000 paquetes de audio
+     * y 100 000 de vídeo —una hora larga— y un `moov` de 2,2 MB, cerrar reservaba 11,3 MB, y 21,5 con
+     * inicio rápido; ahora, 3,3 y 5,4.
+     */
+    private fun moovCapacity(tables: List<TrackTables>): Long {
+        var bytes = MOOV_FIXED_BYTES + writingApp.toByteArray(Charsets.UTF_8).size
+        val offsetBytes = if (useCo64) 8L else 4L
+        for ((i, t) in tracks.withIndex()) {
+            val tab = tables[i]
+            val n = t.samples.size.toLong()
+            bytes += TRAK_FIXED_BYTES + t.sampleEntry.size + (t.info.name?.toByteArray(Charsets.UTF_8)?.size ?: 0)
+            bytes += 8L * tab.stts.size + 8L * (tab.ctts?.size ?: 0)
+            bytes += 4L * n + if (tab.keyCount < n) 4L * tab.keyCount else 0L
+            bytes += 12L * tab.stscEntries + offsetBytes * tab.chunkStarts.size
+        }
+        return bytes
+    }
+
+    /** Una duración de la lista de edición solo cabe en la versión 0 si entra en 32 bits sin signo. */
+    private fun versionFor(duration: Long): Int = if (duration > UINT32_MAX) 1 else 0
+
+    /**
+     * La duración de la pista en la escala de la película, que es la del `tkhd`: la suma de sus
+     * ediciones, como pide ISO/IEC 14496-12 §8.3.2.3. Es el instante en que acaba de presentarse
+     * —su desfase de arranque más su presentación, sin el cebado que la edición salta—, redondeado
+     * una sola vez; [writeEdts] le resta el hueco inicial para que las dos sumen exactamente esto.
+     *
+     * Antes el `tkhd` contaba el cebado y la edición no, así que un archivo cuya pista más larga era
+     * el audio declaraba en el `mvhd` unos 21 ms de más con AAC-LC: lo que salta la edición.
+     */
+    private fun trackDurationTicks(t: TrackState, tab: TrackTables): Long =
+        MovieBoxes.toMovieTicks(tab.startOffsetUs + (tab.presentationDurationUs - t.primingUs).coerceAtLeast(0L))
+
+    /**
+     * El `moov` sin copiar a su array final: para conocer su tamaño basta con construirlo, y
+     * copiarlo solo para medirlo duplicaba lo reservado en ese paso. Se construye en un array de
+     * [capacity] bytes, que con [moovCapacity] nunca tiene que crecer. El `mvhd` declara la mayor de
+     * las duraciones de las pistas.
+     */
+    private fun moovBuilder(tables: List<TrackTables>, offsetDelta: Long, capacity: Long): BoxBuilder {
+        val movieDuration = tracks.indices.maxOfOrNull { i -> trackDurationTicks(tracks[i], tables[i]) } ?: 0L
+        val moov = BoxBuilder(capacity.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+        moov.box("moov") {
+            MovieBoxes.writeMvhd(this, created, movieDuration, tracks.size + 1)
             for ((i, t) in tracks.withIndex()) {
-                writeTrak(this, t, tables[i], offsetDelta)
+                val tab = tables[i]
+                MovieBoxes.writeTrak(
+                    this, t.info, defaultFlags[i], created, trackDurationTicks(t, tab), t.timescale, tab.mediaDuration,
+                    edts = { writeEdts(this, t, tab) },
+                    stbl = { writeStbl(this, t, tab, offsetDelta) },
+                )
             }
             SampleEntries.writeEncoderTag(this, writingApp)
         }
-        return moov.toByteArray()
-    }
-
-    private fun BoxBuilder.identityMatrix() {
-        u32(0x00010000); u32(0); u32(0)
-        u32(0); u32(0x00010000); u32(0)
-        u32(0); u32(0); u32(0x40000000)
-    }
-
-    private fun writeTrak(parent: BoxBuilder, t: TrackState, tab: TrackTables, offsetDelta: Long) {
-        val info = t.info
-        val trackDurationMs = toMovieTicks(tab.startOffsetUs + tab.presentationDurationUs)
-        val tkhdVersion = versionFor(trackDurationMs)
-        val created = mp4Time()
-        val tkhdFlags = if (defaultFlags[info.id - 1]) TKHD_ENABLED_IN_MOVIE else TKHD_IN_MOVIE_ONLY
-        parent.box("trak") {
-            fullBox("tkhd", tkhdVersion, tkhdFlags) {
-                if (tkhdVersion == 1) {
-                    u64(created); u64(created)       // tiempos de creación/modificación
-                    u32(info.id)
-                    u32(0)                           // reservado
-                    u64(trackDurationMs)
-                } else {
-                    u32(created); u32(created)       // tiempos de creación/modificación
-                    u32(info.id)
-                    u32(0)                           // reservado
-                    u32(trackDurationMs)
-                }
-                u32(0); u32(0)                       // reservado
-                u16(0)                               // capa
-                u16(0)                               // alternate_group
-                u16(if (info is TrackInfo.Audio) 0x0100 else 0) // volumen
-                u16(0)
-                if (info is TrackInfo.Video) {
-                    SampleEntries.writeDisplayMatrix(this, info.rotationDegrees, info.displayWidth, info.displayHeight)
-                    u32(info.displayWidth.toLong() shl 16)
-                    u32(info.displayHeight.toLong() shl 16)
-                } else {
-                    identityMatrix()
-                    u32(0); u32(0)
-                }
-            }
-            writeEdts(this, t, tab)
-            box("mdia") {
-                val mdhdVersion = versionFor(tab.mediaDuration)
-                fullBox("mdhd", mdhdVersion, 0) {
-                    if (mdhdVersion == 1) {
-                        u64(created); u64(created)   // tiempos de creación/modificación
-                        u32(t.timescale)
-                        u64(tab.mediaDuration)
-                    } else {
-                        u32(created); u32(created)   // tiempos de creación/modificación
-                        u32(t.timescale)
-                        u32(tab.mediaDuration)
-                    }
-                    u16(SampleEntries.packLanguage(info.language)) // idioma ISO 639-2/T
-                    u16(0)
-                }
-                fullBox("hdlr", 0, 0) {
-                    u32(0)
-                    fourcc(if (info is TrackInfo.Video) "vide" else "soun")
-                    u32(0); u32(0); u32(0)
-                    bytes("Kotmpeg".toByteArray(Charsets.US_ASCII)); u8(0) // null-terminated name
-                }
-                box("minf") {
-                    if (info is TrackInfo.Video) {
-                        fullBox("vmhd", 0, 1) { u16(0); u16(0); u16(0); u16(0) }
-                    } else {
-                        fullBox("smhd", 0, 0) { u16(0); u16(0) }
-                    }
-                    box("dinf") {
-                        fullBox("dref", 0, 0) {
-                            u32(1)
-                            fullBox("url ", 0, 1) {} // autocontenido
-                        }
-                    }
-                    writeStbl(this, t, tab, offsetDelta)
-                }
-            }
-            writeTrackName(this, info)
-        }
-    }
-
-    /**
-     * Nombre legible de la pista, en `udta` > `name` dentro del `trak`.
-     *
-     * No vale el texto del `hdlr`: ese es el nombre del *manejador* —sale «Kotmpeg» en todas las
-     * pistas— y ningún reproductor lo usa para distinguirlas. Con varias pistas del mismo tipo,
-     * esto es lo único que permite saber cuál es cuál.
-     */
-    private fun writeTrackName(parent: BoxBuilder, info: TrackInfo) {
-        val name = info.name ?: return
-        parent.box("udta") {
-            box("name") {
-                bytes(name.toByteArray(Charsets.UTF_8))
-            }
-        }
+        return moov
     }
 
     /**
@@ -554,18 +663,22 @@ public class Mp4Muxer internal constructor(
      *
      * Estaba resuelta solo la primera, y la segunda arrancaba en la primera muestra sin saltar
      * nada. El cebado se suma a `media_time` en ticks **del medio** (no de la película) y se resta
-     * de la duración del segmento, para que la edición no se salga del final del medio.
+     * de la duración del segmento, para que la edición no se salga del final del medio. Es el de
+     * `AudioPriming`, el mismo que declara `MkvMuxer`: en Opus, el `preSkip` de su `OpusHead`.
+     *
+     * Las dos entradas suman la duración del `tkhd` ([trackDurationTicks]): el segmento real es lo
+     * que queda de ella tras el hueco, y no una duración redondeada por su cuenta, que con un
+     * desfase de arranque de milisegundos no enteros podía sumar uno de más o de menos.
      */
     private fun writeEdts(parent: BoxBuilder, t: TrackState, tab: TrackTables) {
-        val primingTicks = primingTicks(t)
-        val primingUs = if (primingTicks > 0) (t.info as TrackInfo.Audio).codecDelayUs else 0L
+        val primingTicks = t.primingTicks
         val needsShift = tab.earliestPts > 0
         val needsDelay = tab.startOffsetUs > 0
         if (!needsShift && !needsDelay && primingTicks <= 0) return
 
         val mediaTime = tab.earliestPts + primingTicks
-        val delayTicks = toMovieTicks(tab.startOffsetUs)
-        val durationTicks = toMovieTicks((tab.presentationDurationUs - primingUs).coerceAtLeast(0L))
+        val delayTicks = MovieBoxes.toMovieTicks(tab.startOffsetUs)
+        val durationTicks = trackDurationTicks(t, tab) - delayTicks
         val version = if (
             versionFor(durationTicks) == 1 ||
             (needsDelay && versionFor(delayTicks) == 1) ||
@@ -594,118 +707,95 @@ public class Mp4Muxer internal constructor(
     }
 
     /**
-     * Cebado de la pista en ticks de su propia escala, redondeando: a 48 kHz los 21 333 µs de un
-     * AAC-LC son 1023,98 muestras, y truncar dejaría el `initial_padding` una muestra corto.
+     * La tabla de muestras de la pista. Solo los offsets de chunk dependen de [offsetDelta], lo que
+     * se desplazan los datos cuando el `moov` va delante; todo lo demás sale ya calculado de [tab].
      */
-    private fun primingTicks(t: TrackState): Long {
-        val info = t.info
-        if (info !is TrackInfo.Audio || info.codecDelayUs <= 0) return 0L
-        return Timestamps.rescaleRounded(info.codecDelayUs, t.timescale, 1_000_000)
-    }
-
     private fun writeStbl(parent: BoxBuilder, t: TrackState, tab: TrackTables, offsetDelta: Long) {
-        val samples = t.samples
         parent.box("stbl") {
             fullBox("stsd", 0, 0) {
-                u32(1)
-                when (val info = t.info) {
-                    is TrackInfo.Video -> SampleEntries.writeVisual(this, info)
-                    is TrackInfo.Audio -> SampleEntries.writeAudio(this, info)
-                }
+                u32(1)                               // entry_count
+                bytes(t.sampleEntry)
             }
+            writeRuns(this, "stts", tab.stts)
+            tab.ctts?.let { writeRuns(this, "ctts", it) }
+            writeStss(this, t.samples, tab.keyCount)
+            writeStsc(this, tab.chunkStarts, t.samples.size, tab.stscEntries)
+            writeStsz(this, t.samples)
+            writeChunkOffsets(this, t.samples, tab.chunkStarts, offsetDelta)
+        }
+    }
 
-            val sttsRuns = runLengths(tab.sttsDeltas)
-            fullBox("stts", 0, 0) {
-                u32(sttsRuns.size)
-                for (r in 0 until sttsRuns.size) { u32(sttsRuns.count(r)); u32(sttsRuns.value(r)) }
+    /** `stts` o `ctts` (versión 0): las dos son series de (número de muestras, valor). */
+    private fun writeRuns(parent: BoxBuilder, type: String, runs: Runs) {
+        parent.fullBox(type, 0, 0) {
+            u32(runs.size)                           // entry_count
+            for (r in 0 until runs.size) { u32(runs.count(r)); u32(runs.value(r)) } // sample_count, sample_delta/offset
+        }
+    }
+
+    /** `stss` con las muestras de sincronización; si lo son todas, no se escribe. */
+    private fun writeStss(parent: BoxBuilder, samples: SampleTable, keyCount: Int) {
+        if (keyCount == samples.size) return
+        parent.fullBox("stss", 0, 0) {
+            u32(keyCount)                            // entry_count
+            for (s in 0 until samples.size) if (samples.isKey(s)) u32(s + 1)
+        }
+    }
+
+    /** `stsc`: una entrada cada vez que cambia el número de muestras por chunk ([entries], de [stscEntries]). */
+    private fun writeStsc(parent: BoxBuilder, chunkStarts: IntArray, sampleCount: Int, entries: Int) {
+        parent.fullBox("stsc", 0, 0) {
+            u32(entries)                             // entry_count
+            forEachStscEntry(chunkStarts, sampleCount) { chunk, samples ->
+                u32(chunk + 1); u32(samples); u32(1) // first_chunk, samples_per_chunk, sample_description_index
             }
+        }
+    }
 
-            if (tab.cttsTicks.any { it != 0L }) {
-                val cttsRuns = runLengths(tab.cttsTicks)
-                fullBox("ctts", 0, 0) {
-                    u32(cttsRuns.size)
-                    for (r in 0 until cttsRuns.size) { u32(cttsRuns.count(r)); u32(cttsRuns.value(r)) }
-                }
+    /** Las entradas del `stsc` de una pista con estos chunks, sin escribirlas. */
+    private fun stscEntries(chunkStarts: IntArray, sampleCount: Int): Int {
+        var entries = 0
+        forEachStscEntry(chunkStarts, sampleCount) { _, _ -> entries++ }
+        return entries
+    }
+
+    /** Para cada chunk en que cambia el número de muestras por chunk, su índice y ese número. */
+    private inline fun forEachStscEntry(chunkStarts: IntArray, sampleCount: Int, action: (chunk: Int, samples: Int) -> Unit) {
+        var previous = -1
+        for (c in chunkStarts.indices) {
+            val samples = (if (c + 1 < chunkStarts.size) chunkStarts[c + 1] else sampleCount) - chunkStarts[c]
+            if (c == 0 || samples != previous) action(c, samples)
+            previous = samples
+        }
+    }
+
+    private fun writeStsz(parent: BoxBuilder, samples: SampleTable) {
+        parent.fullBox("stsz", 0, 0) {
+            u32(0)                                   // sample_size: no constante
+            u32(samples.size)                        // sample_count
+            for (s in 0 until samples.size) u32(samples.size(s))
+        }
+    }
+
+    /** `stco`, o `co64` si [useCo64]: el offset de cada chunk, desplazado [offsetDelta]. */
+    private fun writeChunkOffsets(parent: BoxBuilder, samples: SampleTable, chunkStarts: IntArray, offsetDelta: Long) {
+        if (useCo64) {
+            parent.fullBox("co64", 0, 0) {
+                u32(chunkStarts.size)                // entry_count
+                for (first in chunkStarts) u64(samples.offset(first) + offsetDelta)
             }
-
-            var keyCount = 0
-            for (s in 0 until samples.size) if (samples.isKey(s)) keyCount++
-            if (keyCount < samples.size) {
-                fullBox("stss", 0, 0) {
-                    u32(keyCount)
-                    for (s in 0 until samples.size) if (samples.isKey(s)) u32(s + 1)
-                }
-            }
-
-            val chunkFirstSample = IntArray(samples.size)
-            val chunkSampleCount = IntArray(samples.size)
-            var chunkCount = 0
-            var i = 0
-            while (i < samples.size) {
-                var j = i
-                var end = samples.offset(j) + samples.size(j)
-                while (j + 1 < samples.size && samples.offset(j + 1) == end) {
-                    j++
-                    end = samples.offset(j) + samples.size(j)
-                }
-                chunkFirstSample[chunkCount] = i
-                chunkSampleCount[chunkCount] = j - i + 1
-                chunkCount++
-                i = j + 1
-            }
-
-            fullBox("stsc", 0, 0) {
-                var entries = 0
-                for (c in 0 until chunkCount) {
-                    if (c == 0 || chunkSampleCount[c] != chunkSampleCount[c - 1]) entries++
-                }
-                u32(entries)
-                for (c in 0 until chunkCount) {
-                    if (c == 0 || chunkSampleCount[c] != chunkSampleCount[c - 1]) {
-                        u32(c + 1); u32(chunkSampleCount[c]); u32(1) // first_chunk, samples_per_chunk, sample_description_index
-                    }
-                }
-            }
-
-            fullBox("stsz", 0, 0) {
-                u32(0)                               // sample_size: no constante
-                u32(samples.size)
-                for (s in 0 until samples.size) u32(samples.size(s))
-            }
-
-            if (useCo64) {
-                fullBox("co64", 0, 0) {
-                    u32(chunkCount)
-                    for (c in 0 until chunkCount) u64(samples.offset(chunkFirstSample[c]) + offsetDelta)
-                }
-            } else {
-                fullBox("stco", 0, 0) {
-                    u32(chunkCount)
-                    for (c in 0 until chunkCount) u32(samples.offset(chunkFirstSample[c]) + offsetDelta)
-                }
+        } else {
+            parent.fullBox("stco", 0, 0) {
+                u32(chunkStarts.size)                // entry_count
+                for (first in chunkStarts) u32(samples.offset(first) + offsetDelta)
             }
         }
     }
 
     /** Series de valores repetidos consecutivos, en arrays primitivos y sin un `Pair` por serie. */
-    private class Runs(private val counts: LongArray, private val values: LongArray, val size: Int) {
-        fun count(i: Int): Long = counts[i]
+    private class Runs(private val counts: IntArray, private val values: LongArray) {
+        val size: Int get() = counts.size
+        fun count(i: Int): Int = counts[i]
         fun value(i: Int): Long = values[i]
-    }
-
-    private fun runLengths(values: LongArray): Runs {
-        val counts = LongArray(values.size)
-        val runValues = LongArray(values.size)
-        var runs = 0
-        for (v in values) {
-            if (runs > 0 && runValues[runs - 1] == v) {
-                counts[runs - 1]++
-            } else {
-                runValues[runs] = v
-                counts[runs] = 1
-                runs++
-            }
-        }
-        return Runs(counts, runValues, runs)
     }
 }

@@ -30,11 +30,18 @@ Interesa sobre todo cualquier archivo MKV o MP4 —manipulado o simplemente corr
 - una lectura fuera de los límites del archivo;
 - una excepción no tipada donde debería haber un fin de stream limpio;
 - un bloque comprimido de Matroska que descomprima de forma desproporcionada (el techo es de
-  64 MiB por fotograma).
+  64 MiB por fotograma y también por bloque, con 8 codificaciones encadenadas y 4 KiB de cabecera
+  eliminada como mucho).
+
+Desde la `4.1.0` hay además topes de cardinalidad, todos con aviso por `onWarning`: 256 pistas y
+2¹⁹ puntos de índice en MKV; 64 pistas de audio y vídeo, 2²⁰ muestras por `trun` y, en total, no
+más muestras que el doble de bytes del archivo ni más de 2²⁶ en MP4. Un archivo que haga reservar
+memoria o tiempo de CPU desproporcionados sin pasar de esos topes también es un reporte útil.
 
 La política declarada es que un archivo dañado produzca **un error claro o un fin de stream**, nunca
-un cuelgue ni un consumo sin control. Hay cuatro suites dedicadas a esto —`RobustnessTest`,
-`UntrustedTableSizesTest`, `LargeFileEdgeCasesTest` y `Mp4HeaderHardeningTest`—, y
+un cuelgue ni un consumo sin control. Hay varias suites dedicadas a esto —`RobustnessTest`,
+`UntrustedTableSizesTest`, `LargeFileEdgeCasesTest`, `Mp4HeaderHardeningTest` y, desde la `4.1.0`,
+`MkvReadHardeningTest`, `MkvReadRobustnessTest` y `Mp4ReadHardeningTest`—, y
 `MatroskaContentEncodingTest` cubre los bloques comprimidos de Matroska: dañados, con una
 codificación que no se soporta o que pasan del techo de descompresión; un caso que las burle es un
 reporte útil.
@@ -47,6 +54,16 @@ sin `Error`, sin dejar el archivo abierto y sin reservar memoria desproporcionad
 ejecución de los tests con una pasada fija, y cada semana en el CI con una campaña larga y semilla
 nueva. Cada fallo que ha encontrado queda fijado por un test que reconstruye la entrada que lo
 provocaba.
+
+Desde la `4.1.0`, `Kotmpeg.repair` **escribe** en archivos que el usuario elige, así que su
+política es más estricta: un archivo que no reconoce se rechaza con `IllegalArgumentException`
+**sin modificar ni un byte**, porque todas las comprobaciones se hacen antes de la primera
+escritura. `InterruptedRecordingTest` se lo comprueba con cientos de variantes mutadas de
+grabaciones cortadas —y que la que se leía antes de repararla se sigue leyendo después—, la
+campaña semanal de fuzzing incluye `repair`, y `MkvWriteRepairTest` y `Fmp4RepairTest` cortan la
+propia reparación en cada operación y la relanzan. Un archivo que se leía antes de repararlo y no
+después, que `repair` rechace después de haberlo tocado, o que una reparación interrumpida deje sin
+arreglo, es un reporte útil.
 
 Si encuentras un archivo que la incumpla, puedes comprobarlo antes de reportar con una campaña
 local (los detalles, en el [README](README.md#fuzzing)); el archivo que deja en `build/fuzz-findings/`

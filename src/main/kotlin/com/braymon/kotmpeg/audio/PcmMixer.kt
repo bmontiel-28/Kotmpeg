@@ -25,10 +25,18 @@ public object PcmMixer {
      * cada muestra a `double` ni desempaquetar un `Float` por muestra y fuente, que es lo que
      * pesaba en el hilo de captura. Con ganancias distintas se conserva la aritmética de siempre,
      * producto en `float` y acumulación en `double`, para que la salida no cambie ni en un bit.
+     *
+     * Las ganancias tienen que ser finitas, que `PcmStreamMixer.addSource` ya lo exigía: un `NaN`
+     * convertía la mezcla entera en silencio y un infinito la saturaba, sin ningún error, y hasta la
+     * 4.0 se aceptaban. Una ganancia negativa sí vale: invierte la fase de esa fuente. Se comprueban
+     * con un bucle por índice, que no reserva nada: esto corre en el hilo de captura.
      */
     public fun mix(sources: List<ShortArray>, gains: List<Float>? = null): ShortArray {
         require(sources.isNotEmpty()) { "sin fuentes" }
-        if (gains != null) require(gains.size == sources.size) { "gains y sources no coinciden en tamaño" }
+        if (gains != null) {
+            require(gains.size == sources.size) { "gains y sources no coinciden en tamaño" }
+            for (i in gains.indices) require(gains[i].isFinite()) { "ganancia inválida en la fuente $i: ${gains[i]}" }
+        }
         val inputs = sources.toTypedArray()
         var length = 0
         for (input in inputs) length = maxOf(length, input.size)

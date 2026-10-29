@@ -48,8 +48,12 @@ public enum class ContainerFormat {
          * Hasta la 3.x se trataba como MKV y salía un archivo con extensión `.webm`, cabecera
          * `matroska` y códecs que un navegador no reproduce. Leer un WebM sí se puede: el
          * demuxer detecta el contenedor por su contenido, no por la extensión.
+         *
+         * Un nombre sin punto no tiene extensión y devuelve `null`. Hasta la 4.0 un archivo llamado
+         * `mp4` o `mkv` a secas se tomaba por ese formato: sin punto, el nombre entero hacía de
+         * extensión.
          */
-        public fun fromFileName(name: String): ContainerFormat? = when (name.substringAfterLast('.').lowercase()) {
+        public fun fromFileName(name: String): ContainerFormat? = when (name.substringAfterLast('.', "").lowercase()) {
             "mkv" -> MKV
             "mp4", "m4a", "m4v", "mov" -> MP4
             else -> null

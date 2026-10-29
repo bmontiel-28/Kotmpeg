@@ -16,10 +16,21 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# El workflow solo lee el repositorio: compila, prueba y sube artefactos. Sin esto, el token del job
+# tiene los permisos por defecto del repositorio, que pueden incluir escribir en él.
+permissions:
+  contents: read
+
 jobs:
   jvm:
     name: Tests y publicación
-    runs-on: ubuntu-latest
+    # Fijado y no `ubuntu-latest`: el FFmpeg que valida la salida viene del apt de la imagen, y con
+    # la imagen cambia de versión —y con ella sus avisos y el redondeo de sus duraciones— sin que
+    # cambie nada del repositorio. Con 24.04 es FFmpeg 6.1. Subirlo es un commit deliberado.
+    runs-on: ubuntu-24.04
+    # La suite tarda unos minutos; un job que pasa de media hora está colgado, y así lo dice en vez
+    # de consumir las seis horas que GitHub concede por defecto.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -58,10 +69,15 @@ jobs:
 
       # Sin ffmpeg los tests de integración end-to-end se omiten en silencio (assumeTrue), así que
       # el CI pasaría sin ejecutar justo la cobertura que valida la salida real contra un
-      # decodificador de verdad. Los tres que leen /proc/self/fd sí corren aquí, y solo aquí: en
-      # Windows y macOS no hay dónde mirar.
+      # decodificador de verdad. Los tests que buscan descriptores abiertos con `OpenFiles` miden aquí
+      # leyendo /proc/self/fd; en Windows miden de otra forma —un archivo abierto no se deja
+      # renombrar— y solo en macOS se omiten. No se cuentan: cada test nuevo dejaba la cifra vieja.
+      # La versión queda en el registro: un aviso nuevo de FFmpeg en un test se entiende antes si se
+      # ve en qué versión salió.
       - name: FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          ffmpeg -version
 
       - uses: gradle/actions/setup-gradle@v4
 
@@ -105,7 +121,9 @@ jobs:
   # compartido varían más que cualquier regresión que importe.
   benchmarks:
     name: Benchmarks
-    runs-on: ubuntu-latest
+    # La misma imagen que los tests, para que los dos jobs midan sobre el mismo sistema.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

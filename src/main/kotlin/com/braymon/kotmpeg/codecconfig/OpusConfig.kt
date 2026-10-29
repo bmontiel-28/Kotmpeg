@@ -34,6 +34,13 @@ public object OpusConfig {
         public val codecDelayUs: Long get() = preSkip * 1_000_000L / 48000L
     }
 
+    /**
+     * Construye una cabecera `OpusHead` (RFC 7845, 5.1).
+     *
+     * Con la familia de mapeo 0 la tabla de canales **debe** omitirse, y pasarla se rechaza en vez
+     * de ignorarla: se escribía detrás de la cabecera y salía una `OpusHead` más larga de lo que su
+     * familia permite, y quien la pasa espera que se use, así que callarla solo escondería el error.
+     */
     public fun buildOpusHead(
         channelCount: Int,
         preSkip: Int = 312,
@@ -41,14 +48,16 @@ public object OpusConfig {
         outputGain: Int = 0,
         /** Familia de mapeo de canales: 0 para mono/estéreo, 1 para 5.1/7.1 (Vorbis). */
         mappingFamily: Int = 0,
-        /** `[streamCount, coupledCount, mapping...]`, obligatorio si [mappingFamily] != 0. */
+        /** `[streamCount, coupledCount, mapping...]`, obligatorio si [mappingFamily] != 0 y prohibido con la 0. */
         channelMapping: ByteArray? = null,
     ): ByteArray {
         require(channelCount in 1..255) { "channelCount inválido: $channelCount" }
         require(!(mappingFamily == 0 && channelCount > 2)) {
             "la familia de mapeo 0 solo admite 1-2 canales"
         }
-        if (mappingFamily != 0) {
+        if (mappingFamily == 0) {
+            require(channelMapping == null) { "la familia de mapeo 0 no lleva tabla de canales (RFC 7845)" }
+        } else {
             requireNotNull(channelMapping) { "la familia de mapeo $mappingFamily requiere tabla de canales" }
             require(channelMapping.size == 2 + channelCount) {
                 "la tabla de mapeo debe tener 2 + $channelCount bytes"

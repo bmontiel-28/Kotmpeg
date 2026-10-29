@@ -117,6 +117,9 @@ class WarningChannelTest {
      * Un índice `Cues` roto solo quita la búsqueda rápida: el archivo se lee entero y se puede
      * buscar. Hasta la 3.x eso pasaba **en silencio**, y unas búsquedas de repente lentas no
      * tenían explicación.
+     *
+     * Se rompe el primer `CuePoint`, que va detrás del `Void` corto que deja cada ampliación del
+     * índice en su reserva (ver `MkvLayout`).
      */
     @Test
     fun `an unreadable cues index is reported and the file still reads and seeks`() {
@@ -127,10 +130,10 @@ class WarningChannelTest {
             repeat(90) { i -> muxer.writePacket(MediaPacket(vid, payload(i), i * 40_000L, i * 40_000L, i % 30 == 0)) }
         }
         val bytes = file.readBytes()
-        val cuesId = byteArrayOf(0x1C, 0x53, 0xBB.toByte(), 0x6B)
-        val cues = (bytes.size - 4 downTo 0).first { at -> cuesId.indices.all { bytes[at + it] == cuesId[it] } }
+        val cues = cuesIdPositions(bytes).last()
         val sizeLength = Integer.numberOfLeadingZeros(bytes[cues + 4].toInt() and 0xFF) - 23
-        val firstPoint = cues + 4 + sizeLength
+        var firstPoint = cues + 4 + sizeLength
+        while (bytes[firstPoint] == 0xEC.toByte()) firstPoint += 2 + (bytes[firstPoint + 1].toInt() and 0x7F)
         assertEquals(0xBB.toByte(), bytes[firstPoint], "el índice no empieza por un CuePoint")
         bytes[firstPoint + 1] = 0xFF.toByte()
         val broken = File(dir, "indice-roto.mkv").also { it.writeBytes(bytes) }

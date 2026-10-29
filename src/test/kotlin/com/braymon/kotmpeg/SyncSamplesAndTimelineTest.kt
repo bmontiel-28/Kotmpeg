@@ -41,6 +41,9 @@ import kotlin.test.assertTrue
  * Dos más salieron al validar con grabaciones reales (3.1.0): una pausa entre un B-frame y su
  * referencia, que dejaba ese B-frame decodificándose segundos después de mostrarse, y el cebado del
  * audio en un fMP4, que el demuxer no aplicaba.
+ *
+ * Y uno de la 4.1.0, al reempaquetar en fMP4 una de esas grabaciones ya pasada a fMP4: la duración
+ * del último paquete de cada fragmento mandaba sobre el PTS del keyframe siguiente.
  */
 class SyncSamplesAndTimelineTest {
 
@@ -229,6 +232,58 @@ class SyncSamplesAndTimelineTest {
             }
             val held = frames.first { abs(it.ptsUs - shownAt(19)) <= ONE_VIDEO_TICK_US }
             assertTrue(held.durationUs >= pause, "la pausa tiene que quedar en el B-frame retenido, que dura ${held.durationUs} µs")
+        }
+    }
+
+    /**
+     * Reempaquetar en fMP4 un fMP4 de la propia librería tiene que dejar los mismos tiempos. Cada GOP
+     * acaba, en orden de decodificación, en un B-frame mostrado justo antes de una pausa, así que el
+     * fMP4 le da a ese B-frame la pausa como duración (el caso de arriba). Al releerlo, el paquete
+     * trae esa duración, y hasta la 4.0 mandaba sobre el PTS del keyframe siguiente para el último
+     * hueco del fragmento, el que empieza en la referencia mostrada tras la pausa: el fragmento
+     * acababa una pausa después de que empezara a mostrarse el keyframe, y cada remux retrasaba
+     * otra pausa la decodificación de todo lo que venía detrás. En el último fragmento, sin keyframe
+     * siguiente, esa duración se contaba desde la referencia y no desde el B-frame, y el archivo
+     * crecía una pausa en cada pasada.
+     *
+     * Los tiempos caen en tics exactos de 90 kHz, como los de cualquier MP4 releído, para comparar
+     * sin redondeos.
+     */
+    @Test
+    fun `remuxing an fmp4 with b-frames held across pauses into fmp4 keeps every timestamp`() {
+        val frame = 20_000L
+        val pause = 2_000_000L
+        val gop = 29
+        fun shownAt(index: Int): Long = index * frame + (index + 1) / gop * pause
+        val gen1 = File(dir, "gen1.mp4")
+        FragmentedMp4Muxer(gen1).use { muxer ->
+            val video = muxer.addTrack(videoTrack())
+            muxer.start()
+            for (first in 0 until 3 * gop step gop) {
+                val order = arrayListOf(first)
+                for (reference in first + 2 until first + gop step 2) order += listOf(reference, reference - 1)
+                for (index in order) {
+                    val payload = NalUnits.joinLengthPrefixed(listOf(byteArrayOf(0x41, index.toByte())))
+                    muxer.writePacket(MediaPacket(video, payload, ptsUs = shownAt(index), isKeyFrame = index == first))
+                }
+            }
+        }
+        val gen2 = File(dir, "gen2.mp4").also { Kotmpeg.remux(gen1, it) { fragmented = true } }
+        val gen3 = File(dir, "gen3.mp4").also { Kotmpeg.remux(gen2, it) { fragmented = true } }
+
+        val original = readAll(gen1)
+        assertEquals(3 * gop, original.size)
+        assertTrue(original.filter { it.isKeyFrame }.all { it.dtsUs == it.ptsUs }, "el fMP4 de partida ya decodifica tarde un keyframe")
+        val durationUs = Kotmpeg.openDemuxer(gen1).use { it.durationUs }
+        for (copy in listOf(gen2, gen3)) {
+            val packets = readAll(copy)
+            assertEquals(original.size, packets.size, "${copy.name}: paquetes perdidos")
+            for ((before, after) in original.zip(packets)) {
+                assertEquals(before.ptsUs, after.ptsUs, "${copy.name}: el PTS cambió")
+                assertEquals(before.dtsUs, after.dtsUs, "${copy.name}: el fotograma de ${before.ptsUs} µs se decodifica en ${after.dtsUs} µs")
+                assertEquals(before.durationUs, after.durationUs, "${copy.name}: la duración del fotograma de ${before.ptsUs} µs cambió")
+            }
+            assertEquals(durationUs, Kotmpeg.openDemuxer(copy).use { it.durationUs }, "${copy.name}: la duración del archivo cambió")
         }
     }
 

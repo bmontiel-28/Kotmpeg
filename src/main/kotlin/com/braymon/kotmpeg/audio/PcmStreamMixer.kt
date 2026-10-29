@@ -51,8 +51,10 @@ package com.braymon.kotmpeg.audio
  *
  * **Es seguro entre hilos**, a diferencia de [PcmResampler]: escribir cada fuente desde su hilo y
  * leer desde el del codificador es justo el caso para el que existe. Cada operación toma un único
- * cerrojo y solo copia arrays. Los arrays que se le pasan se copian: se pueden reutilizar en cuanto
- * [write] vuelve.
+ * cerrojo, y dentro de él [write] además remuestrea y convierte los canales de su trozo —el
+ * remuestreador de cada fuente guarda estado y no admite dos hilos—, así que lo que retiene el
+ * cerrojo crece con el tamaño del trozo; [read] y [flush] mezclan lo pendiente. Los arrays que se le
+ * pasan se copian: se pueden reutilizar en cuanto [write] vuelve.
  */
 public class PcmStreamMixer(
     /** Frecuencia de la mezcla, en Hz. */
@@ -149,7 +151,7 @@ public class PcmStreamMixer(
         check(!finished) { "el mezclador ya se cerró con flush()" }
         seal()
         finished = true
-        for (s in sources) if (s.started) place(s, s.tailInOutputFormat())
+        for (s in sources) place(s, s.tailInOutputFormat())
         emit(sources.maxOf { it.frames }, countLosses = false)
     }
 
@@ -178,10 +180,17 @@ public class PcmStreamMixer(
      * caso, lo que caería antes de lo ya entregado se descarta y cuenta como perdido. Los trozos
      * siguientes pagan primero la deuda: el tiempo que se mezcló como silencio mientras la fuente
      * iba por detrás.
+     *
+     * Un trozo sin frames no es un primer trozo: un `write` vacío, o uno tan corto que el
+     * remuestreador aún no saca nada de él, no dice dónde empieza la fuente. Hasta la 4.0 la daba por
+     * empezada, y si la mezcla arrancaba antes de que llegara su audio, ese tiempo se le cobraba como
+     * deuda y su primer trozo de verdad se descartaba en vez de colocarse donde llegaba. Por lo mismo
+     * [flush] puede colocar aquí la cola del remuestreador de una fuente que no llegó a empezar.
      */
     private fun place(s: Source, audio: ShortArray) {
         val frames = audio.size / outputChannels
         if (!s.started) {
+            if (frames == 0) return
             s.started = true
             if (emitted > 0) {
                 val leaderEnd = sources.maxOf { it.frames }

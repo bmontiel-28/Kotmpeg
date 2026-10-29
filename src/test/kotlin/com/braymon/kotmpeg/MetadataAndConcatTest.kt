@@ -1,7 +1,5 @@
 package com.braymon.kotmpeg
 
-import com.braymon.kotmpeg.audio.PcmMixer
-import com.braymon.kotmpeg.audio.PcmResampler
 import com.braymon.kotmpeg.codecconfig.AacConfig
 import com.braymon.kotmpeg.codecconfig.NalUnits
 import com.braymon.kotmpeg.model.AudioCodec
@@ -200,6 +198,18 @@ class MetadataAndConcatTest {
      * sincronía no se pierde: en la salida, el primer fotograma y el primer paquete de audio de la
      * segunda entrada empiezan en el mismo instante, como en su original, y el cebado declarado es
      * el de la primera.
+     *
+     * El mismo instante, hasta lo que deja ver la escala de cada pista: en MP4 el vídeo redondea a
+     * 90 kHz y el audio a 48 kHz, así que si la unión no cae en un tic común los dos se releen a
+     * menos de un tic de audio. La primera entrada acaba con el audio, en 1 002 651 µs. Hasta la 4.0
+     * su `mvhd` contaba el cebado redondeado al milisegundo, 1 003 000 µs, y la unión caía siempre en
+     * un tic común; ahora el `mvhd` es la suma de las ediciones, que lo descuentan, y la unión cae
+     * justo donde acaba el último paquete.
+     *
+     * Que vídeo y audio de la segunda entrada coincidan no basta: coincidirían igual con la unión
+     * desplazada cualquier cantidad. Lo que fija el silencio de la unión es que la segunda entrada
+     * empiece justo donde acaba el audio de la primera —su último paquete más las 1 024 muestras que
+     * dura—, a un tic de la escala de la salida: el de audio en MP4 y el milisegundo en MKV.
      */
     @Test
     fun `concat keeps each segment's audio aligned with its video`() {
@@ -226,7 +236,18 @@ class MetadataAndConcatTest {
                 val packets = generateSequence { demuxer.readPacket() }.toList()
                 val video = packets.filter { it.trackId == videoId }.map { it.ptsUs }.sorted()
                 val audio = packets.filter { it.trackId == audioId }.map { it.ptsUs }
-                assertEquals(video[30], audio[47], "$extension: la segunda entrada empieza desalineada")
+                val audioTickUs = 1_000_000L / 48_000 + 1
+                val toleranceUs = if (extension == "mp4") audioTickUs else 0L
+                assertTrue(
+                    abs(video[30] - audio[47]) <= toleranceUs,
+                    "$extension: la segunda entrada empieza desalineada: vídeo en ${video[30]} µs, audio en ${audio[47]} µs",
+                )
+                val firstAudioEndUs = audio[46] + 21_333
+                val tickUs = if (extension == "mp4") audioTickUs else 1_000L
+                assertTrue(
+                    abs(video[30] - firstAudioEndUs) <= tickUs,
+                    "$extension: la segunda entrada empieza en ${video[30]} µs y el audio de la primera acaba en $firstAudioEndUs µs",
+                )
             }
         }
     }
@@ -275,69 +296,5 @@ class MetadataAndConcatTest {
         val demuxer = Kotmpeg.openDemuxer(out)
         assertTrue(demuxer.durationUs > 2_000_000, "joined duration ${demuxer.durationUs}")
         demuxer.close()
-    }
-}
-
-class AudioDspTest {
-
-    @Test
-    fun `resampler converges to expected length and preserves a sine`() {
-        val inRate = 44100
-        val outRate = 48000
-        val resampler = PcmResampler(inRate, outRate, channels = 1)
-        val freq = 440.0
-        var produced = 0
-        var maxError = 0.0
-        var inputFrames = 0
-        var t = 0
-        while (t < inRate) {
-            val chunk = minOf(997, inRate - t)
-            val input = ShortArray(chunk) { i ->
-                (Math.sin(2 * Math.PI * freq * (t + i) / inRate) * 16000).toInt().toShort()
-            }
-            val out = resampler.resample(input)
-            for ((k, sample) in out.withIndex()) {
-                val outIndex = produced + k
-                val expected = Math.sin(2 * Math.PI * freq * outIndex / outRate) * 16000
-                maxError = maxOf(maxError, Math.abs(sample - expected))
-            }
-            produced += out.size
-            t += chunk
-            inputFrames += chunk
-        }
-        val expectedFrames = inputFrames.toLong() * outRate / inRate
-        assertTrue(Math.abs(produced - expectedFrames) <= 2, "length $produced vs $expectedFrames")
-        assertTrue(maxError < 320, "max error $maxError")
-    }
-
-    @Test
-    fun `passthrough resampler returns input`() {
-        val resampler = PcmResampler(48000, 48000, 2)
-        val input = ShortArray(96) { it.toShort() }
-        assertTrue(resampler.resample(input) === input)
-    }
-
-    @Test
-    fun `mixer saturates and applies gains`() {
-        val a = shortArrayOf(30000, -30000, 100)
-        val b = shortArrayOf(10000, -10000, 50)
-        val mixed = PcmMixer.mix(listOf(a, b))
-        assertEquals(32767, mixed[0].toInt())
-        assertEquals(-32768, mixed[1].toInt())
-        assertEquals(150, mixed[2].toInt())
-        val gained = PcmMixer.mix(listOf(a, b), gains = listOf(0.5f, 0.5f))
-        assertEquals(20000, gained[0].toInt())
-        val uneven = PcmMixer.mix(listOf(shortArrayOf(10), shortArrayOf(1, 2, 3)))
-        assertEquals(11, uneven[0].toInt())
-        assertEquals(2, uneven[1].toInt())
-    }
-
-    @Test
-    fun `channel conversion`() {
-        val stereo = shortArrayOf(100, 200, -50, 50)
-        assertTrue(PcmMixer.stereoToMono(stereo).contentEquals(shortArrayOf(150, 0)))
-        assertTrue(PcmMixer.monoToStereo(shortArrayOf(7)).contentEquals(shortArrayOf(7, 7)))
-        val same = shortArrayOf(1, 2)
-        assertTrue(PcmMixer.convertChannels(same, 2, 2) === same)
     }
 }

@@ -156,12 +156,9 @@ class RobustnessTest {
     fun `mkv seeks by scanning clusters when the file has no cue index`() {
         val file = writeSample(File(dir, "seekable.mkv"), ContainerFormat.MKV, frames = 120)
         val bytes = file.readBytes()
-        val cuesId = byteArrayOf(0x1C, 0x53, 0xBB.toByte(), 0x6B)
-        var at = indexOf(bytes, cuesId)
-        assertTrue(at > 0)
-        bytes[at + 3] = 0x6A
+        assertTrue(cuesIdPositions(bytes).isNotEmpty(), "el archivo no tiene índice que quitar")
         val noCues = File(dir, "no-cues.mkv")
-        noCues.writeBytes(bytes)
+        noCues.writeBytes(withoutCuesIndex(bytes))
 
         Kotmpeg.openDemuxer(noCues).use { demuxer ->
             val target = 2_000_000L

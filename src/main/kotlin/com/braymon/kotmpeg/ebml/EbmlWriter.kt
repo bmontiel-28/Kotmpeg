@@ -8,14 +8,6 @@ import java.io.ByteArrayOutputStream
  */
 internal class EbmlWriter(val out: SeekableOutput) {
 
-    /** Bytes que ocupa un id de elemento (el bit marcador forma parte del id). */
-    private fun idLength(id: Long): Int = when {
-        id <= 0xFF -> 1
-        id <= 0xFFFF -> 2
-        id <= 0xFFFFFF -> 3
-        else -> 4
-    }
-
     fun writeId(id: Long) {
         out.writeUInt(id, idLength(id))
     }
@@ -131,19 +123,33 @@ internal class EbmlWriter(val out: SeekableOutput) {
             require(value >= 0 && value < (1L shl (7 * length)) - 1) {
                 "el tamaño $value no cabe en un vint de $length bytes"
             }
-            val bytes = ByteArray(length)
-            val v = (1L shl (7 * length)) or value
-            for (i in 0 until length) bytes[i] = ((v ushr (8 * (length - 1 - i))) and 0xFF).toByte()
-            return bytes
+            return bigEndian((1L shl (7 * length)) or value, length)
         }
 
         fun encodeUInt(value: Long): ByteArray {
             require(value >= 0) { "un uint EBML no puede ser negativo: $value" }
             var len = 1
             while (len < 8 && (value ushr (8 * len)) != 0L) len++
-            val bytes = ByteArray(len)
-            for (i in 0 until len) bytes[i] = ((value ushr (8 * (len - 1 - i))) and 0xFF).toByte()
-            return bytes
+            return bigEndian(value, len)
         }
+
+        /** Bytes que ocupa un id de elemento (el bit marcador forma parte del id). */
+        fun idLength(id: Long): Int = when {
+            id <= 0xFF -> 1
+            id <= 0xFFFF -> 2
+            id <= 0xFFFFFF -> 3
+            else -> 4
+        }
+
+        /** Un id de elemento tal como va en el archivo. */
+        fun idBytes(id: Long): ByteArray = bigEndian(id, idLength(id))
+
+        /**
+         * Los [count] bytes menos significativos de [value], big-endian: el orden de todos los
+         * enteros de EBML. Es la única versión, para los muxers y la reparación, de lo que antes
+         * estaba escrito a mano en cuatro sitios.
+         */
+        fun bigEndian(value: Long, count: Int): ByteArray =
+            ByteArray(count) { i -> (value ushr (8 * (count - 1 - i))).toByte() }
     }
 }

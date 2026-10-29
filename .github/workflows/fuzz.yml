@@ -1,13 +1,16 @@
 name: Fuzzing
 
-# Campaña larga de fuzzing sobre los dos demuxers. Va aparte del CI a propósito: usa una semilla
-# nueva en cada ejecución para explorar entradas que nunca se probaron, así que su resultado no es
-# reproducible de un push a otro, y un hallazgo no debe bloquear un commit que no lo causó. El CI
-# normal sí corre una pasada corta y fija del mismo test, que se comporta como cualquier otro.
+# Campaña larga de fuzzing sobre los dos demuxers y sobre `Kotmpeg.repair`, que escribe en archivos
+# que el usuario elige y tiene la política más estricta de `SECURITY.md`. Va aparte del CI a
+# propósito: usa una semilla nueva en cada ejecución para explorar entradas que nunca se probaron,
+# así que su resultado no es reproducible de un push a otro, y un hallazgo no debe bloquear un commit
+# que no lo causó. El CI normal sí corre una pasada corta y fija de los mismos tests, que se
+# comporta como cualquier otro.
 #
-# Un hallazgo deja la entrada exacta y su descripción en el artefacto `hallazgos-fuzzing`. Con la
-# semilla y la iteración del `.txt` se reproduce en local; una vez corregido, se fija con un test que
-# construya esa entrada (ver `DemuxerFuzzTest`): el repositorio no guarda archivos de vídeo.
+# Un hallazgo deja la entrada exacta en el artefacto `hallazgos-fuzzing`: la de los demuxers con un
+# `.txt` que da la semilla y la iteración, y la de `repair` con las dos en el nombre del archivo. Con
+# ellas se reproduce en local; una vez corregido, se fija con un test que construya esa entrada (ver
+# `DemuxerFuzzTest`): el repositorio no guarda archivos de vídeo.
 on:
   schedule:
     # Los lunes a las 04:17 UTC. Los flujos programados solo corren sobre la rama por defecto.
@@ -19,10 +22,15 @@ on:
         required: false
         default: "20"
 
+# Solo lee el repositorio y sube artefactos; el token no necesita más.
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     name: Campaña de fuzzing
-    runs-on: ubuntu-latest
+    # La misma imagen fija que el CI: las semillas de terceros salen del FFmpeg de su apt.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +50,12 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       # La duración llega por variable de entorno y se valida antes de usarla: interpolar la
-      # entrada del formulario dentro del script permitiría inyectar órdenes en él.
+      # entrada del formulario dentro del script permitiría inyectar órdenes en él. El tope deja
+      # margen dentro de los 120 minutos del job para instalar, compilar y generar las semillas: una
+      # campaña más larga moriría por el timeout sin llegar a guardar el resumen.
+      #
+      # Los dos fuzzers corren en la misma ejecución y cada uno dura `kotmpeg.fuzz.seconds`, así que
+      # los minutos pedidos se reparten a medias entre los demuxers y `repair`.
       - name: Fuzzing
         env:
           MINUTOS: ${{ inputs.minutos || '20' }}
@@ -51,9 +64,15 @@ jobs:
           case "$MINUTOS" in
             ''|*[!0-9]*) echo "::error::minutos tiene que ser un número entero: '$MINUTOS'"; exit 1 ;;
           esac
+          if [ "$MINUTOS" -lt 2 ] || [ "$MINUTOS" -gt 90 ]; then
+            echo "::error::minutos tiene que estar entre 2 y 90 (el job tiene un límite de 120): '$MINUTOS'"
+            exit 1
+          fi
           echo "Semilla base: $SEMILLA, $MINUTOS minutos"
-          ./gradlew test --tests '*DemuxerFuzzTest*' \
-            -Dkotmpeg.fuzz.seconds=$((MINUTOS * 60)) -Dkotmpeg.fuzz.seed="$SEMILLA"
+          ./gradlew test \
+            --tests '*DemuxerFuzzTest*' \
+            --tests 'com.braymon.kotmpeg.InterruptedRecordingTest.mutated*' \
+            -Dkotmpeg.fuzz.seconds=$((MINUTOS * 30)) -Dkotmpeg.fuzz.seed="$SEMILLA"
 
       - name: Resumen
         if: always()

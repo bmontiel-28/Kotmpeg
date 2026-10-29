@@ -80,7 +80,12 @@ public class SeekableOutput private constructor(
 
     /**
      * Escribe en un descriptor ya abierto (p. ej. `ParcelFileDescriptor.getFileDescriptor()`
-     * en modo `"rw"`). [close] cierra el descriptor.
+     * en modo `"rw"`).
+     *
+     * [close] cierra los canales que abre sobre el descriptor, pero el descriptor es de quien lo
+     * abrió: en Android `FileInputStream`/`FileOutputStream` no se adueñan de un `FileDescriptor`
+     * ajeno, así que el `ParcelFileDescriptor` hay que cerrarlo aparte (con `use`, como en el
+     * ejemplo de arriba).
      */
     public constructor(fd: FileDescriptor) : this(FileOutputStream(fd).channel, fd)
 
@@ -127,9 +132,24 @@ public class SeekableOutput private constructor(
     public fun writeInt32(value: Int): Unit = writeUInt(value.toLong() and 0xFFFFFFFFL, 4)
     public fun writeInt64(value: Long): Unit = writeUInt(value, 8)
 
-    /** Reescribe [data] en la posición absoluta [at] sin mover la posición de escritura. */
+    /**
+     * Reescribe [data] en la posición absoluta [at] sin mover la posición de escritura.
+     *
+     * Si esa zona sigue en el buffer, se reescribe ahí y no llega al archivo hasta el próximo
+     * vaciado, junto con lo demás. Si ya está en el archivo, antes se vacía el buffer: **todo lo
+     * escrito antes del parche llega al archivo antes que él**. Es lo que permite a `MkvMuxer`
+     * publicar un cluster en el índice sabiendo que el cluster ya está entero en el archivo.
+     *
+     * Hasta la 4.0 vaciaba el buffer siempre, y cerrar cada elemento de la cabecera de un MKV
+     * —que se hace parcheando su tamaño— era una escritura al sistema: la cabecera llegaba al
+     * archivo en decenas de trozos.
+     */
     public fun patch(at: Long, data: ByteArray) {
         require(at >= 0 && at + data.size <= position) { "patch fuera de la zona escrita" }
+        if (at >= flushedPosition) {
+            System.arraycopy(data, 0, buffer, (at - flushedPosition).toInt(), data.size)
+            return
+        }
         flush()
         writeAt(at, data, 0, data.size)
     }

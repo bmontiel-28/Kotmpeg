@@ -17,7 +17,6 @@ import com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
 import com.braymon.kotmpeg.mp4.Mp4Demuxer
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.util.concurrent.TimeUnit
 import java.util.zip.Deflater
 import kotlin.random.Random
 
@@ -45,23 +44,27 @@ internal object FuzzSeeds {
 
     class Seed(val name: String, val container: Container, val bytes: ByteArray)
 
-    /** Todas las semillas, escritas en [dir]: las de FFmpeg, si lo hay, y las de la librería. */
-    fun all(dir: File): List<Seed> {
-        dir.mkdirs()
-        val thirdParty = ffmpeg(dir)
-        return thirdParty + generated(dir, thirdParty)
+    @Volatile
+    private var cached: List<Seed>? = null
+
+    /**
+     * Todas las semillas: las de FFmpeg, si lo hay, y las de la librería.
+     *
+     * Se generan **una vez por JVM** y se guardan en memoria: cada test de `DemuxerFuzzTest` las
+     * pedía de nuevo, y cada vez eran seis codificaciones con FFmpeg. [dir] solo se usa en la primera
+     * llamada, para los archivos intermedios; después basta con los bytes, que nadie modifica
+     * —[FuzzMutator] y los truncados trabajan sobre copias—.
+     */
+    fun all(dir: File): List<Seed> = cached ?: synchronized(this) {
+        cached ?: run {
+            dir.mkdirs()
+            val thirdParty = ffmpeg(dir)
+            thirdParty + generated(dir, thirdParty)
+        }.also { cached = it }
     }
 
     /** Si hay un `ffmpeg` que se pueda ejecutar; sin él solo se usan las semillas de la librería. */
-    val ffmpegAvailable: Boolean by lazy {
-        runCatching { run(listOf("ffmpeg", "-version")) }.getOrDefault(false)
-    }
-
-    private fun run(command: List<String>): Boolean {
-        val process = ProcessBuilder(command).redirectErrorStream(true).start()
-        process.inputStream.readBytes()
-        return process.waitFor(120, TimeUnit.SECONDS) && process.exitValue() == 0
-    }
+    val ffmpegAvailable: Boolean get() = ffmpegInstalled
 
     /**
      * Medio segundo de vídeo de 64x48 y un tono, codificados con un solo hilo y sin metadatos de
@@ -98,8 +101,8 @@ internal object FuzzSeeds {
         )
         return recipes.mapNotNull { (name, codecs) ->
             val file = File(dir, name)
-            val ok = runCatching { run(listOf("ffmpeg", "-hide_banner", "-loglevel", "error", "-y") + input + codecs + stable + file.absolutePath) }
-                .getOrDefault(false)
+            val command = listOf("ffmpeg", "-hide_banner", "-loglevel", "error", "-y") + input + codecs + stable + file.absolutePath
+            val ok = runCatching { runProcess(*command.toTypedArray()).second == 0 }.getOrDefault(false)
             if (!ok || !file.isFile) return@mapNotNull null
             Seed(name, if (file.extension == "mkv") Container.MKV else Container.MP4, file.readBytes())
         }
@@ -130,6 +133,9 @@ internal object FuzzSeeds {
     /**
      * Vídeo con B-frames simulados (pts reordenados), audio AAC y Opus con retardo de códec, 1,2 s.
      * Con [hevcConfig] el vídeo es H.265 con HDR; sin él, H.264 rotado.
+     *
+     * Sin fecha de creación: con la del reloj, los bytes de la semilla cambiaban de una ejecución a
+     * otra, y con ellos las variantes que salen de la misma semilla base.
      */
     private fun muxed(
         file: File,
@@ -140,9 +146,14 @@ internal object FuzzSeeds {
         segmentIndex: Boolean = false,
     ): ByteArray {
         val muxer = if (segmentIndex) {
-            FragmentedMp4Muxer(file) { fragmentDurationUs = 300_000; this.segmentIndex = true }
+            FragmentedMp4Muxer(file) { creationTimeMillis = null; fragmentDurationUs = 300_000; this.segmentIndex = true }
         } else {
-            Kotmpeg.createMuxer(file, format) { this.fastStart = fastStart; this.fragmented = fragmented; fragmentDurationUs = 300_000 }
+            Kotmpeg.createMuxer(file, format) {
+                creationTimeMillis = null
+                this.fastStart = fastStart
+                this.fragmented = fragmented
+                fragmentDurationUs = 300_000
+            }
         }
         val video = if (hevcConfig != null) {
             TrackInfo.Video(codec = VideoCodec.H265, width = 64, height = 48) {

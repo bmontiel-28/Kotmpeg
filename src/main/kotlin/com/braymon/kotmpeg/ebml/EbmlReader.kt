@@ -1,6 +1,7 @@
 package com.braymon.kotmpeg.ebml
 
 import com.braymon.kotmpeg.io.SeekableInput
+import java.io.EOFException
 
 /** Una cabecera de elemento parseada. [size] es -1 para maestros de tamaño desconocido. */
 internal class EbmlElement(
@@ -44,13 +45,8 @@ internal class EbmlReader(val input: SeekableInput) {
     }
 
     private fun lengthFromMarker(firstByte: Int, what: String): Int {
-        if (firstByte == 0) throw EbmlException("$what inválido (byte inicial 0) en ${input.position - 1}")
-        var length = 1
-        var mask = 0x80
-        while (firstByte and mask == 0) {
-            length++
-            mask = mask shr 1
-        }
+        val length = vintLength(firstByte)
+        if (length == 0) throw EbmlException("$what inválido (byte inicial 0) en ${input.position - 1}")
         return length
     }
 
@@ -62,25 +58,32 @@ internal class EbmlReader(val input: SeekableInput) {
     }
 
     /**
-     * Lee un entero sin signo de hasta 8 bytes.
+     * Lee un entero sin signo de hasta 8 bytes, o lanza `IllegalArgumentException` si el elemento
+     * declara más; la reparación de Matroska cuenta con ese tipo.
      *
-     * El valor se devuelve en un `Long` con signo: un uint de 8 bytes con el bit más alto a
-     * 1 saldría negativo. En la práctica no ocurre — los campos que usan esto (posiciones,
-     * marcas de tiempo, dimensiones) son de 4 bytes o menos — y quien lo consume comprueba
-     * `>= 0` antes de usarlo.
+     * El valor se devuelve en un `Long` con signo: un uint de 8 bytes con el bit más alto a 1 sale
+     * **negativo**. Un archivo sano no lo escribe nunca —posiciones, tiempos y dimensiones caben de
+     * sobra—, pero uno manipulado sí, así que quien lo consume tiene que comprobar el rango que
+     * espera antes de usarlo: `>= 0` para un tiempo o una posición, y que quepa en `Int` antes de
+     * un `toInt()`, que si no se queda en silencio con los 32 bits bajos.
      */
     fun readUInt(element: EbmlElement): Long {
         require(element.size in 0..8) { "uint de tamaño ${element.size}" }
         return input.readUInt(element.size.toInt())
     }
 
-    fun readSInt(element: EbmlElement): Long {
-        require(element.size in 0..8)
-        if (element.size == 0L) return 0
-        var v = input.readByte().toLong()
-        if (v and 0x80L != 0L) v = v or -0x100L
-        repeat(element.size.toInt() - 1) { v = (v shl 8) or input.readByte().toLong() }
-        return v
+    /**
+     * Lee un `SeekID`: el id del elemento al que apunta una entrada del `SeekHead`, guardado como
+     * binario con su marcador, que es leerlo como entero sin signo. Uno de más de 8 bytes no puede
+     * ser un id —ninguno pasa de 4— y no se lee: se salta y da 0, que no es el de ningún elemento.
+     * Su tamaño solo está acotado por el del archivo, y leerlo entero reservaba esa memoria.
+     *
+     * Es el único sitio donde se decodifica: el demuxer y la reparación lo repetían cada uno.
+     */
+    fun readSeekId(element: EbmlElement): Long {
+        if (element.size in 1..8) return readUInt(element)
+        skip(element)
+        return 0L
     }
 
     fun readFloat(element: EbmlElement): Double = when (element.size) {
@@ -117,6 +120,34 @@ internal class EbmlReader(val input: SeekableInput) {
     fun skip(element: EbmlElement) {
         if (element.size < 0) throw EbmlException("no se puede saltar un elemento de tamaño desconocido 0x${element.id.toString(16)}")
         input.position = element.dataStart + element.size
+    }
+
+    /**
+     * Lo que no depende de una lectura en curso. Va en el compañero y no como funciones de nivel
+     * superior porque estas generan una clase fachada `EbmlReaderKt` que el bytecode expone como
+     * pública aunque las funciones sean `internal`, y aparecería en `public-api.txt`.
+     */
+    companion object {
+        /**
+         * Longitud de un VINT de EBML por su primer byte —de 1 a 8, lo que marca su primer bit a
+         * 1—, o 0 si el byte es 0 y no marca ninguna.
+         *
+         * Es la única decodificación del marcador: la usan los ids y tamaños de [EbmlReader], el
+         * número de pista de la cabecera de un bloque y los tamaños del lacing EBML, que antes
+         * repetían cada uno su propio bucle.
+         */
+        fun vintLength(firstByte: Int): Int =
+            if (firstByte and 0xFF == 0) 0 else Integer.numberOfLeadingZeros(firstByte and 0xFF) - 23
+
+        /**
+         * Si [e] es de los fallos que da un archivo EBML dañado o manipulado —un elemento
+         * imposible ([EbmlException]), un corte (`EOFException`), un valor fuera de rango
+         * (`IllegalArgumentException`, el de [readUInt] y el de una posición imposible)— y no un
+         * error de E/S de verdad, que no es un archivo dañado sino un disco o un descriptor que
+         * fallan y tiene que llegar a quien lee.
+         */
+        fun isCorruptData(e: Exception): Boolean =
+            e is EbmlException || e is EOFException || e is IllegalArgumentException
     }
 }
 

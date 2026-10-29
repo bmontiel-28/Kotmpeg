@@ -21,6 +21,9 @@ import java.nio.channels.FileChannel
  * }
  * ```
  *
+ * Hacen falta los dos `use`: el del demuxer libera lo suyo y cierra el canal, y el del
+ * `ParcelFileDescriptor` cierra el descriptor, que no es de esta instancia (ver el constructor).
+ *
  * **No es seguro entre hilos**: mantiene una posición de lectura y un buffer compartidos.
  */
 public class SeekableInput(private val channel: FileChannel) : Closeable {
@@ -33,9 +36,9 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
      * Lee de un descriptor ya abierto (p. ej. `ParcelFileDescriptor.getFileDescriptor()`).
      *
      * El descriptor tiene que ser posicionable: vale un archivo normal, no una tubería ni
-     * un socket. [close] cierra el descriptor, así que hay que pasar uno del que esta
-     * instancia pueda adueñarse (con `ParcelFileDescriptor` lo natural es dejar que el
-     * `use {}` del propio pfd lo cierre y no llamar a [close] aquí).
+     * un socket. [close] cierra los canales que abre sobre el descriptor, pero el descriptor es
+     * de quien lo abrió: en Android `FileInputStream` no se adueña de un `FileDescriptor` ajeno,
+     * así que el `ParcelFileDescriptor` hay que cerrarlo aparte (con `use`).
      */
     public constructor(fd: FileDescriptor) : this(FileInputStream(fd).channel)
 
@@ -133,15 +136,15 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
     }
 
     /**
-     * Lee [length] bytes desde [at] directamente del canal, **sin mover [position] ni tocar el
+     * Lee [count] bytes desde [at] directamente del canal, **sin mover [position] ni tocar el
      * buffer**. Es para el índice de muestras de `Mp4Demuxer`, que lee sus tablas por páginas a
      * medida que avanza la lectura: pasar por el buffer compartido lo vaciaría con cada página y
      * obligaría a releer la zona de datos en el paquete siguiente.
      */
-    internal fun readAt(at: Long, dst: ByteArray, offset: Int, length: Int) {
+    internal fun readAt(at: Long, dst: ByteArray, offset: Int, count: Int) {
         var done = 0
-        while (done < length) {
-            val n = channel.read(ByteBuffer.wrap(dst, offset + done, length - done), at + done)
+        while (done < count) {
+            val n = channel.read(ByteBuffer.wrap(dst, offset + done, count - done), at + done)
             if (n <= 0) throw EOFException("fin de archivo en ${at + done}")
             done += n
         }
@@ -150,9 +153,16 @@ public class SeekableInput(private val channel: FileChannel) : Closeable {
     public fun readInt32(): Int = readUInt(4).toInt()
     public fun readInt64(): Long = readUInt(8)
 
+    /**
+     * Avanza [count] bytes, que puede ser más allá del final: lo que falle será la lectura
+     * siguiente. Pasa por el setter de [position] y comprueba el desbordamiento: un salto enorme
+     * sumado a mano daba la vuelta a una posición negativa sin ningún error, y el fallo aparecía
+     * lejos, en la lectura del canal.
+     */
     public fun skip(count: Long) {
-        require(count >= 0)
-        pos += count
+        require(count >= 0) { "salto negativo: $count" }
+        require(count <= Long.MAX_VALUE - pos) { "saltar $count bytes desde $pos se sale de las posiciones posibles" }
+        position = pos + count
     }
 
     override fun close(): Unit = channel.close()

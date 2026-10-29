@@ -4,7 +4,8 @@ Las secciones 1 a 8 son la revisión que dio lugar a la **3.0.0**. La [sección 
 **3.1.0**, que atiende las recomendaciones del §7, con su propio histórico, mediciones y
 observaciones. La [sección 10](#10-la-400) es la **4.0.0**, que cierra todo lo que quedaba
 abierto —en el código, en la API y en las observaciones de §9.6 y §9.8— para que la siguiente
-versión no arrastre nada.
+versión no arrastre nada. La [sección 11](#11-la-410) es la **4.1.0**: grabaciones que sobreviven a
+un corte y se reparan en el sitio.
 
 Revisión del código completo (muxers y demuxers MKV/MP4/fMP4, EBML, E/S, configuración de códecs,
 audio PCM y fachada) con tres objetivos: que no quede ningún fallo conocido sin cubrir, que rinda
@@ -232,10 +233,11 @@ pista lee lo que necesita.
   `ctts`) avanza en cada paso; la de posiciones (`stsc`, `stco`, `stsz`) solo se pone al día cuando
   se pide el offset de una muestra, al leer su paquete. Las tablas se leen por páginas con lecturas
   posicionales que no tocan el buffer compartido de `SeekableInput`. Los keyframes van en un
-  `BitSet`: un bit por muestra.
+  `BitSet`: un bit por muestra, reservado al usarlo (desde la 4.1.0; antes, al abrir).
 - **fMP4**: los puntos de control guardan dónde retomar el recorrido de fragmentos y el tiempo de
   decodificación acumulado de cada pista, y el cursor vuelve a parsear el `moof` que necesita con el
-  mismo código que la pasada al abrir.
+  mismo código que la pasada al abrir. Desde la 4.1.0 no guarda el fragmento entero sino ventanas de
+  4 096 muestras: un `trun` manipulado puede declarar millones (§12).
 - La lógica de parseo es la misma de la 3.0.0, incluidas sus reglas para archivos dañados; lo que
   cambia es dónde se guardan las muestras. Las búsquedas reproducen el algoritmo anterior entre
   puntos de control.
@@ -898,3 +900,335 @@ Lo que sigue fuera es a propósito o no depende de la librería:
   donde son 6,0—, y con los suyos igual: 6,067 s en uno de 6 s escrito con `-movflags dash`;
 - que JitPack compile el tag con Gradle 9.8.1 solo se puede ver al publicarlo; en local se simuló
   su build exacto (§10.6).
+
+## 11. La 4.1.0
+
+Una versión **menor** con un solo fin: que una grabación interrumpida —el proceso muere antes de
+`stop()`— siga sirviendo sin reempaquetarla. Hasta la 4.0.0, un MKV cortado tenía la `Duration` a
+0, ningún `Cues`, un `Void` de 120 bytes donde iba el `SeekHead`, y el `Segment` y el último
+cluster con tamaño desconocido: los extractores de Android le daban duración cero y no podían
+buscar en él. Un fMP4 cortado se reproducía hasta su último fragmento entero, pero con `mvhd`,
+`tkhd` y `mehd` a cero. Lo único que lo arreglaba era `remux`, que copia el archivo entero.
+
+Al comparar las reparaciones con sus remux salió además un fallo de la 4.0.0, que se corrige aquí:
+reempaquetar en fMP4 un fMP4 de la librería movía los tiempos (§11.4).
+
+### 11.1 Un MKV válido en todo momento
+
+La disposición pasa a ser `SeekHead` · `Info` · `Tracks` · `Cues` (reserva) · clusters, y se escribe
+entera en `start()`. El `SeekHead` ya apunta a la reserva, que es un `Cues` de tamaño fijo con un
+`Void` libre dentro. Al cerrar un cluster:
+
+1. se escribe su tamaño;
+2. se parchea la `Duration`, lo que lleva antes al archivo todo lo pendiente —el cluster entero—;
+3. se amplía el índice con su cue.
+
+El índice se amplía en dos escrituras, y ese es el centro del diseño. Primero, los `CuePoint`
+nuevos y la cabecera del `Void` libre que irá detrás se escriben **dentro de la carga** del `Void`
+libre actual, donde para cualquier lector siguen siendo relleno. Después, **un solo byte** —el
+primero del tamaño de ese `Void`— lo convierte en un `Void` de 2 a 5 bytes que solo cubre su propia
+cabecera, y lo escrito pasa a formar parte del índice. Ningún corte deja un índice a medias: o se
+ve el de antes o el de después. El `SeekHead` lleva su propio `Void` libre y crece igual, y con eso
+`stop()` tampoco reescribe nada grande: si el índice no cabía en la reserva o no hay reserva, lo
+escribe al final, añade o mueve la entrada del `SeekHead` (8 bytes) y anula la reserva con otro
+parche de 9.
+
+Cada cluster ocupa unos 22 bytes del índice —18 del `CuePoint`, escrito con los tamaños en su forma
+más corta, y el `Void` que deja la ampliación—. Los 64 KiB por defecto dan para unos 3 000
+clusters: 50 minutos con un keyframe por segundo, cuatro horas de solo audio. Lo que no quepa va al
+final en `stop()`, y lo ya publicado sigue valiendo.
+
+`SeekableOutput.patch` cambió para no estorbar: un parche sobre lo que aún está en el buffer se hace
+en el buffer. Antes vaciaba siempre, y cerrar cada elemento de la cabecera de un MKV —que se hace
+parcheando su tamaño— era una escritura al sistema. Una grabación de 6 s pasó de 44 escrituras a
+28, y la cabecera llega al archivo de una vez.
+
+### 11.2 fMP4: la duración tras cada fragmento
+
+`patchDurations` se llama tras volcar cada fragmento, no solo al cerrar, y `stop()` escribe el
+`mfra` lo último: es la señal de que el archivo está cerrado.
+
+### 11.3 Reparar en el sitio
+
+`Kotmpeg.repair(File)` y `repair(FileDescriptor)` cierran un archivo así como lo habría cerrado su
+muxer, y devuelven un `RepairResult`. Leen todo y comprueban que saben cerrarlo antes de la primera
+escritura, así que lo que no reconocen lo rechazan con `IllegalArgumentException` sin haber tocado
+nada; y un archivo ya cerrado —el `Segment` con tamaño, o un `mfra` al final— no lo tocan.
+
+- **MKV**: recorre los clusters leyendo solo las cabeceras de los bloques, corta tras el último
+  bloque entero, escribe el tamaño de los clusters que no lo tenían, reconstruye el índice con el
+  criterio del muxer —un cue por cluster, en el primer keyframe de la pista de vídeo— y escribe la
+  `Duration` y, lo último, el tamaño del `Segment`. Si el índice que el muxer publicó en vivo es el
+  principio del reconstruido, solo añade lo que falta, con la misma confirmación de un byte; el
+  `SeekHead` lo completa igual; y en un MKV de la 4.0 escribe un `SeekHead` dentro de su `Void` y lo
+  confirma con un byte. Un final de ceros —lo que deja un sistema de archivos que reservó el espacio
+  sin llegar a escribirlo— cuenta como corte; un hueco en mitad del archivo, no.
+- **fMP4**: corta tras el último fragmento entero, pone la duración en `mvhd`, `tkhd`, `mehd` y la
+  lista de edición con el criterio de `patchDurations` y añade el `mfra`.
+
+Dos cosas del fMP4 no estaban en el planteamiento inicial, que era cortar tras el último `moof` +
+`mdat` completo:
+
+- **Se conservan las muestras completas del fragmento a medias.** El demuxer de la librería y el de
+  FFmpeg las leen, así que `remux` las conserva, y cortar antes perdía hasta un GOP que un remux sí
+  daba. Se hace bajando el `sample_count` de cada `trun` y el tamaño del `mdat`, sin mover datos: las
+  entradas que sobran se quedan al final del `trun`, donde ISO/IEC 14496-12 pide ignorar lo que haya
+  detrás de lo que se conoce. Una primera versión reescribía el `moof` entero con un `free` detrás;
+  era más limpia, pero era la única escritura de varios KB sobre algo que un lector o una segunda
+  reparación aún usan, y un corte a mitad dejaba el archivo sin arreglo.
+- **Con B-frames, la última muestra se alarga.** Lo que queda de un fragmento cortado puede acabar
+  en un P que se presenta después de dos B que se han perdido: su presentación pasa del final del
+  tiempo de decodificación, que es la duración que declara la pista, y un lector que la respete lo
+  cortaría. Alargándola, la pista acaba donde acaba de presentarse el último fotograma, que es
+  también lo que da el remux.
+
+Todo lo que escribe la reparación son parches de 4 a 9 bytes, `CuePoint` en zona muerta confirmados
+con un byte y, al final del archivo, el índice o el `mfra`. Si se interrumpe, se puede volver a
+lanzar. La única escritura grande sobre algo en uso es reescribir entera la reserva cuando lo
+publicado no es el principio del índice reconstruido, que con archivos de este muxer no pasa.
+
+### 11.4 fMP4: un remux que no mueve nada
+
+Reempaquetar en fMP4 el fMP4 que escribe la librería no lo dejaba igual. Con la grabación de la
+tablet de §9.6, cada pasada alargaba la duración 189 ms y retrasaba el DTS de 1 175 de sus 1 236
+fotogramas, y la siguiente otro tanto. La 4.0.0 hacía lo mismo, y grabando no se veía porque
+`MediaCodec` no da duraciones.
+
+La causa era la duración de la última muestra de cada fragmento, lo único que no sale de los PTS del
+propio fragmento. Con el DTS sacado de los PTS ordenados, el último hueco de decodificación empieza
+en el mayor PTS; pero mandaba la duración del último paquete **en orden de decodificación**, que con
+B-frames es otra muestra. Si el origen es un fMP4 de la librería, esa duración es la del hueco de ese
+paquete, que el límite de §9.6 puede haber alargado con una pausa de la pantalla. El fragmento
+acababa unos milisegundos —o una pausa entera— después de que empezara a mostrarse el keyframe
+siguiente, y todo lo de detrás se decodificaba ese tiempo tarde.
+
+Dos cambios en `FragmentedMp4Muxer`:
+
+- **Si se conoce el PTS del keyframe que abre el fragmento siguiente, manda él.** Es lo que ya decía
+  la documentación del muxer y lo que pasaba con paquetes sin duración.
+- **Sin él —el último fragmento, o una pista que no provoca el corte—, la duración del paquete es la
+  de su propio hueco**, el que empieza en su DTS, como la escribe el muxer y la devuelve el demuxer.
+  Cuenta desde ahí mientras ese hueco acabe después de que empiece a mostrarse el último fotograma;
+  si no, desde el mayor PTS, como antes. Sin esto, el último fragmento seguía creciendo una pausa en
+  cada pasada.
+
+Lo que no cambia: la duración de la última muestra de una pista que no provoca el corte y cuyos
+paquetes no traen duración se sigue estimando con el intervalo anterior. Sin el paquete siguiente no
+puede ser exacta, y con tiempos en milisegundos se pasa uno de vez en cuando: el audio del MKV de OBS,
+a 21 y 22 ms alternos, sale en su primer fMP4 con el DTS de 1 932 de sus 3 989 paquetes 1 ms por
+detrás del PTS. No se acumula ni cambia la duración, y del primer fMP4 en adelante el remux ya no
+mueve nada. (Lo resolvió después la revisión de §12: el audio ya no lleva desfases de composición
+y cada fragmento absorbe su solape, así que el remux del MKV de OBS es estable desde el primero.)
+
+### 11.5 Decisiones
+
+- **Un byte de confirmación en vez de reescribir el índice.** Reescribirlo en el sitio, como sugería
+  el planteamiento, deja una ventana en la que un corte mezcla el índice viejo y el nuevo. Con la
+  confirmación de un byte no hay ventana, a cambio de un `Void` de 2 a 5 bytes por ampliación (5 con reservas de más de 2 MiB).
+- **El `SeekHead` desde el principio**, y no al publicar el primer cue: Media3 y libwebm encuentran el
+  índice delante de los clusters aunque no lo anuncie, pero es lo que pide la especificación y lo
+  que hace FFmpeg con `-reserve_index_space`. Tiene un efecto en FFmpeg: con un MKV **sin ningún
+  cluster** —cortado antes de escribir el primero— llega al final, busca por dónde seguir y confunde
+  los ids que nombra el `SeekHead` con elementos, y protesta. Un archivo así no tiene nada que
+  reproducir, y con la 4.0 tampoco se abría: daba `End of file`.
+- **64 KiB de reserva por defecto.** Es lo que hace que la protección funcione sin configurar nada,
+  y en un vídeo es despreciable. En un clip corto de solo audio se nota; `cuesReserveBytes = 0` lo
+  devuelve todo a la disposición de la 4.0.
+- **Es una menor.** `public-api.txt` solo gana diez líneas, y el cambio de disposición del MKV no
+  rompe nada que funcionara: es un Matroska conforme con el mismo contenido, que los lectores leen
+  igual. Que ocupe 64 KiB más va en `Cambiado` del CHANGELOG, con cómo evitarlo.
+- **El modelo de corte de los tests.** Un proceso que muere deja en el archivo lo que ya había
+  llegado al sistema; la escritura en curso puede quedar a medias, porque el kernel copia una
+  escritura grande página a página y comprueba entre una y otra si el proceso tiene que morir. Los
+  tests cortan cualquier escritura de más de 16 bytes en cualquier byte, y tratan como indivisibles
+  las de 16 o menos, que en la práctica no se parten: así son los parches de tamaños y duraciones y
+  el byte de confirmación. Un corte de luz es otro modelo, y está en el README.
+
+### 11.6 Cómo se verificó
+
+- **Suite completa: 296 tests**, sin fallos ni omitidos, incluida la integración con FFmpeg 8.1.2,
+  lanzando Gradle con JDK 21 y otra vez con JDK 17, como el CI. (Es la verificación de lo de esta
+  sección; la de la versión entera, tras la revisión, está en §12.5.)
+- **`InterruptedRecordingTest`**: cinco segundos de vídeo con B-frames y AAC grabados sobre un canal
+  que registra cada escritura, y cortados justo antes, en y justo después del final de cada una, y
+  dentro de las que se pueden partir: 78 cortes en el MKV con reserva, 72 con la reserva mínima
+  —que se llena enseguida y lleva el índice al final—, 62 sin reserva y 105 en el fMP4, con y sin
+  `sidx`. Sin reparar, cada corte tiene un índice que solo apunta a clusters completos y una
+  duración que los cubre, se lee hasta donde llega sin avisos de índice, y lo que se lee es el
+  principio exacto de la grabación; el fMP4 declara la duración de su último fragmento completo, o
+  la del anterior si el corte cae entre el volcado y el parche. Reparado, da los mismos paquetes y
+  la misma duración que su remux, se lee sin ningún aviso y una segunda reparación no lo toca.
+- **Con FFmpeg**, sobre H.264 de x264 con B-frames y AAC: 21 cortes de cada contenedor. Los que ya
+  declaran duración se abren sin avisos de índice y con ella; reparados, sin ningún aviso y con la
+  duración de su remux.
+- **Las tres grabaciones reales de §9.6**, pasadas por los dos muxers sobre el mismo canal y
+  cortadas en 17 puntos cada una —alrededor de la mitad y dentro de `stop()`—:
+  - sin reparar, FFmpeg abre cada MKV y cada fMP4 con la duración hasta el último cluster o
+    fragmento cerrado; el único aviso es `UDTA parsing failed retrying raw` en el fMP4 de OBS, que
+    FFmpeg da también con el MP4 que escribe él mismo con esos títulos de pista;
+  - los MKV, en los 51 cortes, y el fMP4 del móvil, en sus 17: el reparado da los mismos paquetes
+    y la misma duración que su remux, y FFmpeg lo abre sin avisos;
+  - el fMP4 de la tablet: el reparado da los mismos paquetes que su remux en los 17 cortes, y la
+    misma duración en 16, y FFmpeg lo abre sin avisos. En el otro, la duración que lee el demuxer
+    difiere en 1 µs: la última muestra acaba en el mismo tic en los dos, pero en el reparado se
+    decodifica antes y está alargada (§11.3), y el demuxer pasa a microsegundos por separado su DTS
+    y su duración;
+  - el fMP4 de OBS: el reparado es, pista a pista, exactamente el principio del archivo completo, y
+    tiene los mismos paquetes y la misma duración que su remux, pero intercalados en otro orden,
+    porque el DTS del audio de su primer fMP4 redondea un milisegundo distinto (§11.4).
+- **El remux idempotente**, con las tres grabaciones de §9.6 reempaquetadas tres veces seguidas a
+  fMP4 y a MP4 plano: la segunda y la tercera pasada dan exactamente los mismos paquetes, con el
+  mismo PTS, DTS y duración, y la misma duración de archivo que la primera, salvo el audio de OBS
+  de la primera a la segunda (§11.4). Antes, la tablet se alargaba 189 ms por pasada. El test nuevo de
+  `SyncSamplesAndTimelineTest` hace lo mismo con vídeo sintético y falla sin cualquiera de los dos
+  cambios: el fragmento se pasa una pausa de 2 s, o el último crece 2 s.
+- **Fuzzing**: `DemuxerFuzzTest` con semilla nueva (41000023), porque `MkvDemuxer` cambió: 721 885
+  variantes en dos minutos, ninguna falla, y 3,6 MiB de reserva máxima. El de la reparación, en una
+  pasada larga aparte de la de la suite: 5 000 variantes mutadas de seis grabaciones cortadas —MKV
+  con reserva en dos puntos, sin reserva y con la mínima; fMP4 con y sin `sidx`—: 3 345 reparadas,
+  1 654 rechazadas sin tocar un byte y una ya cerrada; ninguna otra excepción, ninguna segunda
+  reparación cambió nada, y todas las que se leían antes se leen después. Esa pasada encontró que
+  el texto previsto para `SECURITY.md` prometía de más: una variante con una pista dañada que el
+  demuxer ya rechazaba antes de repararla, lo sigue rechazando después, y la política se escribió
+  así.
+- **Benchmarks** con `verificarLimites`: los once dentro de su límite de memoria.
+- **La compilación de JitPack, simulada en local**: sin `build/` ni `.gradle/`, con JDK 17 y el mismo
+  `publishToMavenLocal -x test`; y **el consumidor con Kotlin 1.9** contra ese artefacto 4.1.0.
+- `public-api.txt`: diez líneas nuevas, ninguna que cambie o desaparezca.
+
+### 11.7 Lo que queda
+
+- Un MKV cortado antes de escribir su primer cluster no se abre en FFmpeg sin protestas (§11.5). No
+  tiene nada que reproducir, y la librería lo abre sin paquetes.
+- Las garantías son frente a la muerte del proceso. Ante un corte de luz, `repair` acepta un final
+  de ceros y rechaza un hueco en mitad del archivo; lo que no se puede perder se fuerza con
+  `SeekableOutput.sync()`. Lo explica el README.
+- El MP4 plano sigue sin arreglo si se corta: su índice solo se escribe en `stop()`, y es lo que
+  explica la sección de grabaciones interrumpidas del README.
+
+## 12. La revisión antes de publicar la 4.1.0
+
+Antes de etiquetar la 4.1.0 se revisó el proyecto entero —la librería, los tests, la compilación, el
+CI y la documentación—, no solo lo nuevo, buscando fallos ocultos, regresiones y deuda de estructura.
+
+### 12.1 Cómo se hizo
+
+1. **Siete revisiones en paralelo, de solo lectura**, una por área: escritura y reparación MKV;
+   lectura MKV; escritura y reparación fMP4; lectura MP4; MP4 plano, entradas de muestra y códecs;
+   fachada, pipeline y audio; y tests, compilación, CI y documentación. Cada hallazgo tenía que
+   llevar un escenario concreto —qué entrada da qué resultado— y no repetir lo que ya está decidido
+   en este documento.
+2. **Seis correcciones en paralelo**, cada una en una copia aislada del proyecto y sobre un conjunto
+   de archivos disjunto. La regla, para cada hallazgo: primero un test que construye su entrada y
+   falla con el código anterior; después el arreglo. Lo que no se reproducía no se tocaba. Antes de
+   refactorizar, la salida de los muxers se fijaba con su SHA-256 y tenía que quedar idéntica byte a
+   byte, salvo los cambios pedidos.
+3. **Integración y consolidación** de lo que cruzaba áreas —las cabeceras comunes de los dos muxers
+   MP4, el cebado, las duraciones frente a las ediciones, la validación de las pistas—, con el mismo
+   criterio de bytes idénticos.
+4. **Revisión final del conjunto**, centrada en las costuras entre áreas, y la verificación de §12.5.
+
+Salieron casi un centenar de hallazgos. El detalle de cada corrección está en el CHANGELOG; aquí, lo
+que importa para entender el estado en que queda el proyecto.
+
+### 12.2 Lo que se encontró
+
+- **La reparación no aguantaba que la interrumpieran.** Prometía que se podía relanzar, pero ningún
+  test cortaba la propia reparación, y en varios casos relanzarla fallaba o empeoraba el archivo: un
+  MKV de la 4.0 cortado tras confirmar su `SeekHead`, la última muestra de un fMP4 alargada dos
+  veces, un índice final correcto que se truncaba. Con entradas manipuladas, además, escribía fuera
+  de los elementos (`Seek`, `Duration`), truncaba de más —un tamaño dañado en mitad del archivo se
+  tomaba por el corte— o agotaba la memoria. Ahora `RecordingFileChannel` registra también los
+  truncados, y los tests cortan la reparación en cada operación y la relanzan.
+- **Las cotas de los demuxers eran por tabla, no por archivo.** Cada tabla se acotaba por el tamaño
+  del archivo, pero con cajas pequeñas repetidas unos pocos MB hacían reservar cientos —cadenas de
+  `ContentEncoding`, zlib comprobado después de escribir, `trun` sin campos por muestra, miles de
+  pistas, muestras solapadas— o tardar minutos. Ahora hay presupuestos por bloque y por archivo y
+  topes de cardinalidad, todos con aviso; los valores están en `SECURITY.md`.
+- **El tiempo de decodificación del fMP4 con GOP abierto se retrasaba sin límite.** Las imágenes
+  iniciales de un GOP se presentan antes que su keyframe, el solape pasaba entero al fragmento
+  siguiente y el retraso crecía dos fotogramas por GOP. Ahora cada fragmento absorbe su solape
+  (`FragmentTiming`), comprobado con x265 real; con GOP cerrado la salida no cambia.
+- **El MP4 plano validaba el audio en `stop()`**: una grabación entera podía quedar sin `moov`. Y al
+  cerrar reservaba unos 250 bytes por muestra; ahora unos 40.
+- **`concat`** no restaba el principio de cada entrada y tenía abiertas todas a la vez.
+- **El CI dependía de la versión de FFmpeg** sin fijarla, con un test estricto que solo se había
+  visto con la 8.1.2, y los procesos de FFmpeg de los tests podían colgar la suite.
+
+### 12.3 Estructura
+
+Lo que estaba duplicado y ya divergía se unificó, y los archivos más grandes se partieron por
+responsabilidades:
+
+- `MkvDemuxer` pasó de 1 464 líneas a 673: `MkvHeaderParser` (cabecera e índice, en una estructura
+  inmutable), `MkvContentDecoder` (`ContentEncoding`) y `MkvSeekFilter` (la espera al keyframe tras
+  una búsqueda).
+- `Mp4Demuxer` pasó de 1 352 a 814: `Mp4BoxReader`, `Mp4SampleEntryReader`, `FragmentWalker` (con
+  un contexto explícito en vez de clases `inner`) y `FragmentFlags`.
+- `FragmentedMp4Muxer`: los tiempos van en `FragmentTiming`, funciones puras que se prueban sin E/S;
+  el criterio de duraciones, en `FragmentDurations`, común con la reparación, que lo tenía escrito
+  aparte.
+- `MovieBoxes`: las cabeceras de `Mp4Muxer` y `FragmentedMp4Muxer`, que estaban copiadas.
+  `AudioPriming`: el cebado, igual en los tres muxers. `MkvTimeline`: la duración final y los cues,
+  comunes al muxer y a la reparación MKV. `MkvLayout.append`: el protocolo de ampliar el índice con
+  un byte de confirmación, que estaba escrito cuatro veces.
+- En los tests, `TestSupport.kt` reúne lo que estaba copiado en cada clase: los procesos de FFmpeg
+  con plazo, la medición de memoria y la corrupción del índice MKV.
+
+### 12.4 Decisiones: lo que no se cambia
+
+- **La visibilidad de la API pública.** `SeekableInput`/`SeekableOutput` exponen primitivas de
+  lectura y escritura, y los muxers y demuxers concretos son públicos además de la fachada.
+  Cerrarlo rompería a quien los use, y no causa ningún fallo.
+- **Los tipos de excepción ante una entrada corrupta** difieren por contenedor (`EbmlException`,
+  `IllegalStateException`, de E/S). Unificarlos rompería a quien capture uno; el contrato queda
+  documentado en el KDoc de `Demuxer`.
+- **El parámetro `length` de `SeekableInput.readFully`** oculta la propiedad del mismo nombre, pero
+  es un nombre público que se puede usar con argumento nombrado.
+- **`cuesReserveBytes` sigue siendo `Int`**: su máximo es 16 MiB.
+- **La reparación de un MKV cuenta para la duración las pistas que el demuxer descartaría por algo
+  que no sea el códec** —cifrado, compresión de contenido no soportada, parámetros imposibles—. Ya
+  no cuenta subtítulos ni códecs sin soporte; lo otro solo aparece en archivos de otros programas, y
+  saberlo exigiría que la reparación leyera las pistas como el demuxer.
+- **La reparación de un MKV da lo que daría `remux` de lo que se lee.** Con vídeo de frecuencia
+  variable puede diferir en unos milisegundos de la duración final que habría escrito `stop()` en
+  vivo: el muxer estima el último fotograma con el hueco entre los dos mayores PTS, y lo leído trae
+  la `DefaultDuration`.
+- **El GOP abierto en fMP4 queda acotado, no resuelto del todo.** Cada fragmento absorbe su solape
+  y el retraso ya no se acumula, pero el keyframe que abre un fragmento se decodifica en su propio
+  PTS, así que las imágenes iniciales —las que se muestran antes que él— se adelantan tantos
+  fotogramas como imágenes iniciales haya, no la profundidad de reordenación: con 4 B-frames a
+  30 fps, unos 133 ms, que FFmpeg traduce en un retraso del vídeo de ese tamaño. En modo sin signo
+  es peor: el desplazamiento lo fija el primer fragmento, y las imágenes iniciales que se adelantan
+  más quedan recortadas a desfase 0 y fuera de orden. Resolverlo exige retener cada fragmento hasta
+  ver las imágenes iniciales del siguiente, que cambia el camino de la grabación en vivo; como solo
+  ocurre al reempaquetar fuentes de GOP abierto —`MediaCodec` cierra los GOP—, se deja así. Con
+  esas fuentes conviene el modo con signo, el de por defecto.
+- **MP4 híbrido** —muestras en el `moov` y además fragmentos—: se leen las del `moov`, con aviso.
+  Está en el README.
+- **`alternate_group`** sigue a 0 en todas las pistas: no hay un caso que lo justifique.
+- **Las acciones del CI siguen en `@v4`, y los `gradle-wrapper.properties` sin
+  `distributionSha256Sum`**: funcionan, y cambiar de versión o fijar el checksum exige descargar y
+  verificar algo que no se puede comprobar sin red.
+
+### 12.5 Cómo se verificó
+
+- **Suite completa: 451 tests** (296 antes de la revisión), sin fallos ni omitidos, incluida la
+  integración con FFmpeg 8.1.2, lanzando Gradle con JDK 21 y otra vez con JDK 17. Tarda unos 120 s
+  de tests —antes 171—: las pruebas de reparación van en memoria, y `InterruptedRecordingTest` pasó
+  de 115 s a unos 20.
+- **Cada corrección, con un test que fallaba antes**: se ejecutaron contra el código original sin
+  tocar.
+- **Salida idéntica**: 70 archivos fMP4 con GOP cerrado —con signo, sin signo, `sidx`, VFR, pausas,
+  pistas tardías, remux de x264 y x265— y 9 MP4 de referencia salieron iguales byte a byte tras las
+  correcciones. En la consolidación cambiaron 58 de 77 salidas, todas por un cambio pedido y
+  comprobadas caja a caja.
+- **Las tres grabaciones reales de §9.6**: reempaquetadas tres veces seguidas a fMP4 y a MP4 plano,
+  la segunda y la tercera pasada son idénticas a la primera —también el MKV de OBS, que antes
+  cambiaba el audio en 1 ms— y con los mismos datos que el original. Grabadas sobre el canal que
+  registra escrituras, cortadas en 6 puntos cada una y reparadas, las 36 reparaciones dan, pista a
+  pista, lo mismo que su remux. Sin un solo aviso en todo el recorrido.
+- **Con FFmpeg**: el `pasp` se lee como 853:640 con rotación 0 y 90; el remux de x265 con GOP
+  abierto deja los keyframes con DTS = PTS y la duración exacta; y la duración que da `ffprobe` de
+  un Opus con `preSkip` pasa de 5,000 s a 4,994 (la real es 4,9935).
+- `public-api.txt`: sin cambios respecto a lo que ya añadía la 4.1.0.

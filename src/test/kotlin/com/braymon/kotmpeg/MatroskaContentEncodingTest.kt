@@ -290,14 +290,11 @@ class MatroskaContentEncodingTest {
      */
     @Test
     fun `many tiny compressed laced frames do not allocate a buffer each`() {
-        val threads = java.lang.management.ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
-        org.junit.jupiter.api.Assumptions.assumeTrue(threads != null, "este JDK no mide la memoria por hilo")
         val file = handMadeMkv(File(dir, "lacing-vacio.mkv"), Encoding(algorithm = 0), List(256) { ByteArray(0) }, lacing = 2)
         read(file)
-        val before = threads!!.currentThreadAllocatedBytes
         val warnings = ArrayList<String>()
-        val packets = read(file, warnings)
-        val allocated = threads.currentThreadAllocatedBytes - before
+        var packets = emptyList<MediaPacket>()
+        val allocated = allocatedBytes { packets = read(file, warnings) }
 
         assertEquals(0, packets.size)
         assertEquals(1, warnings.size, "256 fotogramas ilegibles de un bloque son un solo aviso: ${warnings.size}")

@@ -13,7 +13,6 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
 import java.nio.ByteBuffer
-import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -46,13 +45,6 @@ class DisplayGeometryTest {
 
         /** El 16:9 real de una imagen de 480 de alto: `round(480 * 16 / 9)`. */
         const val DISPLAY_W = 853
-
-        fun run(vararg cmd: String): Int {
-            val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
-            p.inputStream.bufferedReader().readText()
-            p.waitFor(120, TimeUnit.SECONDS)
-            return p.exitValue()
-        }
     }
 
     /**
@@ -376,10 +368,10 @@ class DisplayGeometryTest {
 
         val rotado = File(dir, "anamorfico-rotado.mp4")
         assumeTrue(
-            run(
+            runProcess(
                 "ffmpeg", "-y", "-v", "error", "-display_rotation:v", "90",
                 "-i", plano.absolutePath, "-c", "copy", rotado.absolutePath,
-            ) == 0 && rotado.length() > 0,
+            ).second == 0 && rotado.length() > 0,
             "esta compilación de FFmpeg no admite -display_rotation",
         )
 
@@ -430,12 +422,12 @@ class DisplayGeometryTest {
     /** 640x480 con una proporción 16:9 declarada, en el contenedor que se pida. */
     private fun makeAnamorphic(target: File, ext: String): Boolean {
         val code = runCatching {
-            run(
+            runProcess(
                 "ffmpeg", "-y", "-v", "error",
                 "-f", "lavfi", "-i", "testsrc=size=${CODED_W}x$CODED_H:duration=1:rate=10",
                 "-c:v", "libx264", "-aspect", "16:9", "-f", if (ext == "mkv") "matroska" else "mp4",
                 target.absolutePath,
-            )
+            ).second
         }.getOrDefault(1)
         return code == 0 && target.length() > 0
     }

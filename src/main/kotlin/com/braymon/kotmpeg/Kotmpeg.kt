@@ -1,17 +1,23 @@
 package com.braymon.kotmpeg
 
+import com.braymon.kotmpeg.io.RepairTarget
 import com.braymon.kotmpeg.io.SeekableInput
 import com.braymon.kotmpeg.io.SeekableOutput
 import com.braymon.kotmpeg.mkv.MkvDemuxer
 import com.braymon.kotmpeg.mkv.MkvMuxer
+import com.braymon.kotmpeg.mkv.MkvRepair
 import com.braymon.kotmpeg.model.ContainerFormat
 import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
+import com.braymon.kotmpeg.mp4.FragmentedMp4Repair
 import com.braymon.kotmpeg.mp4.Mp4Demuxer
 import com.braymon.kotmpeg.mp4.Mp4Muxer
 import com.braymon.kotmpeg.pipeline.Remuxer
 import java.io.File
+import java.io.FileDescriptor
+import java.io.FileNotFoundException
+import java.nio.file.Files
 
 /**
  * Punto de entrada del motor de contenedores en Kotlin puro (MKV + MP4).
@@ -92,7 +98,7 @@ public object Kotmpeg {
 
     /** Por qué no se pudo deducir el formato de salida de [name], con lo que hay que hacer. */
     private fun unknownExtension(name: String): String =
-        if (name.substringAfterLast('.').equals("webm", ignoreCase = true)) {
+        if (name.substringAfterLast('.', "").equals("webm", ignoreCase = true)) {
             "$name: WebM solo admite VP8, VP9 o AV1 con Vorbis u Opus, y esta librería escribe " +
                 "H.264/H.265 con AAC u Opus. Usa la extensión .mkv"
         } else {
@@ -120,7 +126,9 @@ public object Kotmpeg {
      * formato se detecta igual, leyendo la cabecera, así que no hay que declararlo.
      *
      * Si no se reconoce el contenedor se cierra la entrada antes de lanzar: quien pasa un
-     * `SeekableInput` ya no tiene otra forma de recuperar el descriptor.
+     * `SeekableInput` no recibe ningún demuxer con el que cerrarla después. Lo que se cierra es el
+     * canal; en Android, el `ParcelFileDescriptor` del que salió sigue siendo de quien lo abrió y se
+     * cierra aparte (con `use`).
      */
     public fun openDemuxer(input: SeekableInput, onWarning: (String) -> Unit = {}): Demuxer {
         val format = runCatching { detectFormat(input) }
@@ -146,21 +154,69 @@ public object Kotmpeg {
     public fun detectFormat(input: SeekableInput): ContainerFormat? {
         if (input.length < 12) return null
         val saved = input.position
-        val head = try {
+        try {
             input.position = 0
-            input.readBytes(12)
+            val head = input.readBytes(12)
+            if (head[0] == 0x1A.toByte() && head[1] == 0x45.toByte() &&
+                head[2] == 0xDF.toByte() && head[3] == 0xA3.toByte()
+            ) return ContainerFormat.MKV
+            return if (startsLikeMp4(input)) ContainerFormat.MP4 else null
         } finally {
             input.position = saved
         }
-        if (head[0] == 0x1A.toByte() && head[1] == 0x45.toByte() &&
-            head[2] == 0xDF.toByte() && head[3] == 0xA3.toByte()
-        ) return ContainerFormat.MKV
-        val type = String(head, 4, 4, Charsets.US_ASCII)
-        if (type == "ftyp" || type == "moov" || type == "mdat" || type == "free" || type == "wide") {
-            return ContainerFormat.MP4
-        }
-        return null
     }
+
+    /**
+     * Si [input] empieza como un MP4: con una caja de [MP4_OPENING_BOXES], o con cajas de
+     * [MP4_LEADING_BOXES] seguidas de una de ellas.
+     *
+     * Las de [MP4_LEADING_BOXES] abren MP4 legítimos —un `skip` de relleno, que la reparación ya
+     * aceptaba, la vista previa `pnot` de los `.mov` antiguos o un `uuid` de fabricante—, pero son
+     * cuatro letras demasiado corrientes para fiarse solo de ellas: se exige además que su tamaño
+     * quepa en el archivo y que lo que venga detrás sea otra caja conocida. Hasta la 4.0 un archivo
+     * que empezaba así se rechazaba como «ni MKV ni MP4».
+     *
+     * Un `pnot` no va solo: apunta a la imagen de la vista previa, que va detrás de él, en una de
+     * [MOV_PREVIEW_BOXES]. Se acepta ahí y en ningún otro sitio, con las mismas condiciones. Sin
+     * aceptarla, un `.mov` con vista previa de verdad se rechazaría igual: solo pasaría uno con el
+     * `pnot` y sin su imagen.
+     */
+    private fun startsLikeMp4(input: SeekableInput): Boolean {
+        var at = 0L
+        var previous = ""
+        repeat(MAX_LEADING_BOXES + 1) {
+            if (at > input.length - 8) return false
+            input.position = at
+            val size = input.readUInt(4)
+            val type = String(input.readBytes(4), Charsets.US_ASCII)
+            if (type in MP4_OPENING_BOXES) return true
+            val preview = previous == "pnot" && type in MOV_PREVIEW_BOXES
+            if (type !in MP4_LEADING_BOXES && !preview) return false
+            val minimum = if (type == "uuid") 24L else 8L
+            if (size < minimum || size > input.length - at) return false
+            at += size
+            previous = type
+        }
+        return false
+    }
+
+    /** Cajas que, en cabeza del archivo, bastan para tomarlo por MP4. */
+    private val MP4_OPENING_BOXES = setOf("ftyp", "moov", "mdat", "free", "wide")
+
+    /** Cajas que pueden ir delante de las de [MP4_OPENING_BOXES], pero que solas no prueban nada. */
+    private val MP4_LEADING_BOXES = setOf("skip", "pnot", "uuid")
+
+    /**
+     * La imagen de la vista previa de un `.mov`, que solo se acepta detrás de su `pnot`: `PICT`, la
+     * habitual, y `pict`, que FFmpeg también reconoce.
+     */
+    private val MOV_PREVIEW_BOXES = setOf("PICT", "pict")
+
+    /**
+     * Cuántas cajas de [MP4_LEADING_BOXES], o imágenes tras un `pnot`, se saltan como mucho antes de
+     * dar el archivo por desconocido.
+     */
+    private const val MAX_LEADING_BOXES = 4
 
     /**
      * Concatena [inputs] en [output] sin recodificar (el demuxer `concat` de FFmpeg).
@@ -171,13 +227,16 @@ public object Kotmpeg {
      * [onWarning] recibe los mismos avisos que en [openDemuxer], por cada entrada, y [options]
      * configura el muxer de salida igual que en [createMuxer].
      *
-     * Las entradas se abren de una en una y el `finally` cierra las que ya lo estuvieran: si
-     * una falla a mitad —no es MKV ni MP4, cabecera corrupta, permisos— las anteriores no se
-     * quedan con el descriptor abierto, que en Windows además impedía borrarlas o moverlas.
+     * **Nunca hay más de una entrada abierta.** Primero se abre cada una solo para leer sus pistas y
+     * se cierra; comprobado que todas encajan, se copian en orden, abriéndolas otra vez de una en
+     * una. Hasta la 4.0 se tenían todas abiertas a la vez —un descriptor, un buffer de 64 KiB y el
+     * índice de cada una—, y con un millar largo de segmentos se agotaban los descriptores del
+     * proceso o la memoria. Los avisos que da cada entrada al abrirse llegan a [onWarning] una sola
+     * vez: en la segunda apertura se descartan, porque son los mismos de la primera.
      *
      * Todo lo que se puede comprobar antes de escribir —que las entradas se abren y son
      * compatibles— se comprueba antes de abrir [output], así que una llamada rechazada deja
-     * intacto lo que hubiera en esa ruta. Hasta ahora la truncaba primero y la dejaba vacía.
+     * intacto lo que hubiera en esa ruta. Hasta la 4.0 la truncaba primero y la dejaba vacía.
      */
     public fun concat(
         inputs: List<File>,
@@ -189,15 +248,18 @@ public object Kotmpeg {
     ): Long {
         require(inputs.isNotEmpty()) { "sin entradas" }
         requireDistinct(inputs, output)
-        val demuxers = ArrayList<Demuxer>(inputs.size)
-        try {
-            for (file in inputs) demuxers.add(openDemuxer(file, onWarning))
-            Remuxer.requireConcatenable(demuxers)
-            return createMuxer(output, format, options).use { muxer ->
-                Remuxer.concat(demuxers, muxer, onProgress)
+        val layouts = inputs.map { file -> openDemuxer(file, onWarning).use { it.tracks } }
+        Remuxer.requireConcatenable(layouts)
+        return createMuxer(output, format, options).use { muxer ->
+            val concatenation = Remuxer.Concatenation(layouts.first(), muxer, onProgress)
+            for ((index, file) in inputs.withIndex()) {
+                var opening = true
+                openDemuxer(file) { if (!opening) onWarning(it) }.use { demuxer ->
+                    opening = false
+                    concatenation.append(index, demuxer)
+                }
             }
-        } finally {
-            demuxers.forEach { runCatching { it.close() } }
+            concatenation.finish()
         }
     }
 
@@ -205,9 +267,11 @@ public object Kotmpeg {
      * Reempaqueta [input] en [output] sin recodificar, en cualquier dirección (MKV <-> MP4
      * o limpieza en el mismo formato). Devuelve el número de paquetes copiados.
      *
-     * [trackFilter] recibe el id de cada pista de entrada y descarta las que devuelvan `false`;
-     * [onWarning] y [options], como en [concat]. Como allí, una llamada que no puede salir bien
-     * —ninguna pista seleccionada, vídeo sin `codecPrivate`— se rechaza antes de abrir [output].
+     * [trackFilter] recibe el id de cada pista de entrada, **una sola vez por pista**, y descarta las
+     * que devuelvan `false`; [onWarning] y [options], como en [concat]. Como allí, una llamada que no
+     * puede salir bien —ninguna pista seleccionada, vídeo sin `codecPrivate`— se rechaza antes de
+     * abrir [output]. Hasta la 4.0 el filtro se evaluaba dos veces, al comprobar y al copiar, y uno
+     * con estado podía no seleccionar nada la segunda vez: el error llegaba con [output] ya vacía.
      */
     public fun remux(
         input: File,
@@ -221,14 +285,64 @@ public object Kotmpeg {
         requireDistinct(listOf(input), output)
         val demuxer = openDemuxer(input, onWarning)
         try {
-            Remuxer.requireWritable(demuxer.tracks.filter { trackFilter(it.id) })
+            val selected = demuxer.tracks.filter { trackFilter(it.id) }
+            Remuxer.requireWritable(selected)
+            val selectedIds = selected.mapTo(HashSet()) { it.id }
             return createMuxer(output, format, options).use { muxer ->
-                Remuxer.remux(demuxer, muxer, trackFilter, onProgress)
+                Remuxer.remux(demuxer, muxer, { it in selectedIds }, onProgress)
             }
         } finally {
             demuxer.close()
         }
     }
+
+    /**
+     * Cierra en el sitio un MKV o un MP4 fragmentado que se quedó sin cerrar —el proceso murió
+     * antes de `stop()`—, como lo habría cerrado su muxer, sin copiar el archivo:
+     *
+     *  - **MKV**: quita lo que el corte dejó a medias tras el último bloque entero, escribe el
+     *    tamaño del último cluster, reconstruye el índice `Cues` y escribe la duración, el
+     *    `SeekHead` y el tamaño del `Segment`.
+     *  - **MP4 fragmentado**: deja del fragmento a medias las muestras que están completas, pone la
+     *    duración en la cabecera y añade el índice `mfra`.
+     *
+     * Con `cuesReserveBytes` el MKV ya se abre y se recorre aunque no se repare, y el fMP4 siempre;
+     * reparar deja además el archivo igual de cerrado que si se hubiera llegado a `stop()`, sin
+     * necesitar otra vez su tamaño en disco. Con un archivo de los muxers de esta librería tiene los
+     * mismos paquetes y la misma duración que reempaquetarlo con [remux]; con uno de otro programa
+     * los paquetes son los mismos, pero el remux puede intercalar las pistas en otro orden o
+     * redondear la duración en un microsegundo.
+     *
+     * Un archivo ya cerrado no se toca (`repaired = false`). Lo que no se reconoce —otro
+     * contenedor, un MP4 plano, una cabecera cortada, daños que no están al final— se rechaza con
+     * `IllegalArgumentException` **sin modificar nada**: todas las comprobaciones se hacen antes de
+     * escribir. Si la reparación se interrumpe a medias, el archivo sigue pareciendo sin cerrar y se
+     * puede volver a lanzar.
+     */
+    public fun repair(file: File): RepairResult {
+        if (!file.isFile) throw FileNotFoundException("${file.path} no existe o no es un archivo")
+        return RepairTarget.open(file).use { repair(it) }
+    }
+
+    /**
+     * Variante de [repair] sobre un descriptor ya abierto (`MediaStore`/SAF), que tiene que poder
+     * leerse y escribirse: con `ContentResolver`, `openFileDescriptor(uri, "rw")`. Uno de solo
+     * escritura —el modo `"w"`— se rechaza con `IllegalArgumentException` antes de leer nada; uno de
+     * solo lectura falla con la `IOException` de la primera escritura, que no llega a cambiar nada.
+     *
+     * Cierra los canales que abre sobre el descriptor, pero el descriptor es de quien lo abrió: en
+     * Android `FileInputStream`/`FileOutputStream` no se adueñan de un `FileDescriptor` ajeno, así que
+     * el `ParcelFileDescriptor` hay que cerrarlo aparte (con `use`).
+     */
+    public fun repair(fd: FileDescriptor): RepairResult = RepairTarget.open(fd).use { repair(it) }
+
+    /** La reparación sobre un destino ya abierto; los tests la llaman sobre un canal que registra cada operación. */
+    internal fun repair(target: RepairTarget): RepairResult =
+        when (detectFormat(target.input)) {
+            ContainerFormat.MKV -> MkvRepair(target).run()
+            ContainerFormat.MP4 -> FragmentedMp4Repair(target).run()
+            null -> throw IllegalArgumentException("no se puede reparar: no es un archivo MKV ni MP4")
+        }
 
     /**
      * Rechaza que el destino sea también una de las entradas, lanzando `IllegalArgumentException`
@@ -241,7 +355,10 @@ public object Kotmpeg {
      *
      * Se compara por ruta canónica para que un enlace simbólico o una ruta relativa distinta
      * al mismo archivo tampoco se cuelen; si el sistema de archivos no puede canonizarla se
-     * cae a la ruta absoluta, que es lo mejor disponible.
+     * cae a la ruta absoluta, que es lo mejor disponible. Si [output] ya existe, se pregunta
+     * además al sistema con `Files.isSameFile`, que reconoce lo que ninguna ruta delata: un enlace
+     * duro, otro nombre del mismo archivo. Hasta la 4.0 `remux(f, enlaceDuro)` se aceptaba y
+     * truncaba la entrada.
      *
      * [remux] y [concat] ya la aplican por su cuenta, así que **no hace falta llamarla** para
      * usarlas. Está expuesta para quien arme su propia canalización con [openDemuxer] y
@@ -254,8 +371,11 @@ public object Kotmpeg {
      */
     public fun requireDistinct(inputs: List<File>, output: File) {
         fun key(f: File): File = runCatching { f.canonicalFile }.getOrDefault(f.absoluteFile)
+        fun sameExistingFile(f: File): Boolean =
+            f.exists() && runCatching { Files.isSameFile(f.toPath(), output.toPath()) }.getOrDefault(false)
         val out = key(output)
-        require(inputs.none { key(it) == out }) {
+        val outputExists = output.exists()
+        require(inputs.none { key(it) == out || (outputExists && sameExistingFile(it)) }) {
             "la salida ${output.name} es también una de las entradas: se truncaría y " +
                 "reescribiría mientras se lee. Escribe a un archivo temporal y renómbralo."
         }

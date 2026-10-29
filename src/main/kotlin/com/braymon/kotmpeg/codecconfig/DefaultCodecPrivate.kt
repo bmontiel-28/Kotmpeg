@@ -15,6 +15,10 @@ import com.braymon.kotmpeg.model.TrackInfo
  * Para Opus, el `preSkip` sale de `codecDelayUs` si la pista lo declara, y si no se usa el valor
  * de libopus (312 muestras a 48 kHz). Un Opus de más de dos canales necesita una tabla de mapeo
  * que no se puede adivinar, y ahí `OpusConfig.buildOpusHead` lanza con un mensaje que lo explica.
+ *
+ * La frecuencia de entrada de esa `OpusHead` es la de la pista. Hasta la 4.0 era siempre 48 kHz, y
+ * en MP4, donde la entrada de muestra y la escala del `mdhd` de un Opus valen 48 kHz por norma, ese
+ * campo es el único sitio en el que viaja la frecuencia original: un Opus a 16 kHz se releía a 48.
  */
 internal object DefaultCodecPrivate {
 
@@ -29,7 +33,7 @@ internal object DefaultCodecPrivate {
             } else {
                 DEFAULT_OPUS_PRE_SKIP
             }
-            OpusConfig.buildOpusHead(track.channelCount, preSkip = preSkip)
+            OpusConfig.buildOpusHead(track.channelCount, preSkip = preSkip, inputSampleRate = track.sampleRate)
         }
     }
 }

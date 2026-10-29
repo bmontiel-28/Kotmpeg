@@ -43,7 +43,8 @@ integración end-to-end**, que son los que validan la salida contra binarios rea
 omiten en silencio, así que merece la pena instalarlo (`winget install Gyan.FFmpeg`,
 `brew install ffmpeg` o `apt install ffmpeg`).
 
-Tres tests comprueban que una operación fallida no deja archivos abiertos (`OpenFiles`): en Linux
+Cuatro tests comprueban que no quedan archivos abiertos (`OpenFiles`) —tres tras una operación
+fallida y uno mientras `concat` recorre sus entradas—: en Linux
 leyendo `/proc/self/fd` y en Windows comprobando que el archivo se deja renombrar, que Windows impide
 mientras está abierto. En macOS no hay forma fiable de medirlo y se saltan solos; el CI, en Linux,
 sí los ejecuta. El build imprime todos los `SKIPPED` a propósito, para que un verde con media suite
@@ -153,16 +154,17 @@ Cuando el cambio es intencionado, regenera el volcado y **revisa el diff**:
   el nombre del campo de la especificación va en la propia línea (`u32(0)  // reservado`,
   `out.write(1)  // configurationVersion`), porque no hay ninguna declaración a la que colgarlo y
   es lo único que permite contrastar el código contra el estándar. Meterlo en el KDoc de la función
-  sería duplicar la tabla de campos y condenarla a desincronizarse del cuerpo. Vale para estos ocho
+  sería duplicar la tabla de campos y condenarla a desincronizarse del cuerpo. Vale para estos nueve
   archivos y para ningún otro:
 
   ```
-  mp4/Mp4Muxer.kt   mp4/Mp4Demuxer.kt   mp4/FragmentedMp4Muxer.kt   mp4/SampleEntries.kt
-  codecconfig/NalUnits.kt   codecconfig/OpusConfig.kt   model/ColorInfo.kt   ebml/EbmlWriter.kt
+  mp4/Mp4Muxer.kt   mp4/MovieBoxes.kt   mp4/Mp4Demuxer.kt   mp4/FragmentedMp4Muxer.kt
+  mp4/SampleEntries.kt   codecconfig/NalUnits.kt   codecconfig/OpusConfig.kt   model/ColorInfo.kt
+  ebml/EbmlWriter.kt
   ```
 
   La regla no depende de que nadie se acuerde: `CommentPolicyTest` falla si aparece un comentario
-  fuera de esos ocho archivos, y también si el número de anotaciones dentro de ellos baja de lo que
+  fuera de esos nueve archivos, y también si el número de anotaciones dentro de ellos baja de lo que
   hay registrado.
 - El código y el KDoc están en español. Los nombres de identificadores y de tests, en inglés.
 - `explicitApi()` está activo: cualquier miembro público necesita visibilidad y tipo de retorno

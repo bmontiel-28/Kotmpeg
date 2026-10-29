@@ -119,6 +119,13 @@ internal object MatroskaIds {
     const val CHAPTERS: Long = 0x1043A770L
     const val ATTACHMENTS: Long = 0x1941A469L
 
+    /**
+     * Los ids que solo pueden ir en el nivel 1 del segmento, o por encima —una cabecera EBML o un
+     * `Segment` encadenados—. Ninguno puede estar dentro de un cluster, así que cualquiera de ellos
+     * cierra un cluster de tamaño desconocido, como dice Matroska; no solo el siguiente cluster.
+     */
+    val TOP_LEVEL: Set<Long> = setOf(EBML, SEGMENT, SEEK_HEAD, INFO, TRACKS, CLUSTER, CUES, ATTACHMENTS, CHAPTERS, TAGS)
+
     const val TRACK_TYPE_VIDEO: Long = 1L
     const val TRACK_TYPE_AUDIO: Long = 2L
     const val TRACK_TYPE_SUBTITLE: Long = 17L

@@ -18,6 +18,8 @@ class com.braymon.kotmpeg.Kotmpeg
   fun openDemuxer(File, Function1<? super String, Unit>): Demuxer
   fun remux$default(Kotmpeg, File, File, ContainerFormat, Function1, Function1, Function1, Function1, int, Object): long
   fun remux(File, File, ContainerFormat, Function1<? super Integer, Boolean>, Function1<? super Long, Unit>, Function1<? super String, Unit>, Function1<? super MuxerOptions, Unit>): long
+  fun repair(File): RepairResult
+  fun repair(FileDescriptor): RepairResult
   fun requireDistinct(List<? extends File>, File): void
   fun synchronizedMuxer(Muxer): Muxer
   field INSTANCE: Kotmpeg
@@ -29,6 +31,7 @@ interface com.braymon.kotmpeg.Muxer
 class com.braymon.kotmpeg.MuxerOptions
   constructor()
   fun getCreationTimeMillis(): Long
+  fun getCuesReserveBytes(): int
   fun getFastStart(): boolean
   fun getFragmentDurationUs(): long
   fun getFragmented(): boolean
@@ -40,6 +43,7 @@ class com.braymon.kotmpeg.MuxerOptions
   fun getSegmentIndex(): boolean
   fun getWritingApp(): String
   fun setCreationTimeMillis(Long): void
+  fun setCuesReserveBytes(int): void
   fun setFastStart(boolean): void
   fun setFragmentDurationUs(long): void
   fun setFragmented(boolean): void
@@ -50,6 +54,12 @@ class com.braymon.kotmpeg.MuxerOptions
   fun setOnSegment(Function1<? super Mp4Segment, Unit>): void
   fun setSegmentIndex(boolean): void
   fun setWritingApp(String): void
+class com.braymon.kotmpeg.RepairResult
+  fun getDiscardedBytes(): long
+  fun getDurationUs(): long
+  fun getFormat(): ContainerFormat
+  fun getRepaired(): boolean
+  fun toString(): String
 class com.braymon.kotmpeg.audio.PcmMixer
   fun convertChannels(short[], int, int): short[]
   fun mix$default(PcmMixer, List, List, int, Object): short[]

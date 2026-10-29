@@ -49,8 +49,6 @@ internal class SampleTable {
     fun isKey(i: Int): Boolean = keys[i ushr PAGE_BITS]!![i and PAGE_MASK]
     fun durationUs(i: Int): Long = durationsUs[i ushr PAGE_BITS]!![i and PAGE_MASK]
 
-    fun isEmpty(): Boolean = size == 0
-
     private fun addPage() {
         if (pages == offsets.size) {
             val capacity = pages * 2

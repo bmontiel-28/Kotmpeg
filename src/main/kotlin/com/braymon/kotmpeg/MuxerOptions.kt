@@ -102,11 +102,31 @@ public class MuxerOptions {
      * sincroniza exacto. A cambio, la cabecera no se escribe al llamar
      * a `start()` sino con el primer fragmento, que es cuando se conoce el desfase que hay que
      * compensar.
+     *
+     * Eso vale con GOP cerrado, que es lo que da `MediaCodec`. Con GOP abierto —reempaquetar un
+     * x265 con sus opciones por defecto—, el desfase que fija el primer fragmento no alcanza para
+     * las imágenes iniciales de los siguientes, que quedan recortadas y fuera de orden: con esas
+     * fuentes conviene el valor por defecto (ver el KDoc de `FragmentedMp4Muxer`).
      */
     public var nonNegativeCompositionOffsets: Boolean = false
 
     /** Matroska: duración máxima de un cluster antes de abrir otro, en ms. */
     public var maxClusterDurationMs: Long = 5_000
+
+    /**
+     * Matroska: bytes reservados delante de los clusters para el índice `Cues`, que se amplía en
+     * ese hueco cada vez que se cierra un cluster, a la vez que se actualiza la duración. Es lo que
+     * hace que un archivo cortado a mitad de grabación —el proceso muere antes de `stop()`— se abra
+     * con su duración y se pueda buscar en él hasta el último cluster cerrado, sin reempaquetarlo.
+     *
+     * Cada cluster que empieza en un keyframe ocupa unos 22 bytes del índice. Los 64 KiB por
+     * defecto dan para unos 3 000: 50 minutos con un keyframe por segundo, hora y media con uno cada
+     * dos, o cuatro horas de solo audio, que abre un cluster cada [maxClusterDurationMs]. Si se
+     * llena, el índice deja de crecer ahí —lo que ya tiene sigue valiendo— y `stop()` lo escribe
+     * entero al final del archivo. 0 desactiva la reserva: el índice va siempre al final, como hasta
+     * la 4.0, y un archivo cortado se queda sin él. Si no es 0, entre 64 bytes y 16 MiB.
+     */
+    public var cuesReserveBytes: Int = 64 * 1024
 
     /**
      * Comprueba que los valores tienen sentido y devuelve estas mismas opciones. Es lo primero que
@@ -124,6 +144,9 @@ public class MuxerOptions {
             "con segmentIndex, maxFragmentBytes no puede pasar de 1 GiB: $maxFragmentBytes"
         }
         require(maxClusterDurationMs > 0) { "maxClusterDurationMs debe ser positivo: $maxClusterDurationMs" }
+        require(cuesReserveBytes == 0 || cuesReserveBytes in MIN_CUES_RESERVE..MAX_CUES_RESERVE) {
+            "cuesReserveBytes tiene que ser 0 o estar entre $MIN_CUES_RESERVE y $MAX_CUES_RESERVE: $cuesReserveBytes"
+        }
         require(!(fastStart && fragmented)) {
             "fastStart y fragmented son excluyentes (el fMP4 no necesita faststart: su cabecera ya va delante)"
         }
@@ -152,4 +175,10 @@ public class MuxerOptions {
             runCatching { out.close() }
             throw t
         }
+
+    private companion object {
+        /** Límites de [cuesReserveBytes]: por debajo no cabe casi nada; el máximo da para días de grabación. */
+        private const val MIN_CUES_RESERVE = 64
+        private const val MAX_CUES_RESERVE = 16 shl 20
+    }
 }

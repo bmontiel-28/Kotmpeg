@@ -18,7 +18,7 @@ import kotlin.test.assertTrue
  * ## Qué comprueba, y las dos direcciones
  *
  * - **Fuera de [BINARIO], ningún comentario.** Ni de línea ni de bloque. El KDoc sí, claro.
- * - **Dentro de [BINARIO], que no bajen.** Esos ocho archivos serializan o parsean formato byte a
+ * - **Dentro de [BINARIO], que no bajen.** Esos nueve archivos serializan o parsean formato byte a
  *   byte y son la única excepción: el nombre del campo de la especificación va en la propia línea
  *   porque no hay declaración a la que colgarlo, y es lo único que ata el código a ISO/IEC
  *   14496-10/12 y a RFC 8794. Se perdieron una vez en una limpieza y hubo que recuperarlos del
@@ -36,23 +36,37 @@ import kotlin.test.assertTrue
  *   otro equivocado, o moverlo a la línea de al lado, mantiene la cuenta y pasa en verde. Es
  *   inherente a contar, y contar era lo que resolvía el problema real —que desaparecieran—, así
  *   que el verde se lee como «no han desaparecido» y no como «son correctas».
- * - **Solo recorre este proyecto**, porque [RAICES] es relativo a él. Vigilar el código de quien
+ * - **Solo recorre este proyecto**, porque [raices] es relativo a él. Vigilar el código de quien
  *   consuma la librería ataría este test a cómo estén dispuestos los repositorios en el disco, y
- *   la política es de aquí: quien la quiera, se lleva el test.
+ *   la política es de aquí: quien la quiera, se lleva el test. Lo de aquí sí entra entero: además
+ *   de la librería y sus tests, los benchmarks y los consumidores de `compat/`, que son builds
+ *   aparte pero viven en este repositorio con las mismas reglas.
  * - **Bajar un número de [BINARIO] no tiene fricción**, y tiene que no tenerla. Eso significa que
  *   en ese caso el guardián vale lo que valga la revisión del commit que lo baje.
  */
 class CommentPolicyTest {
 
     private companion object {
-        val RAICES = listOf("src/main/kotlin", "src/test/kotlin")
+        /**
+         * Las carpetas de fuentes que se recorren: las del build principal, la de `benchmarks/` y la
+         * de cada proyecto de `compat/`, que se buscan en vez de listarse para que uno nuevo no se
+         * quede fuera sin que nadie lo note.
+         */
+        fun raices(): List<String> =
+            listOf("src/main/kotlin", "src/test/kotlin", "benchmarks/src") +
+                File("compat").listFiles().orEmpty().filter { it.isDirectory }.map { "compat/${it.name}/src" }.sorted()
 
         /**
          * Los archivos de serialización binaria, con el número de anotaciones que tienen que
          * llevar como mínimo. La ruta es relativa a `src/main/kotlin/com/braymon/kotmpeg/`.
+         *
+         * `mp4/MovieBoxes.kt` reúne las cajas de cabecera que antes escribían por separado
+         * `Mp4Muxer` y `FragmentedMp4Muxer` (`mvhd`, `tkhd`, `mdhd`, `hdlr`, `minf`), con sus
+         * anotaciones: de ahí que el mínimo de `Mp4Muxer` bajara de 24 a 13 sin perder ninguna.
          */
         val BINARIO = mapOf(
-            "mp4/Mp4Muxer.kt" to 24,
+            "mp4/Mp4Muxer.kt" to 13,
+            "mp4/MovieBoxes.kt" to 43,
             "codecconfig/NalUnits.kt" to 17,
             "mp4/Mp4Demuxer.kt" to 10,
             "mp4/FragmentedMp4Muxer.kt" to 9,
@@ -138,12 +152,16 @@ class CommentPolicyTest {
     }
 
     private fun fuentes(): List<File> {
-        val archivos = RAICES.map(::File).filter { it.isDirectory }
-            .flatMap { it.walkTopDown().filter { f -> f.isFile && f.extension == "kt" } }
+        val raices = raices()
+        assertEquals(
+            emptyList(), raices.filterNot { File(it).isDirectory },
+            "faltan raíces de fuentes; ¿ha cambiado el directorio de trabajo de los tests o se movió una carpeta?",
+        )
+        val archivos = raices.map(::File).flatMap { it.walkTopDown().filter { f -> f.isFile && f.extension == "kt" } }
         assertTrue(
             archivos.size > 40,
             "solo se encontraron ${archivos.size} archivos Kotlin; ¿ha cambiado el directorio " +
-                "de trabajo de los tests? Se esperan las raíces $RAICES",
+                "de trabajo de los tests? Se esperan las raíces $raices",
         )
         return archivos
     }

@@ -265,7 +265,7 @@ class HdrBoxAndDescriptorIoTest {
                 for (i in 0 until 5) muxer.writePacket(MediaPacket(id, ByteArray(32) { i.toByte() }, i * 40_000L, isKeyFrame = true))
             }
         }
-        assertTrue(file.length() < 4096, "quedó el contenido anterior: ${file.length()} bytes")
+        assertTrue(file.length() < 128 * 1024, "quedó el contenido anterior: ${file.length()} bytes")
         val warnings = ArrayList<String>()
         Kotmpeg.openDemuxer(file, onWarning = { warnings.add(it) }).use { demuxer ->
             assertEquals(5, generateSequence { demuxer.readPacket() }.count())

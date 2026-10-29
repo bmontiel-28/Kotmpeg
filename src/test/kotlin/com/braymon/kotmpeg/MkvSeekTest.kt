@@ -57,14 +57,9 @@ class MkvSeekTest {
         }
     }
 
-    /** El mismo archivo con el índice `Cues` inutilizado, para forzar la búsqueda recorriendo clusters. */
-    private fun withoutIndex(file: File): File {
-        val bytes = file.readBytes()
-        val cuesId = byteArrayOf(0x1C, 0x53, 0xBB.toByte(), 0x6B)
-        val cues = (bytes.size - 4 downTo 0).first { at -> cuesId.indices.all { bytes[at + it] == cuesId[it] } }
-        "XXXX".toByteArray().copyInto(bytes, cues)
-        return File(dir, "sin-indice.mkv").also { it.writeBytes(bytes) }
-    }
+    /** El mismo archivo con el índice `Cues` inutilizado ([withoutCuesIndex]), para forzar la búsqueda recorriendo clusters. */
+    private fun withoutIndex(file: File): File =
+        File(dir, "sin-indice.mkv").also { it.writeBytes(withoutCuesIndex(file.readBytes())) }
 
     private fun assertLandsOnKeyFrame(file: File, target: Long, expected: Long) {
         Kotmpeg.openDemuxer(file).use { demuxer ->
