@@ -49,7 +49,8 @@ class Mp4SampleIndexTest {
     /**
      * El algoritmo de `seekTo` tal como está documentado, sobre arrays: último keyframe con
      * `pts <= destino` entre las muestras del ancla que no empiezan a decodificarse después del
-     * destino; luego, con el `pts` de ese keyframe, lo mismo en las demás pistas de vídeo y, en las
+     * destino, o el primer keyframe si no hay ninguno antes; luego, con el `pts` de ese keyframe, lo
+     * mismo en las demás pistas de vídeo y, en las
      * de audio, la última muestra que no empieza después de él. Una pista cuya búsqueda llegó a su
      * última muestra y que desde ahí no presenta nada en ese instante ni después ya ha terminado, y
      * queda agotada. Devuelve el `pts` de destino y la posición de cada pista.
@@ -57,7 +58,7 @@ class Mp4SampleIndexTest {
     private fun expectedSeek(tracks: List<TrackInfo>, samples: Map<Int, List<Sample>>, t: Long): Pair<Long, Map<Int, Int>> {
         fun keyFrameAtOrBefore(list: List<Sample>, time: Long): Int {
             val limit = (list.indexOfFirst { it.dts > time }.let { if (it < 0) list.size else it }).coerceAtMost(list.size - 1)
-            return (limit downTo 0).firstOrNull { list[it].key && list[it].pts <= time } ?: 0
+            return (limit downTo 0).firstOrNull { list[it].key && list[it].pts <= time } ?: list.indexOfFirst { it.key }.coerceAtLeast(0)
         }
         val anchor = (tracks.firstOrNull { it is TrackInfo.Video } ?: tracks.first()).id
         val a = samples.getValue(anchor)

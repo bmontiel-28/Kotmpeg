@@ -46,6 +46,14 @@ class Mp4FieldWidthTest {
 
     private fun payload(i: Int) = ByteArray(32) { i.toByte() }
 
+    /** Cada 12 horas desde las 12 primeras hasta [farOutUs], que es el último: saltos que caben en el `stts`. */
+    private fun halfDays(): List<Long> = generateSequence(HALF_DAY_US) { it + HALF_DAY_US }.takeWhile { it < farOutUs }.toList() + farOutUs
+
+    private companion object {
+        /** 12 horas en µs: a 90 kHz son unos 3 900 millones de tics, dentro de los 32 bits del `stts`. */
+        const val HALF_DAY_US = 43_200_000_000L
+    }
+
     private fun be32(b: ByteArray, at: Int): Long =
         ((b[at].toLong() and 0xFF) shl 24) or ((b[at + 1].toLong() and 0xFF) shl 16) or
             ((b[at + 2].toLong() and 0xFF) shl 8) or (b[at + 3].toLong() and 0xFF)
@@ -92,6 +100,10 @@ class Mp4FieldWidthTest {
      * multipista, porque el codificador de audio y el de vídeo no entregan su primer paquete
      * en el mismo microsegundo. Basta con eso para que la caja exista, y en versión 0 su
      * `segment_duration` de 32 bits se truncaba en silencio.
+     *
+     * Los paquetes van cada 12 horas hasta [farOutUs]: un único salto de 57 días no cabe en los
+     * 32 bits del `stts`, y desde la 4.1.1 `Mp4Muxer` lo rechaza en vez de truncarlo (ver
+     * `Mp4WriteValidationTest`).
      */
     @Test
     fun `an edit list longer than 32 bits is written as version 1`() {
@@ -102,8 +114,10 @@ class Mp4FieldWidthTest {
             muxer.start()
             muxer.writePacket(MediaPacket(v, payload(0), 0, 0, true, 33_333L))
             muxer.writePacket(MediaPacket(a, payload(1), 1_000_000L, 1_000_000L, true, 21_333L))
-            muxer.writePacket(MediaPacket(v, payload(2), farOutUs, farOutUs, true, 33_333L))
-            muxer.writePacket(MediaPacket(a, payload(3), farOutUs, farOutUs, true, 21_333L))
+            for ((i, t) in halfDays().withIndex()) {
+                muxer.writePacket(MediaPacket(v, payload(2 + 2 * i), t, t, true, 33_333L))
+                muxer.writePacket(MediaPacket(a, payload(3 + 2 * i), t, t, true, 21_333L))
+            }
         }
 
         val bytes = file.readBytes()

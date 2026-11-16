@@ -18,6 +18,7 @@ import java.io.File
 import java.io.FileDescriptor
 import java.io.FileNotFoundException
 import java.nio.file.Files
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * Punto de entrada del motor de contenedores en Kotlin puro (MKV + MP4).
@@ -237,6 +238,9 @@ public object Kotmpeg {
      * Todo lo que se puede comprobar antes de escribir —que las entradas se abren y son
      * compatibles— se comprueba antes de abrir [output], así que una llamada rechazada deja
      * intacto lo que hubiera en esa ruta. Hasta la 4.0 la truncaba primero y la dejaba vacía.
+     *
+     * [onProgress] y lo que pasa si la copia se corta, como en [remux]. Como allí, el recorte que
+     * haga la lista de edición de una entrada MP4 no se conserva.
      */
     public fun concat(
         inputs: List<File>,
@@ -250,7 +254,7 @@ public object Kotmpeg {
         requireDistinct(inputs, output)
         val layouts = inputs.map { file -> openDemuxer(file, onWarning).use { it.tracks } }
         Remuxer.requireConcatenable(layouts)
-        return createMuxer(output, format, options).use { muxer ->
+        return copyInto(output, createMuxer(output, format, options)) { muxer ->
             val concatenation = Remuxer.Concatenation(layouts.first(), muxer, onProgress)
             for ((index, file) in inputs.withIndex()) {
                 var opening = true
@@ -272,6 +276,27 @@ public object Kotmpeg {
      * puede salir bien —ninguna pista seleccionada, vídeo sin `codecPrivate`— se rechaza antes de
      * abrir [output]. Hasta la 4.0 el filtro se evaluaba dos veces, al comprobar y al copiar, y uno
      * con estado podía no seleccionar nada la segunda vez: el error llegaba con [output] ya vacía.
+     *
+     * [onProgress] se llama tras escribir cada paquete, desde el mismo hilo, con su `pts` en
+     * microsegundos. Es el del último paquete escrito, en orden de decodificación, así que con
+     * B-frames no siempre crece: para una barra de progreso, quédate con el mayor que hayas visto.
+     * Lanzar desde él corta la copia, y la excepción sale de esta llamada:
+     *
+     *  - una `CancellationException` —la de cancelar una corrutina— **borra [output]**: se cierra
+     *    sin terminarlo y se elimina, porque nadie pidió un parcial. Hasta la 4.1.0 se terminaba
+     *    como si la copia hubiera acabado, y con `fastStart` se reescribía entero antes de volver;
+     *  - cualquier otra excepción, de [onProgress] o de la propia copia, **conserva** lo escrito:
+     *    se cierra con `stop()` y queda legible hasta el último paquete. Si ni eso se puede, un MKV
+     *    o un MP4 fragmentado se recuperan con [repair].
+     *
+     * El recorte que haga una lista de edición de [input] no se conserva: con un MP4 que oculta sus
+     * primeros fotogramas —lo que deja `ffmpeg -ss … -c copy`, que corta en el keyframe anterior y
+     * esconde los sobrantes con la edición—, la copia los muestra, en los tres contenedores. Los
+     * muxers MP4 empiezan la línea de tiempo en el paquete más temprano, que es lo que piden los
+     * archivos en vivo, y Matroska no tiene nada equivalente a esa edición. Descartar esos paquetes
+     * antes de escribirlos tampoco da un recorte exacto: los fotogramas que se ven hasta el
+     * keyframe siguiente se decodifican a partir del keyframe oculto, y sin él no salen. Un recorte
+     * exacto del vídeo exige recodificar, que esta librería no hace.
      */
     public fun remux(
         input: File,
@@ -288,11 +313,51 @@ public object Kotmpeg {
             val selected = demuxer.tracks.filter { trackFilter(it.id) }
             Remuxer.requireWritable(selected)
             val selectedIds = selected.mapTo(HashSet()) { it.id }
-            return createMuxer(output, format, options).use { muxer ->
+            return copyInto(output, createMuxer(output, format, options)) { muxer ->
                 Remuxer.remux(demuxer, muxer, { it in selectedIds }, onProgress)
             }
         } finally {
             demuxer.close()
+        }
+    }
+
+    /**
+     * Ejecuta [copy] sobre [muxer], que escribe en [output], y lo cierra después, también si falla:
+     * es el `use` de siempre salvo ante una `CancellationException`, que cierra el muxer **sin
+     * terminarlo** y borra [output] antes de relanzarla (ver [remux]). La clase es la de la
+     * biblioteca estándar, que en la JVM es la de `java.util.concurrent`: la de las corrutinas, sin
+     * depender de ellas.
+     */
+    private inline fun <T> copyInto(output: File, muxer: Muxer, copy: (Muxer) -> T): T {
+        val result = try {
+            copy(muxer)
+        } catch (cancelled: CancellationException) {
+            try {
+                abort(muxer)
+            } catch (closeFailure: Throwable) {
+                cancelled.addSuppressed(closeFailure)
+            }
+            output.delete()
+            throw cancelled
+        } catch (failure: Throwable) {
+            try {
+                muxer.close()
+            } catch (closeFailure: Throwable) {
+                failure.addSuppressed(closeFailure)
+            }
+            throw failure
+        }
+        muxer.close()
+        return result
+    }
+
+    /** Cierra [muxer] sin terminar el archivo; uno que no es de esta librería, con `close()`. */
+    private fun abort(muxer: Muxer) {
+        when (muxer) {
+            is MkvMuxer -> muxer.abort()
+            is Mp4Muxer -> muxer.abort()
+            is FragmentedMp4Muxer -> muxer.abort()
+            else -> muxer.close()
         }
     }
 
@@ -311,13 +376,28 @@ public object Kotmpeg {
      * necesitar otra vez su tamaño en disco. Con un archivo de los muxers de esta librería tiene los
      * mismos paquetes y la misma duración que reempaquetarlo con [remux]; con uno de otro programa
      * los paquetes son los mismos, pero el remux puede intercalar las pistas en otro orden o
-     * redondear la duración en un microsegundo.
+     * redondear la duración en un microsegundo. Con desfases de composición sin signo
+     * (`nonNegativeCompositionOffsets`) y B-frames, el remux recalcula con sus propios fragmentos
+     * el desplazamiento de esos desfases, y eso tiene dos efectos: puede presentar algún fotograma
+     * un tic de la escala de su pista más tarde, unos 11 µs a 90 kHz, y si la pista más larga es la
+     * de vídeo y el desplazamiento solo es cero en uno de los dos archivos, la duración que lee
+     * [openDemuxer] puede diferir en menos de un milisegundo, porque en el otro sale del `mvhd`. La
+     * reparación deja los tiempos que ya tiene el archivo. Hasta la 4.1.0 la duración de un fMP4
+     * reparado y la de su remux podían diferir en un fotograma cuando el último se decodificaba
+     * fuera de orden.
+     *
+     * **Solo para un archivo que ya no se está escribiendo**: al arrancar la app, con las
+     * grabaciones que dejó a medias la ejecución anterior. Reparar el de una grabación en curso lo
+     * da por terminado mientras su muxer sigue añadiendo datos detrás: si el proceso muere después,
+     * un MKV así no deja leer ni un paquete, y otro `repair` lo da por cerrado y no lo arregla.
      *
      * Un archivo ya cerrado no se toca (`repaired = false`). Lo que no se reconoce —otro
      * contenedor, un MP4 plano, una cabecera cortada, daños que no están al final— se rechaza con
      * `IllegalArgumentException` **sin modificar nada**: todas las comprobaciones se hacen antes de
-     * escribir. Si la reparación se interrumpe a medias, el archivo sigue pareciendo sin cerrar y se
-     * puede volver a lanzar.
+     * escribir. También un MKV que se cerró bien y se truncó después —una copia que no llegó a
+     * terminar—, aunque se lea hasta el corte, porque su `Segment` declara más bytes de los que
+     * tiene; un MP4 fragmentado en el mismo caso sí se repara. Si la reparación se interrumpe a
+     * medias, el archivo sigue pareciendo sin cerrar y se puede volver a lanzar.
      */
     public fun repair(file: File): RepairResult {
         if (!file.isFile) throw FileNotFoundException("${file.path} no existe o no es un archivo")

@@ -17,6 +17,7 @@ import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.model.TrackRequirements
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.security.MessageDigest
 import java.util.Random
 
 /**
@@ -80,7 +81,15 @@ public class MkvMuxer internal constructor(
 
     private val ebml = EbmlWriter(out)
     private val tracks = ArrayList<TrackInfo>()
-    private val random = Random()
+
+    /**
+     * De dónde salen el `SegmentUID` y los `TrackUID`. Con fecha de creación, al azar, como
+     * siempre. Sin ella se fija en [start] a partir de la cabecera (ver [uidSeed]): es la opción
+     * que promete dos archivos iguales byte a byte para la misma entrada, y hasta la 4.1.0 en
+     * Matroska no lo eran, porque los 32 bytes de identificadores de un archivo con dos pistas
+     * salían siempre de un `Random` sin semilla.
+     */
+    private var random = Random()
 
     private var started = false
     private var stopped = false
@@ -192,6 +201,7 @@ public class MkvMuxer internal constructor(
         check(!started) { "ya iniciado" }
         check(tracks.isNotEmpty()) { "sin pistas" }
         started = true
+        if (dateUtcMillis == null) random = Random(uidSeed())
 
         timeline = MkvTimeline(MkvTimeline.cueTrack(tracks) { it is TrackInfo.Video }.id.toLong())
         trackEnds = tracks.map { MkvTimeline.Track(it.defaultDurationNs) }
@@ -213,6 +223,27 @@ public class MkvMuxer internal constructor(
         writeSeekHead()
         if (cuesReservePos >= 0) reserveCues()
         out.flush()
+    }
+
+    /**
+     * La semilla de los identificadores sin fecha de creación: los primeros 8 bytes del SHA-256 de
+     * lo que describe la cabecera —la aplicación y cada pista con su configuración de códec—.
+     * `java.util.Random` con semilla da la misma secuencia en cualquier JVM y en Android, así que
+     * la misma entrada da los mismos UID. Dos grabaciones con la misma cabecera comparten
+     * `SegmentUID`, que es justo lo que pide quien quiere salidas reproducibles; quien necesite
+     * identificadores únicos, que deje la fecha.
+     */
+    private fun uidSeed(): Long {
+        val digest = MessageDigest.getInstance("SHA-256")
+        digest.update(writingApp.toByteArray(Charsets.UTF_8))
+        for (track in tracks) {
+            digest.update(track.toString().toByteArray(Charsets.UTF_8))
+            track.codecPrivate?.let { digest.update(it) }
+        }
+        val hash = digest.digest()
+        var seed = 0L
+        for (i in 0 until 8) seed = (seed shl 8) or (hash[i].toLong() and 0xFF)
+        return seed
     }
 
     /** Escribe en [cuesReservePos] la reserva del índice: un `Cues` vacío que la ocupa entera (ver `MkvLayout`). */
@@ -593,5 +624,16 @@ public class MkvMuxer internal constructor(
 
     override fun close() {
         stop()
+    }
+
+    /**
+     * Cierra el archivo sin terminarlo —sin índice ni duraciones—, para borrarlo después. Es lo que
+     * hacen `Kotmpeg.remux` y `Kotmpeg.concat` con una copia cancelada: terminarla con [stop]
+     * dejaba en disco un parcial cerrado y legible que nadie pidió. Después, [stop] no hace nada.
+     */
+    internal fun abort() {
+        if (stopped) return
+        stopped = true
+        out.close()
     }
 }

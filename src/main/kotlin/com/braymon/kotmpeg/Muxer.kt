@@ -11,6 +11,14 @@ import java.io.Closeable
  * Los paquetes deben llegar en orden de decodificación por pista; las pistas pueden
  * intercalarse libremente, pero conviene mantenerlas alineadas en el tiempo para un buen
  * comportamiento en reproductores y streaming.
+ *
+ * Si falla al construirse, el archivo queda cerrado. Si falla después —un paquete rechazado, un
+ * error de E/S—, el muxer sigue abierto y hay que cerrarlo: con `use { }`, que llama a [stop].
+ *
+ * **No interrumpas el hilo que escribe.** `FileChannel` se cierra al recibir una interrupción, y
+ * desde entonces [writePacket] y [stop] fallan con `IOException`: un MP4 plano se queda sin `moov`
+ * y no se puede leer; un MKV o un MP4 fragmentado se recuperan con `Kotmpeg.repair`. Para parar
+ * una grabación, deja de llamar a [writePacket] y llama a [stop].
  */
 public interface Muxer : Closeable {
     /** Registra una pista antes de [start]. Devuelve el id a usar en [MediaPacket.trackId]. */
@@ -25,10 +33,20 @@ public interface Muxer : Closeable {
      *
      * El array de [MediaPacket.data] se puede reutilizar en cuanto vuelve: ningún muxer guarda una
      * referencia a él (ver [MediaPacket]).
+     *
+     * En un MP4 fragmentado, el `onSegment` de `MuxerOptions` se ejecuta **dentro** de esta llamada,
+     * en el mismo hilo, cuando el paquete cierra un fragmento —y dentro de [stop], con el
+     * último—; con `Kotmpeg.synchronizedMuxer`, dentro de su cerrojo. Lo que tarde lo tarda la
+     * escritura.
+     *
+     * @throws IllegalStateException antes de [start] o después de [stop].
      */
     public fun writePacket(packet: MediaPacket)
 
-    /** Finaliza índices/cabeceras y cierra el archivo. Idempotente. */
+    /**
+     * Finaliza índices/cabeceras y cierra el archivo. Idempotente: una segunda llamada no hace
+     * nada. Después, [writePacket] lanza `IllegalStateException`.
+     */
     public fun stop()
 }
 
@@ -43,12 +61,16 @@ public interface Muxer : Closeable {
  * comprueba. Un archivo solo truncado, si abre, no lanza al leer: entrega hasta su último paquete
  * completo y termina con `null`. `Kotmpeg.repair`, que sí escribe, es más estricto: lo que no
  * reconoce lo rechaza con `IllegalArgumentException` sin tocarlo.
+ *
+ * Si falla al abrir, el archivo queda cerrado. Si falla al leer, el demuxer sigue abierto y hay que
+ * cerrarlo: con `use { }`.
  */
 public interface Demuxer : Closeable {
     /**
      * Las pistas que se pueden leer, en el orden del archivo, cada una con el id que llevan sus
      * paquetes en [MediaPacket.trackId]. Las de un códec que no se soporta, o cuya cabecera no se
-     * puede leer, no están: se descartan al abrir y se avisa por `onWarning`.
+     * puede leer, no están: se descartan al abrir y se avisa por `onWarning`. Una pista sin
+     * ninguna muestra sí está, y no entrega ningún paquete.
      */
     public val tracks: List<TrackInfo>
 
@@ -61,7 +83,9 @@ public interface Demuxer : Closeable {
     /**
      * Reposiciona el stream en el último keyframe con `pts <= `[timestampUs] de la pista ancla
      * —la primera de vídeo, o la primera si no hay vídeo— y devuelve su `pts`, en
-     * microsegundos. Si no hay ninguno antes, en el primero.
+     * microsegundos. Si no hay ninguno antes, en el primero. Una pista sin ningún paquete no es
+     * ancla: si la primera de vídeo está vacía —la cámara no llegó a entregar fotogramas—, lo es
+     * la siguiente de vídeo, y si no hay otra, la primera de las demás que tenga paquetes.
      *
      * Lo siguiente que entrega [readPacket] de esa pista es ese keyframe. Las demás siguen desde
      * el mismo instante **de presentación**, para que un recorte que empiece en el valor devuelto

@@ -19,7 +19,11 @@ public object Remuxer {
      * Copia todas las pistas soportadas de [demuxer] a [muxer].
      *
      * @param trackFilter  devuelve false para descartar una pista (por id de entrada).
-     * @param onProgress   se llama con el último pts escrito (us).
+     * @param onProgress   se llama tras escribir cada paquete, desde el mismo hilo, con su pts en
+     *                     µs: en orden de decodificación, así que con B-frames no siempre crece.
+     *                     Lanzar desde él corta la copia y la excepción sale de aquí con [muxer]
+     *                     sin terminar: cerrarlo, o descartar el archivo, es cosa de quien llama
+     *                     (`Kotmpeg.remux` lo hace por ti).
      * @return número de paquetes escritos.
      */
     public fun remux(

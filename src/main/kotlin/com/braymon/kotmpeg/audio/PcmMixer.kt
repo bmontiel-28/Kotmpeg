@@ -116,9 +116,19 @@ public object PcmMixer {
         else -> throw IllegalArgumentException("conversión de canales no soportada: $from -> $to")
     }
 
-    /** Copia un ByteBuffer PCM (little-endian) a un ShortArray sin consumirlo. */
+    /**
+     * Copia un ByteBuffer PCM (little-endian) a un ShortArray sin consumirlo.
+     *
+     * Un número impar de bytes pendientes se rechaza con `IllegalArgumentException`: la última
+     * muestra estaría a medias. Hasta la 4.1.0 ese byte se perdía en silencio —5 bytes daban 2
+     * muestras—, al revés que en `PcmResampler.resample`, que ya rechazaba un frame incompleto por
+     * el mismo motivo.
+     */
     public fun toShortArray(buffer: ByteBuffer): ShortArray {
         val duplicate = buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        require(duplicate.remaining() % 2 == 0) {
+            "el buffer PCM tiene ${duplicate.remaining()} bytes: una muestra de 16 bits a medias se perdería en silencio"
+        }
         val out = ShortArray(duplicate.remaining() / 2)
         duplicate.asShortBuffer().get(out)
         return out

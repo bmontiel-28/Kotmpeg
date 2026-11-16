@@ -42,7 +42,16 @@ public sealed class TrackInfo {
     public abstract val id: Int
     public abstract val codecPrivate: ByteArray?
 
-    /** Código de idioma ISO 639-2, p. ej. "und", "spa", "eng". */
+    /**
+     * Código de idioma ISO 639-2, p. ej. "und", "spa", "eng".
+     *
+     * Se guarda normalizado: en minúsculas y sin espacios alrededor, y lo que no sea un código de
+     * tres letras ASCII —`"es"`, `"es-MX"`, `""`, `"zz9"`— pasa a `"und"`. No se rechaza: se
+     * normaliza al construir la pista, también la que devuelven los demuxers, así que MKV y MP4
+     * escriben y releen el mismo valor. Hasta la 4.1.0 se guardaba tal cual: Matroska lo escribía
+     * en su elemento `Language`, que es el de los códigos ISO 639-2 (los de BCP 47 van en otro), y
+     * MP4 lo escribía como `"und"`, sin aviso; un `remux` de MKV a MP4 lo perdía.
+     */
     public abstract val language: String
 
     /** Nombre legible de la pista, opcional. */
@@ -115,7 +124,7 @@ public sealed class TrackInfo {
         public val color: ColorInfo? = builder.color
 
         override val codecPrivate: ByteArray? = builder.codecPrivate
-        override val language: String = builder.language
+        override val language: String = TrackLanguage.normalize(builder.language)
         override val name: String? = builder.name
         override val default: Boolean? = builder.default
 
@@ -277,7 +286,7 @@ public sealed class TrackInfo {
         public val codecDelayUs: Long = builder.codecDelayUs
 
         override val codecPrivate: ByteArray? = builder.codecPrivate
-        override val language: String = builder.language
+        override val language: String = TrackLanguage.normalize(builder.language)
         override val name: String? = builder.name
         override val default: Boolean? = builder.default
 
@@ -352,6 +361,22 @@ public sealed class TrackInfo {
             public var name: String? = null
             public var default: Boolean? = null
         }
+    }
+}
+
+/** La normalización de [TrackInfo.language], la misma para las dos pistas y los dos contenedores. */
+internal object TrackLanguage {
+    /** El código de «idioma no determinado» de ISO 639-2. */
+    const val UNDETERMINED: String = "und"
+
+    /**
+     * [code] en minúsculas y sin espacios alrededor si es un código de tres letras ASCII, o
+     * [UNDETERMINED] si no. Es el único formato que cabe en el `mdhd` de MP4, que lo guarda en tres
+     * letras de 5 bits, y el que define Matroska para su elemento `Language`.
+     */
+    fun normalize(code: String): String {
+        val normalized = code.trim().lowercase()
+        return if (normalized.length == 3 && normalized.all { it in 'a'..'z' }) normalized else UNDETERMINED
     }
 }
 

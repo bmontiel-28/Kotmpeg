@@ -120,9 +120,9 @@ internal class Mp4SampleEntryReader(private val boxes: Mp4BoxReader, private val
                     }
                 }
                 "mdcv" -> {
-                    val v = DoubleArray(8) { (input.readUInt(2)) * 0.00002 }
-                    val maxLum = (input.readInt32().toLong() and 0xFFFFFFFFL) * 0.0001
-                    val minLum = (input.readInt32().toLong() and 0xFFFFFFFFL) * 0.0001
+                    val v = DoubleArray(8) { (input.readUInt(2)) / CHROMATICITY_UNITS }
+                    val maxLum = (input.readInt32().toLong() and 0xFFFFFFFFL) / LUMINANCE_UNITS
+                    val minLum = (input.readInt32().toLong() and 0xFFFFFFFFL) / LUMINANCE_UNITS
                     mastering = doubleArrayOf(v[4], v[5], v[0], v[1], v[2], v[3], v[6], v[7], maxLum, minLum)
                 }
                 "clli" -> {
@@ -337,5 +337,16 @@ internal class Mp4SampleEntryReader(private val boxes: Mp4BoxReader, private val
         private const val ES_STREAM_DEPENDENCE_FLAG = 0x80
         private const val ES_URL_FLAG = 0x40
         private const val ES_OCR_STREAM_FLAG = 0x20
+
+        /**
+         * Unidades por unidad de las cromaticidades y de la luminancia del `mdcv` (CTA-861.3):
+         * 0,00002 y 0,0001. Se **divide** entre ellas en vez de multiplicar por 0,00002 y 0,0001,
+         * que no son exactos en binario: 35 400 unidades daban 0,7080000000000001 y no 0,708, el
+         * `ColorInfo` de un MP4 no era igual al del mismo HDR10 leído de un MKV —que lo guarda como
+         * float— y `concat` de los dos fallaba con «color distinto». Dividiendo, un valor que el
+         * `mdcv` representa exacto vuelve exacto.
+         */
+        private const val CHROMATICITY_UNITS = 50_000.0
+        private const val LUMINANCE_UNITS = 10_000.0
     }
 }

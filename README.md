@@ -11,8 +11,14 @@ pantalla, audio del sistema y micrófono —mezclados en una pista o cada uno en
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10. Sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
 
-**Versión: 4.1.0**
+**Versión: 4.1.1**
 
+- **La `4.1.1` corrige lo que encontró una revisión de la `4.1.0`**, sin cambiar la API: una
+  fuente de `PcmStreamMixer` que deja de entregar audio ya no queda desfasada ni muda el resto de
+  la grabación; el fMP4 con `nonNegativeCompositionOffsets` coloca bien los B-frames tras un corte
+  a mitad de GOP y da a una pista que arranca tarde su duración real; `repair` deja la misma
+  duración que `remux`; cancelar una copia borra la salida; y la búsqueda en un MKV cuya primera
+  pista de vídeo está vacía ya no vuelve al principio. El detalle, en el [CHANGELOG](CHANGELOG.md).
 - **La `4.1.0` hace que una grabación cortada siga sirviendo.** Si el proceso muere antes de
   `stop()`, el MKV y el MP4 fragmentado se abren con su duración y se pueden recorrer hasta el
   último cluster o fragmento cerrado, sin reempaquetarlos, y `Kotmpeg.repair` los cierra en el
@@ -53,7 +59,17 @@ Kotmpeg.openDemuxer(File("clip.mp4")).use { d ->
     println("${d.durationUs / 1000} ms, ${d.tracks.size} pistas")
     d.tracks.forEach { println("${it.id}: ${it.name} (${it.language}) default=${it.default}") }
 }
+
+// Con progreso: el pts del último paquete escrito, en µs.
+var hasta = 0L
+Kotmpeg.remux(File("entrada.mkv"), File("salida.mp4"), onProgress = { ptsUs -> hasta = maxOf(hasta, ptsUs) })
 ```
+
+`onProgress` se llama tras escribir cada paquete, desde el mismo hilo, con su `pts` en
+microsegundos. Va en orden de decodificación, así que con B-frames no siempre crece: para una barra
+de progreso, quédate con el mayor. Lanzar desde él corta la copia y la excepción sale de `remux` o
+`concat`: una `CancellationException` —la de cancelar una corrutina— **borra la salida**;
+cualquier otra la conserva, cerrada y legible hasta el último paquete escrito.
 
 Y el nivel bajo, cuando ya tienes paquetes codificados (por ejemplo, de `MediaCodec`) y solo
 quieres el contenedor:
@@ -154,10 +170,12 @@ fun mezclar(sistemaEstereo48k: ShortArray, microfonoMono44k: ShortArray): ShortA
 - **La suma satura**, no se envuelve: dos señales fuertes dan `32767`, nunca un chasquido de signo
   cambiado.
 - **Alimenta bloques que cubran el mismo tiempo.** `mix` trata la fuente más corta como silencio
-  a partir de su final, así que si los bloques no cuadran, se oye un hueco. El remuestreador es
-  exacto en enteros: tras N frames de entrada ha emitido exactamente los que corresponden, sin
-  deriva en sesiones de horas, así que no hace falta corregir nada a mano. Si cuadrarlos te toca a
-  ti, usa `PcmStreamMixer` (abajo), que lo hace por ti.
+  a partir de su final, así que si los bloques no cuadran, se oye un hueco. El remuestreador cuenta
+  en enteros: tras N frames de entrada ha emitido los que corresponden, sin error acumulado en
+  sesiones de horas (con `flush()`, `round(N · salida / entrada)`; al reducir la frecuencia a menos
+  de la mitad, puede ser un frame más). Eso no corrige relojes distintos: si un dispositivo entrega
+  algo más despacio de lo que declara, el bloque que sale es más corto. Si cuadrarlos te toca a ti,
+  usa `PcmStreamMixer` (abajo), que lo hace por ti.
 - **Rendimiento**: mezclar una hora de estéreo a 48 kHz en bloques de 10 ms cuesta unos 0,3 s de
   CPU sin ganancias (la ruta es entera, ~6 veces más rápida que en la `2.x`) y unos 2,3 s con
   ganancias, medido en un equipo de desarrollo. El resultado es idéntico bit a bit al de la `2.x`.
@@ -185,21 +203,37 @@ val ptsUs = inicioUs + desde * 1_000_000 / 48_000     // marca del primer frame 
 val cola = mezclador.flush()
 ```
 
-- **El resultado es el de mezclar a mano**: idéntico, muestra a muestra, a convertir y sumar los
-  flujos enteros con `PcmResampler`, `PcmMixer.convertChannels` y `PcmMixer.mix`, sea cual sea el
-  tamaño de los trozos y el orden en que lleguen.
+- **`inicioUs` es el instante de la primera muestra** de las fuentes —el frame 0 de la mezcla—, en
+  el mismo reloj y en la misma unidad que los PTS del vídeo: con `MediaCodec` y una `Surface`,
+  `System.nanoTime() / 1000`. Tómalo al recibir el primer trozo de audio, o mejor, de la marca que
+  dé la fuente para su primer frame (`AudioRecord.getTimestamp` con `TIMEBASE_MONOTONIC`). Sin él,
+  el audio empieza en cero, el vídeo en su reloj, y no se sincronizan.
+- **Mientras ninguna fuente pierda audio, el resultado es el de mezclar a mano**: idéntico, muestra
+  a muestra, a convertir y sumar los flujos enteros con `PcmResampler`, `PcmMixer.convertChannels` y
+  `PcmMixer.mix`, sea cual sea el tamaño de los trozos y el orden en que lleguen.
 - **Es seguro entre hilos**: cada fuente desde su hilo y la lectura desde el del codificador. Los
   arrays se copian, así que puedes reutilizar tu buffer.
 - **Si una fuente se retrasa**, se la espera hasta `maxLatencyMs` (500 ms por defecto). Pasado ese
-  margen, su parte se mezcla como silencio y, cuando el audio retrasado llega, se descarta lo ya
-  entregado: un tirón deja un hueco corto, pero nunca desincroniza esa fuente para el resto de la
-  grabación. `lostFrames(fuente)` lo cuenta, y si crece, esa fuente se está quedando atrás.
+  margen, su parte se mezcla como silencio, y lo que pasa después depende de cómo vuelva su audio:
+  - **en ráfaga** —el que retenía un hilo atascado—, se descarta lo que corresponde al tiempo ya
+    entregado y la fuente sigue en su sitio: un tirón deja un hueco corto y nada más;
+  - **a ritmo normal**, sin recuperar lo que faltó —una fuente a la que se dejó de escribir un
+    rato—, si en `maxLatencyMs` no lo recupera, ese tramo se da por perdido y el audio nuevo se
+    coloca donde llega. Se tolera sin corregir una décima parte de `maxLatencyMs` (50 ms por
+    defecto), así que la fuente puede quedar desfasada hasta eso.
+
+  `lostFrames(fuente)` cuenta lo mezclado como silencio y lo descartado; si crece, esa fuente se
+  está quedando atrás. Hasta la 4.1.0 todo retraso se trataba como una ráfaga, y una fuente cuyo
+  audio no volvía quedaba desfasada o **muda** el resto de la grabación.
+- **Para silenciar una fuente, escríbele ceros**, no dejes de escribirle: así sigue en su sitio y
+  no pierde nada. Si dejas de escribirle, la mezcla la espera hasta `maxLatencyMs` cada vez.
 - **Arranque**: las fuentes que entregan audio antes de que salga la primera mezcla se consideran
   simultáneas. Si sabes que una arrancó X ms después, escríbele antes X ms de silencio. Una fuente
   que empieza cuando la mezcla ya ha salido se coloca donde llega.
 - **No corrige la deriva de reloj** entre fuentes: las frecuencias se toman por su valor nominal.
-  Si un dispositivo entregara una fuente algo más despacio de lo que declara, se vería en
-  `lostFrames` como pérdidas puntuales, nunca como un desfase creciente.
+  Una fuente que entrega algo más despacio de lo que declara se va quedando atrás —con 45 partes por
+  millón, unos 160 ms por hora— hasta pasar la tolerancia; entonces pierde ese tramo, que se oye
+  como un hueco corto, y vuelve a su sitio. El desfase queda acotado a la tolerancia.
 
 ### Cada fuente en su pista
 
@@ -243,10 +277,15 @@ Es un jar de Kotlin/JVM, no un AAR, y no declara manifiesto, recursos ni permiso
 | Requisito | Valor |
 |---|---|
 | `minSdk` soportado | **26 (Android 8.0)** |
-| Nivel de Java de tu app | 17 o superior (`compileOptions` y `kotlinOptions`) |
+| Nivel de Java de tu app | 17 o superior (`compileOptions` y `kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_17) } }`) |
 | Kotlin de tu app | 1.9 o superior |
 | Permisos que exige la librería | Ninguno |
 | Dependencias que arrastra | Ninguna |
+| Código nativo | Ninguno |
+| Reglas de R8/ProGuard | Ninguna: no usa reflexión |
+
+Con Kotlin 2.2 o superior, el bloque `kotlinOptions { jvmTarget = "17" }` de los ejemplos antiguos
+es un error de compilación; el de la tabla es el que lo sustituye.
 
 Toda la superficie de plataforma que usa —`java.io.File`, `RandomAccessFile`, `FileDescriptor`,
 `ByteBuffer`, `FileChannel`, `java.nio.file.Files`, `java.util.zip.Inflater`— existe en la API 26.
@@ -263,7 +302,13 @@ Lo que conviene saber al integrarla:
   formato del contenedor, y la configuración de códec (`avcC`/`hvcC`/ASC/OpusHead) viaja en
   `TrackInfo.codecPrivate`.
 - **Los codificadores entregan desde hilos distintos.** Envuelve el muxer con
-  `Kotmpeg.synchronizedMuxer(...)` y llama a `writePacket` desde cada callback.
+  `Kotmpeg.synchronizedMuxer(...)` y llama a `writePacket` desde cada callback. `onSegment` se
+  ejecuta dentro de ese cerrojo, y tras `stop()` un `writePacket` tardío lanza
+  `IllegalStateException` (ver [Contrato de un solo hilo](#contrato-de-un-solo-hilo)).
+- **No interrumpas el hilo que escribe** —`Thread.interrupt()`, `shutdownNow()` de un
+  `ExecutorService`, `Future.cancel(true)`—: el canal del archivo se cierra y `writePacket` y
+  `stop()` fallan con `IOException`. Un MP4 plano queda ilegible; un MKV o un fMP4, por cerrar con
+  `Kotmpeg.repair`.
 - **Las marcas de tiempo de `MediaCodec` se pasan tal cual**, aunque cuenten desde el arranque del
   dispositivo, y **en el orden en que lleguen**: los tres muxers empiezan la línea de tiempo en el
   paquete más temprano de todas las pistas, aunque no sea el primero en llegar (lo normal cuando el
@@ -306,7 +351,7 @@ dependencyResolutionManagement {
 
 // build.gradle.kts — qué bajar
 dependencies {
-    implementation("com.github.bmontiel-28:Kotmpeg:4.1.0")
+    implementation("com.github.bmontiel-28:Kotmpeg:4.1.1")
 }
 ```
 
@@ -332,7 +377,7 @@ aquí sale uno. Escribirla con punto antes de `Kotmpeg` da un `Could not find`.
 // settings.gradle.kts
 dependencyResolutionManagement { repositories { mavenLocal(); mavenCentral() } }
 // build.gradle.kts
-dependencies { implementation("com.braymon:kotmpeg-core:4.1.0") }
+dependencies { implementation("com.braymon:kotmpeg-core:4.1.1") }
 ```
 
 Las dos opciones publican el jar y un jar de fuentes, así que el IDE deja navegar el código y leer
@@ -352,6 +397,19 @@ distintos—, envuelve el muxer con `Kotmpeg.synchronizedMuxer`, que serializa c
 un único cerrojo. Un `PcmResampler` por fuente, usado desde el hilo de esa fuente. `PcmMixer` no
 tiene estado y se puede llamar desde cualquier hilo. `PcmStreamMixer` es la excepción a propósito:
 es seguro entre hilos, porque existe precisamente para recibir cada fuente desde su hilo.
+
+Tres cosas más del ciclo de vida de un muxer:
+
+- **`onSegment` se ejecuta dentro de `writePacket`**, en el hilo que escribe el paquete que cierra
+  el fragmento (o dentro de `stop()`, con el último), y con `synchronizedMuxer`, dentro de su
+  cerrojo: mientras dura, los demás productores esperan.
+- **Tras `stop()`, `writePacket` lanza `IllegalStateException`.** `stop()` es idempotente: una
+  segunda llamada no hace nada. Si un codificador puede entregar un paquete después de parar,
+  descártalo antes de llamar al muxer.
+- **No interrumpas el hilo que escribe.** `FileChannel` se cierra al recibir una interrupción
+  (`Thread.interrupt()`, o cancelar el `Future` con `cancel(true)`), y desde entonces `writePacket`
+  y `stop()` fallan con `IOException`: un MP4 plano se queda sin `moov` y no se puede leer, y un MKV
+  o un fMP4 hay que cerrarlos con `Kotmpeg.repair`. Para parar, deja de escribir y llama a `stop()`.
 
 ## Memoria al escribir archivos largos
 
@@ -439,12 +497,23 @@ contentResolver.openFileDescriptor(uri, "rw")!!.use { pfd -> Kotmpeg.repair(pfd.
 
 Con archivos de esta librería deja los mismos paquetes y la misma duración que reempaquetar el
 archivo con `remux`, sin necesitar otra vez su tamaño libre en disco; con los de otros programas
-puede cambiar el orden en que se intercalan las pistas o un microsegundo de redondeo. Un archivo ya
-cerrado no se toca (`repaired = false`): un MKV con el tamaño del `Segment` escrito, un fMP4 que
-acaba en `mfra`. Uno completo de otro programa sin `mfra` se trata como cortado, y solo se le pone la
-duración y el `mfra`. Lo que no reconoce se rechaza con `IllegalArgumentException` sin modificar
-nada. Si la propia reparación se interrumpe, se puede volver a lanzar: los tests la cortan en cada
-una de sus operaciones y la relanzan.
+puede cambiar el orden en que se intercalan las pistas o un microsegundo de redondeo. Con
+`nonNegativeCompositionOffsets` y B-frames, el remux recalcula el desplazamiento de los desfases con
+sus propios fragmentos: puede mover algún fotograma un tic de la escala de su pista (unos 11 µs a
+90 kHz) y, si la pista más larga es la de vídeo, cambiar la duración leída en menos de un
+milisegundo. La reparación deja los tiempos que ya tiene el archivo. Un
+archivo ya cerrado no se toca (`repaired = false`): un MKV con el tamaño del `Segment` escrito, un
+fMP4 que acaba en `mfra`. Uno completo de otro programa sin `mfra` se trata como cortado, y solo se le
+pone la duración y el `mfra`. Lo que no reconoce se rechaza con `IllegalArgumentException` sin
+modificar nada, y eso incluye un MKV que se cerró bien y se truncó después —una copia que no llegó a
+terminar—, aunque se lea hasta el corte: su `Segment` declara más bytes de los que tiene. Un fMP4 en
+el mismo caso sí se repara. Si la propia reparación se interrumpe, se puede volver a lanzar: los
+tests la cortan en cada una de sus operaciones y la relanzan.
+
+**Repara solo archivos que ya no se están escribiendo**: al arrancar la app, las grabaciones que
+dejó a medias la ejecución anterior. Reparar el archivo de una grabación en curso lo da por
+terminado mientras su muxer sigue añadiendo datos detrás, y si el proceso muere después, un MKV así
+no deja leer ni un paquete y otro `repair` lo da por cerrado.
 
 El MP4 plano (`Mp4Muxer`) no tiene arreglo: su índice `moov` solo se escribe en `stop()`. Para
 grabar, usa MKV o `fragmented = true`.
@@ -461,7 +530,19 @@ en mitad del archivo lo rechaza sin tocarlo. Lo que no se puede perder se fuerza
 | Canal | Qué es | Qué hacer |
 |---|---|---|
 | `onWarning: (String) -> Unit` | **No fatal.** Algo se degradó pero la operación sigue: una pista que no se puede leer, una muestra que se salta, un archivo cortado. | Registrarlo, y avisar si afecta a lo que se pidió. Nunca ignorarlo en silencio. |
-| Excepciones | **Fatal.** Cabecera corrupta, MP4 sin `moov`, un desfase de tiempo que no cabe en el contenedor, un parámetro inválido, un error de E/S real. | El mensaje nombra el campo o la caja concreta. El archivo queda cerrado. |
+| Excepciones | **Fatal.** Cabecera corrupta, MP4 sin `moov`, un desfase de tiempo que no cabe en el contenedor, un parámetro inválido, un error de E/S real. | El mensaje nombra el campo o la caja concreta. Si falla al **abrir**, el archivo queda cerrado; si falla al leer o al escribir, el demuxer o el muxer siguen abiertos y hay que cerrarlos: usa `use { }`. |
+
+Las excepciones son siempre de estos tipos:
+
+| Excepción | Cuándo |
+|---|---|
+| `EbmlException` | Un MKV dañado: un elemento que no se puede leer o que se sale de su padre |
+| `IllegalStateException` | Un MP4 dañado (sin `moov`, una caja que no cuadra), o un uso fuera de orden: `writePacket` antes de `start()` o después de `stop()`, `addTrack` después de `start()`, leer de un demuxer cerrado |
+| `IllegalArgumentException` | Un campo fuera de rango en cualquier contenedor, un parámetro inválido —una opción imposible, una pista desconocida, un tiempo que no cabe—, o lo que `repair` no reconoce |
+| `EOFException` | Un archivo que se acaba antes de lo que declara su cabecera |
+| `IOException` | Cualquier otro fallo de E/S, incluido interrumpir el hilo que escribe |
+
+`remux` y `concat` cierran ellos mismos lo que abren, también si fallan.
 
 Un archivo **truncado** —la grabación se interrumpió— no es fatal en ningún contenedor: se lee hasta
 el último paquete completo, el stream termina limpio y el corte se avisa por `onWarning`. Para
@@ -507,7 +588,7 @@ Mp4Muxer(SeekableOutput(pfd.fileDescriptor)) { fastStart = true }
 | `nonNegativeCompositionOffsets` | `false` | fMP4 | Desfases de composición sin signo y lista de edición, para que FFmpeg sincronice exacto |
 | `maxClusterDurationMs` | 5000 | MKV | Duración máxima de un cluster |
 | `cuesReserveBytes` | 64 KiB | MKV | Hueco delante de los clusters para el índice, que se amplía al cerrar cada cluster: un archivo cortado se abre con índice y duración. ~22 bytes por cluster; 0 lo desactiva |
-| `creationTimeMillis` | ahora | todos | Fecha de creación; `null` la omite, para una salida idéntica byte a byte |
+| `creationTimeMillis` | ahora | todos | Fecha de creación; `null` la omite, para una salida idéntica byte a byte (en MKV, con `SegmentUID` y `TrackUID` derivados de las pistas en vez de aleatorios) |
 | `writingApp` | `"Kotmpeg"` | todos | El `WritingApp` de Matroska y la etiqueta `©too` de MP4, el `encoder` de ffprobe; vacía, no se escribe en MP4 |
 
 Hasta la `3.x` eran parámetros con valor por defecto, una función aparte para el fMP4 con límites y
@@ -575,7 +656,19 @@ firmados, como en CMAF, y lo que un B-frame se decodifica después de mostrarse 
 una pausa de la pantalla caiga entre él y su referencia. FFmpeg retrasa la pista de vídeo entera lo
 que mida el mayor de esos offsets negativos, uno o dos fotogramas; si el archivo va a pasar por
 FFmpeg, `nonNegativeCompositionOffsets = true` los escribe sin signo (`trun` v0) con una lista de
-edición que los compensa, y la cabecera espera al primer fragmento para conocer el desfase. El
+edición que los compensa, y la cabecera espera al primer fragmento para conocer el desfase. Vale con
+GOP cerrado, también cuando un fragmento se corta a mitad de GOP por `maxFragmentDurationUs` o
+`maxFragmentBytes`: el corte cae delante de un fotograma ancla, y cada fotograma se presenta donde
+lo haría con signo (hasta la 4.1.0, tras uno de esos cortes un B-frame se mostraba en su tiempo de
+decodificación, hasta 3 s fuera de su sitio). Con GOP abierto conviene el modo con signo: el
+desfase que fija el primer fragmento no alcanza para las imágenes iniciales de los siguientes. En
+este modo, una pista que arranca después que las demás lleva una lista de edición de dos entradas
+—un tramo vacío y la edición con medios—, como el MP4 plano y como `-movflags delay_moov`, para que
+FFmpeg le dé su duración real. **Con el valor por defecto no la lleva**: la cabecera se escribe en
+`start()`, antes de saber qué pista arrancará tarde, y su `tfdt` cuenta desde el origen. Los tiempos
+de los paquetes son correctos y este demuxer lo lee bien, pero FFmpeg y lo que se apoya en él
+muestran el archivo más largo: 9,5 s en uno de 7,5 con el vídeo desde los 2 s. Si el archivo va a
+pasar por FFmpeg y una pista puede arrancar tarde, usa `nonNegativeCompositionOffsets = true`. El
 demuxer lee fMP4 propio y de FFmpeg, con su lista de edición igual que en un MP4 plano.
 
 ## Segmentos para HLS y DASH
@@ -633,13 +726,16 @@ com/braymon/kotmpeg/
 │                        (ContentEncoding) y MkvSeekFilter (búsqueda en keyframe).
 ├── mp4/                 ISO/IEC 14496-12. Escritura: Mp4Muxer (faststart), FragmentedMp4Muxer
 │                        (fMP4, con FragmentTiming, FragmentDurations y FragmentLimits),
-│                        MovieBoxes (cabeceras comunes), SampleEntries, SampleTable y
-│                        BoxBuilder. Lectura: Mp4Demuxer, con Mp4BoxReader,
-│                        Mp4SampleEntryReader, FragmentWalker y su índice bajo demanda
-│                        (SampleIndex). Reparación: FragmentedMp4Repair y FragmentIndex (mfra).
-├── model/               Modelo canónico: MediaPacket, TrackInfo, códecs, ColorInfo/HDR.
-├── codecconfig/         NalUnits (Annex-B ↔ ISO, avcC/hvcC), AacConfig, OpusConfig y
-│                        AudioPriming (el cebado, igual en los tres muxers).
+│                        Mp4Segment (lo que avisa onSegment), MovieBoxes (cabeceras comunes),
+│                        SampleEntries, SampleTable y BoxBuilder. Lectura: Mp4Demuxer, con
+│                        Mp4BoxReader, Mp4SampleEntryReader, FragmentWalker y su índice bajo
+│                        demanda (SampleIndex). Reparación: FragmentedMp4Repair y FragmentIndex
+│                        (mfra). FragmentFlags: los bits de tfhd y trun, comunes a todos.
+├── model/               Modelo canónico: MediaPacket, TrackInfo, códecs, ColorInfo/HDR, y
+│                        Timestamps (cambio de escala de tiempo sin desbordamiento).
+├── codecconfig/         NalUnits (Annex-B ↔ ISO, avcC/hvcC), AacConfig, OpusConfig,
+│                        AudioPriming (el cebado, igual en los tres muxers) y
+│                        DefaultCodecPrivate (la configuración del audio que llega sin ella).
 ├── io/                  SeekableInput / SeekableOutput (File, RAF o FileDescriptor) y
 │                        RepairTarget (abrir sin truncar, para repair).
 └── pipeline/Remuxer.kt  Copia demuxer→muxer con filtro/progreso, y concat.
@@ -669,6 +765,7 @@ contenedor.
 | `NalUnits` | Annex-B ↔ ISO, avcC/hvcC |
 | `AacConfig`, `OpusConfig` | AudioSpecificConfig y OpusHead/dOps |
 | `SeekableInput` / `SeekableOutput` | E/S buffered con seek/patch sobre `File`, `RandomAccessFile` o un `FileDescriptor`; `sync()` para forzar los datos al almacenamiento |
+| `EbmlException` | La excepción de un MKV dañado (en `com.braymon.kotmpeg.ebml`); el resto de tipos, en [Errores y avisos](#errores-y-avisos) |
 
 ## Cómo se garantiza la sincronización
 
@@ -698,8 +795,12 @@ contenedor.
 - **Fuentes sin DTS** (los encoders por hardware y MKV solo dan PTS): el muxer MP4 deriva un DTS
   monótono a partir de la secuencia de PTS (`dts_i = sortedPts_i − max(sortedPts_i − pts_i)`), que
   garantiza `dts ≤ pts`, preserva duraciones y produce offsets `ctts` mínimos no negativos.
-- **Audio mezclado**: `PcmResampler` lleva la fase en enteros, así que el micrófono remuestreado no
-  se adelanta ni se retrasa respecto al sistema aunque la grabación dure horas.
+- **Audio mezclado**: `PcmResampler` lleva la fase en enteros, así que su cuenta de frames no
+  acumula error aunque la grabación dure horas. `PcmStreamMixer` mantiene cada fuente en su sitio
+  mientras su audio llegue, y una que se retrasa o que deja de entregar se corrige dentro de una
+  tolerancia (ver [Mezclar en streaming](#mezclar-en-streaming-con-pcmstreammixer)). Ninguno de los
+  dos corrige la deriva entre los relojes de dos dispositivos: con 45 partes por millón, la fuente
+  lenta pierde un tramo corto cada vez que se aleja más de la tolerancia.
 - **Opus**: `CodecDelay`/`SeekPreRoll` en MKV y pre-skip en `dOps` en MP4 se convierten entre sí.
 
 ## Lo que **no** está implementado, y por qué
@@ -718,6 +819,7 @@ Todas son decisiones de alcance, no carencias pendientes:
 | Herramienta de línea de comandos | ❌ (es una librería) | El objetivo es integrarse con una API tipada. |
 | SIMD / ensamblador | ❌ | La JVM no da acceso a eso; el trabajo es sobre todo E/S y copia de buffers. |
 | MP4 híbrido: muestras en el `moov` y además fragmentos | ❌ (se leen las del `moov`, con aviso) | La norma lo permite pero es raro, y leerlo obliga a casar dos índices distintos de la misma pista. |
+| Conservar en `remux` y `concat` el recorte de una lista de edición | ❌ (los fotogramas que oculta pasan a verse, en los tres contenedores) | Un MP4 de `ffmpeg -ss … -c copy` corta en el keyframe anterior y oculta los sobrantes con la edición: reempaquetado, se ven. Los muxers MP4 empiezan la línea de tiempo en el paquete más temprano, que es lo que piden las grabaciones en vivo, y Matroska no tiene nada equivalente a esa edición. Descartar esos paquetes antes de escribirlos tampoco da un recorte exacto: los fotogramas visibles hasta el keyframe siguiente se decodifican a partir del keyframe oculto. Un recorte exacto del vídeo exige recodificar, que esta librería no hace. |
 | Recuperar un MP4 con el `moov` corrupto o ausente | ❌ (falla limpio con "no se encontró la caja moov") | Reconstruir las tablas escaneando el `mdat` es mucha superficie para un caso que el fMP4 ya cubre por diseño. Una pista ilegible sí se tolera: se descarta y el resto se lee. |
 | Entrada/salida por streaming puro (tuberías, sockets) | ❌ (hace falta un destino posicionable) | Los muxers vuelven atrás a parchear tamaños al cerrar. Sí vale cualquier **descriptor ya abierto**. |
 | Índice `sidx` único al principio (perfil DASH *on-demand*) | ❌ (con `segmentIndex`, cada fragmento lleva el suyo) | Un índice global va delante de todos los fragmentos, que solo se conocen al cerrar: habría que reescribir el archivo entero, y dejaría de ser solo-añadir y a prueba de cortes. Partir el archivo en varios es trabajo del empaquetador. |
@@ -732,19 +834,19 @@ Todas son decisiones de alcance, no carencias pendientes:
 ./gradlew test
 ```
 
-451 tests. Necesitan **JDK 17+**; si además tienes **ffmpeg** en el `PATH`, se ejecuta también la
+Los tests necesitan **JDK 17+**; si además tienes **ffmpeg** en el `PATH`, se ejecuta también la
 suite de integración, que genera archivos con FFmpeg real, los reescribe con esta librería en ambas
 direcciones y valida el resultado con `ffprobe` y una decodificación completa sin errores. Sin
 ffmpeg esos tests se omiten solos (`assumeTrue`).
 
-Cuatro tests comprueban que no quedan archivos abiertos —tres tras una operación fallida y uno
-mientras `concat` recorre sus entradas—: en Linux leyendo
-`/proc/self/fd` y en Windows comprobando que el archivo se deja renombrar, algo que Windows impide
-mientras está abierto. En macOS no hay forma fiable de medirlo y se omiten. Otros dos, de HE-AAC,
-necesitan un FFmpeg con codificador HE (`aac_mf` o `libfdk_aac`). Un `SKIPPED` en el log es siempre
-una de esas causas, nunca un fallo tapado — por eso el build los imprime.
+Los que comprueban que no quedan archivos abiertos —tras una operación fallida, o mientras
+`concat` recorre sus entradas— lo miden en Linux leyendo `/proc/self/fd` y en Windows comprobando
+que el archivo se deja renombrar, algo que Windows impide mientras está abierto. En macOS no hay
+forma fiable de medirlo y se omiten. Los de HE-AAC necesitan un FFmpeg con codificador HE (`aac_mf`
+o `libfdk_aac`). Un `SKIPPED` en el log es siempre una de esas causas, nunca un fallo tapado — por
+eso el build los imprime.
 
-Cuatro tests no comprueban una funcionalidad sino una **política** del proyecto:
+Algunos tests no comprueban una funcionalidad sino una **política** del proyecto:
 
 | Test | Qué protege |
 |---|---|
@@ -762,7 +864,7 @@ Kotlin 1.9 no funciona con Gradle 9; se lanza desde su carpeta:
 ```bash
 ./gradlew publishToMavenLocal
 cd compat/kotlin-1.9
-sh gradlew run -PkotmpegVersion=4.1.0
+sh gradlew run -PkotmpegVersion=4.1.1
 ```
 
 En Windows, el último paso es el mismo con `.\gradlew.bat` en lugar de `sh gradlew`.

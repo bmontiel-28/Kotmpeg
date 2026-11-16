@@ -21,19 +21,35 @@ package com.braymon.kotmpeg.mp4
 internal object FragmentDurations {
 
     /**
-     * Las duraciones de la cabecera en la escala del `mvhd`: la del archivo y la de cada pista, que es
-     * a la vez la de su `tkhd` y la de su edición.
+     * Las duraciones de la cabecera en la escala del `mvhd`: la del archivo, la de cada pista —la de
+     * su `tkhd`— y la de la edición con medios de cada pista, que es la misma salvo en una pista que
+     * empieza con un tramo vacío, donde es lo que queda tras él.
      */
-    class Declared(val movie: Long, val tracks: List<Long>)
+    class Declared(val movie: Long, val tracks: List<Long>, val mediaEdits: List<Long>)
 
     /**
      * Las duraciones para unas pistas que se decodifican hasta [decodeEnds] y cuyo cebado es
-     * [priming], las dos en la unidad de cada pista. [toMovie] pasa un valor de la pista `i` a la
-     * escala del `mvhd`: el muxer lleva los tiempos en µs y la reparación en la escala de cada pista.
+     * [priming], las dos en la unidad de cada pista y en su línea de tiempo del medio. [toMovie]
+     * pasa un valor de la pista `i` a la escala del `mvhd`: el muxer lleva los tiempos en µs y la
+     * reparación en la escala de cada pista.
+     *
+     * [emptyEdits] es el tramo vacío con el que empieza la lista de edición de cada pista, en la
+     * escala del `mvhd`, o nada: una pista que arranca tarde con desfases sin signo (ver
+     * `FragmentedMp4Muxer.writeEdts`), cuya línea de tiempo del medio empieza en su propio
+     * arranque. Su `tkhd` es la suma de las dos ediciones: lo que dura su medio más el tramo vacío.
+     * Mientras no tiene medio —no ha llegado su primer fragmento, o el corte no dejó ninguno— declara
+     * cero, como cualquier pista vacía: un archivo cortado antes de tener ninguna muestra no puede
+     * durar lo que tardaba en arrancar una pista, y su remux, sin paquetes, dura cero.
      */
-    fun declared(decodeEnds: LongArray, priming: LongArray, toMovie: (track: Int, value: Long) -> Long): Declared {
-        val tracks = decodeEnds.indices.map { toMovie(it, (decodeEnds[it] - priming[it]).coerceAtLeast(0L)) }
-        return Declared(tracks.maxOrNull() ?: 0L, tracks)
+    fun declared(
+        decodeEnds: LongArray,
+        priming: LongArray,
+        emptyEdits: LongArray = LongArray(decodeEnds.size),
+        toMovie: (track: Int, value: Long) -> Long,
+    ): Declared {
+        val mediaEdits = decodeEnds.indices.map { toMovie(it, (decodeEnds[it] - priming[it]).coerceAtLeast(0L)) }
+        val tracks = mediaEdits.indices.map { if (mediaEdits[it] > 0) mediaEdits[it] + emptyEdits[it] else 0L }
+        return Declared(tracks.maxOrNull() ?: 0L, tracks, mediaEdits)
     }
 
     /**

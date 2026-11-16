@@ -5,9 +5,17 @@ package com.braymon.kotmpeg.audio
  * (el equivalente práctico del `aresample` de FFmpeg para pipelines de captura y
  * transcodificación; la calidad lineal sobra para voz y contenido de pantalla).
  *
- * Acepta trozos de cualquier tamaño; la fase se conserva entre llamadas, así que los
- * streams largos no derivan: tras N frames de entrada la salida converge exactamente a
- * N * outputRate / inputRate.
+ * Acepta trozos de cualquier tamaño, y la fase se conserva entre llamadas: la cuenta no acumula
+ * error, ni en sesiones de horas ni según cómo se trocee la entrada. Tras N frames de entrada,
+ * [resample] ha emitido los que caen antes del último recibido, `ceil((N - 1) * outputRate /
+ * inputRate)`, porque ese último se guarda para interpolar con el trozo siguiente; [flush] completa
+ * hasta `round(N * outputRate / inputRate)`. Al reducir la frecuencia a menos de la mitad, el total
+ * puede llevar un frame más que ese redondeo: lo emitido antes del último frame recibido ya puede
+ * pasarse de él.
+ *
+ * **No corrige relojes distintos.** Las frecuencias se toman por su valor nominal: si un
+ * dispositivo entrega algo más despacio de lo que declara, la salida dura lo que de verdad entregó,
+ * no lo que debería haber durado.
  *
  * Es la pieza que permite mezclar micrófono y audio del sistema cuando no llegan a la misma
  * frecuencia (44,1 kHz frente a 48 kHz es lo habitual en Android): se lleva una de las dos a la
@@ -132,7 +140,7 @@ public class PcmResampler(
      * [resample] solo puede interpolar hasta el penúltimo frame recibido: el último se
      * guarda para poder interpolar con el trozo siguiente. Al terminar de verdad no hay
      * trozo siguiente, así que sin esta llamada ese frame se perdía — un desajuste de
-     * hasta un frame frente a la "convergencia exacta" que promete la clase.
+     * hasta un frame frente a la cuenta que da la clase.
      */
     public fun flush(): ShortArray {
         if (isPassthrough || framesConsumed == 0L) return ShortArray(0)

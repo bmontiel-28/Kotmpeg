@@ -486,9 +486,9 @@ public class MkvDemuxer(
     }
 
     /**
-     * Se coloca en el último keyframe de la pista ancla —la primera de vídeo, o la primera si no
-     * hay vídeo— con `pts <= `[timestampUs], y devuelve su `pts`. Es el mismo contrato que
-     * `Mp4Demuxer`:
+     * Se coloca en el último keyframe de la pista ancla —la primera de vídeo que tenga keyframes, o
+     * la primera de las demás que los tenga si no ([seekAnchor])— con `pts <= `[timestampUs], y
+     * devuelve su `pts`. Es el mismo contrato que `Mp4Demuxer`:
      *
      * - Con índice, el último cue de esa pista en o antes del destino, por bisección, y se recorren
      *   las cabeceras de los bloques desde el cue anterior hasta el destino (ver
@@ -535,8 +535,28 @@ public class MkvDemuxer(
         return landing.ptsUs
     }
 
-    /** La pista ancla de [seekTo]: la primera de vídeo, o la primera si no hay vídeo. */
-    private val seekAnchor: Int? by lazy { (tracks.firstOrNull { it is TrackInfo.Video } ?: tracks.firstOrNull())?.id }
+    /**
+     * La pista ancla de [seekTo]: la primera de vídeo que tenga algún keyframe, o si ninguna lo
+     * tiene, la primera de las demás que lo tenga. Si no lo tiene ninguna, la primera de vídeo, o la
+     * primera si no hay vídeo. Se decide en la primera búsqueda y vale para todas.
+     *
+     * Hasta la 4.1.0 era siempre la primera de vídeo, aunque no tuviera ni un bloque —una grabación
+     * en la que la cámara no llegó a entregar fotogramas—: la búsqueda recorría el archivo entero sin
+     * encontrar un keyframe suyo, devolvía 0 y volvía al principio, también con una segunda pista de
+     * vídeo que sí los tenía. `Mp4Demuxer` elige entre las pistas con muestras, pero en Matroska no
+     * se sabe al abrir qué pistas tienen bloques. Comprobarlo cuesta recorrer las cabeceras de los
+     * bloques hasta el primer keyframe de la pista ([scanForKeyFrame] con un destino anterior a
+     * todo), casi siempre en el primer cluster; una pista sin ninguno cuesta, una sola vez, las de
+     * todo el archivo. Si la primera de vídeo tiene keyframes, el ancla es la de siempre.
+     */
+    private val seekAnchor: Int? by lazy {
+        val candidates = tracks.filter { it is TrackInfo.Video } + tracks.filter { it !is TrackInfo.Video }
+        val firstCluster = header.firstClusterPosition
+        val withKeyFrame = firstCluster?.let { from ->
+            candidates.firstOrNull { scanForKeyFrame(from, Long.MIN_VALUE, it.id, known = null) != null }
+        }
+        (withKeyFrame ?: candidates.firstOrNull())?.id
+    }
 
     /** Los cues de [seekAnchor], ya ordenados; todos si ninguno declara esa pista. */
     private val anchorCues: List<MkvCue> by lazy { header.cues.filter { it.track == seekAnchor }.ifEmpty { header.cues } }

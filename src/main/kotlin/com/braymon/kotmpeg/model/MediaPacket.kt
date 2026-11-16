@@ -18,7 +18,9 @@ package com.braymon.kotmpeg.model
  *                    defecto, y un keyframe que no se marcaba por olvido daba un archivo sin
  *                    puntos de búsqueda, sin ningún error. En audio los muxers tratan todo
  *                    paquete como punto de acceso, lo diga o no.
- * @param durationUs  Duración del paquete en microsegundos, 0 si se desconoce.
+ * @param durationUs  Duración del paquete en microsegundos, 0 si se desconoce. Un valor negativo
+ *                    no se rechaza: los muxers lo tratan igual que 0, como desconocido, y la
+ *                    duración sale de los tiempos de los paquetes vecinos.
  *
  * **[data] se puede reutilizar en cuanto `Muxer.writePacket` vuelve.** Ningún muxer guarda una
  * referencia al array: `Mp4Muxer` lo escribe en el momento, y cuando un muxer tiene que retener

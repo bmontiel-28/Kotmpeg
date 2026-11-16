@@ -4,6 +4,7 @@ import com.braymon.kotmpeg.audio.PcmMixer
 import com.braymon.kotmpeg.audio.PcmResampler
 import com.braymon.kotmpeg.audio.PcmStreamMixer
 import org.junit.jupiter.api.Test
+import java.nio.ByteBuffer
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -88,5 +89,23 @@ class ApiPcmTest {
             assertFailsWith<IllegalArgumentException>("$bad") { PcmMixer.mix(listOf(a, b), listOf(1f, bad)) }
         }
         assertContentEquals(shortArrayOf(500, -1_500), PcmMixer.mix(listOf(a, b), listOf(1f, -1f)))
+    }
+
+    /**
+     * Un `ByteBuffer` con una muestra a medias se rechaza, como un frame incompleto en el
+     * remuestreador. Hasta la 4.1.0 el byte suelto se perdía en silencio: 5 bytes daban 2 muestras.
+     * Lo que cuenta son los bytes pendientes, así que el mismo buffer vale o no según su posición, y
+     * leerlo no lo consume.
+     */
+    @Test
+    fun `toShortArray rejects a buffer with half a sample`() {
+        val buffer = ByteBuffer.wrap(byteArrayOf(1, 0, 2, 0, 3))
+        assertFailsWith<IllegalArgumentException> { PcmMixer.toShortArray(buffer) }
+        assertEquals(0, buffer.position(), "rechazarlo no lo consume")
+        buffer.limit(4)
+        assertContentEquals(shortArrayOf(1, 2), PcmMixer.toShortArray(buffer))
+        assertEquals(0, buffer.position(), "leerlo tampoco")
+        buffer.position(1)
+        assertFailsWith<IllegalArgumentException> { PcmMixer.toShortArray(buffer) }
     }
 }

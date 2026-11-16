@@ -170,13 +170,27 @@ public class FragmentedMp4Muxer internal constructor(
         private const val MVHD_DURATION_V1 = 32
         private const val TKHD_DURATION_V0 = 28
         private const val TKHD_DURATION_V1 = 36
+
+        /** Lo que ocupa una entrada de un `elst` de la versión 0: duración, `media_time` y velocidad. */
+        private const val ELST_ENTRY_V0 = 12
+
+        /** Lo más que cabe en un campo de 32 bits sin signo. */
+        private const val UINT32_MAX = 0xFFFFFFFFL
     }
 
+    /**
+     * Una muestra retenida hasta cerrar su fragmento. [anchor] dice si se presenta después de todas
+     * las anteriores de su pista: un fotograma ancla (I o P), y no un B-frame que se muestra antes
+     * que uno ya decodificado. Es lo único que necesita [flushFragment] para cortar a mitad de GOP
+     * con desfases sin signo.
+     */
     private class PendingSample(
         val data: ByteArray,
         val ptsUs: Long,
         val key: Boolean,
         val durationUs: Long,
+        val anchor: Boolean,
+        val dtsUs: Long,
     )
 
     /**
@@ -226,6 +240,38 @@ public class FragmentedMp4Muxer internal constructor(
          * descuenta al presentar. Se fija al escribir la cabecera; 0 en el modo firmado.
          */
         var compositionShiftTicks = 0L
+
+        /**
+         * Con desfases sin signo, el tramo vacío con el que empieza la lista de edición de una pista
+         * que arranca después del origen, en la escala de la película; 0 si no lleva (ver
+         * [writeEdts]). Se fija antes del primer fragmento, con [firstHeldPtsUs].
+         */
+        var emptyEditMovieTicks = 0L
+
+        /** El menor PTS que entregó la pista antes de fijarse el origen, relativo a él; `null` si ninguno. */
+        var firstHeldPtsUs: Long? = null
+
+        /**
+         * [emptyEditMovieTicks] en la escala del medio, que es donde empieza la línea de tiempo del
+         * medio de la pista: se resta de cada tiempo absoluto que se escribe en tics (`tfdt`, `sidx`
+         * y `tfra`). Es exacto: `placeLateTracks` elige el tramo para que lo sea.
+         */
+        val emptyEditMediaTicks: Long
+            get() = timescale * emptyEditMovieTicks / MovieBoxes.MOVIE_TIMESCALE
+
+        /** El mayor PTS recibido en la pista, relativo al origen; con él se reconoce un ancla. */
+        var maxPtsUs = Long.MIN_VALUE
+
+        /** Si la pista ha traído algún B-frame: un PTS por debajo de uno anterior. Solo en vídeo. */
+        var reordered = false
+
+        /**
+         * Lo que hay que sumar al DTS de un paquete para llevarlo a la línea de tiempo de
+         * decodificación de este muxer, que empieza en el menor PTS de la pista: se mide con el
+         * primer fragmento y vale para toda la pista (ver [decodeEndFromPackets]). `null` hasta
+         * entonces.
+         */
+        var packetDtsOffsetUs: Long? = null
 
         fun toTicks(us: Long): Long = Timestamps.rescaleRounded(us, timescale, 1_000_000)
     }
@@ -352,10 +398,17 @@ public class FragmentedMp4Muxer internal constructor(
     private fun openTimeline(waiting: TimelineGate) {
         gate = null
         baseUs = waiting.earliestPtsUs ?: 0L
+        for ((i, t) in tracks.withIndex()) t.firstHeldPtsUs = waiting.earliestPtsUs(i)?.let { it - baseUs }
         for (held in waiting.release()) append(tracks[held.trackId - 1], held, held.data)
     }
 
-    /** Añade una muestra al fragmento en curso. [data] ya es propiedad del muxer: no se copia aquí. */
+    /**
+     * Añade una muestra al fragmento en curso. [data] ya es propiedad del muxer: no se copia aquí.
+     *
+     * Un corte que no cae en un keyframe —por `maxFragmentDurationUs` o `maxFragmentBytes`— es
+     * **forzoso**, y con desfases sin signo se trata aparte (ver [flushFragment]), salvo que lo
+     * imponga el tope interno de [FragmentLimits], que no admite esperas.
+     */
     private fun append(track: TrackState, packet: MediaPacket, data: ByteArray) {
         val pts = packet.ptsUs - baseUs
 
@@ -364,12 +417,16 @@ public class FragmentedMp4Muxer internal constructor(
         val cutOnLimit = pts - fragmentStartUs >= maxFragmentDurationUs ||
             FragmentLimits.isFull(fragmentBytes, data.size, maxFragmentBytes)
         if (fragmentHasSamples && (cutOnKeyFrame || cutOnDuration || cutOnLimit)) {
-            flushFragment(nextTrack = track, nextPtsUs = pts)
-            fragmentStartUs = pts
+            val hardLimit = fragmentBytes + data.size > FragmentLimits.MAX_DATA_BYTES
+            val forced = nonNegative && !cutOnKeyFrame && !cutOnDuration && !hardLimit
+            if (flushFragment(nextTrack = track, nextPtsUs = pts, forcedUnsigned = forced)) fragmentStartUs = pts
         }
 
+        val anchor = pts > track.maxPtsUs
+        if (!anchor && !track.audio && pts < track.maxPtsUs) track.reordered = true
+        track.maxPtsUs = maxOf(track.maxPtsUs, pts)
         val key = packet.isKeyFrame || track.info is TrackInfo.Audio
-        track.pending.add(PendingSample(data, pts, key, packet.durationUs))
+        track.pending.add(PendingSample(data, pts, key, packet.durationUs, anchor, packet.dtsUs - baseUs))
         fragmentHasSamples = true
         fragmentBytes += data.size
     }
@@ -397,6 +454,17 @@ public class FragmentedMp4Muxer internal constructor(
     }
 
     override fun close(): Unit = stop()
+
+    /**
+     * Cierra el archivo sin terminarlo —sin índice ni duraciones—, para borrarlo después. Es lo que
+     * hacen `Kotmpeg.remux` y `Kotmpeg.concat` con una copia cancelada: terminarla con [stop]
+     * dejaba en disco un parcial cerrado y legible que nadie pidió. Después, [stop] no hace nada.
+     */
+    internal fun abort() {
+        if (stopped) return
+        stopped = true
+        out.close()
+    }
 
     private class TrackFragment(
         val track: TrackState,
@@ -436,13 +504,16 @@ public class FragmentedMp4Muxer internal constructor(
      * estimado— salía con un desfase negativo, que el MP4 plano no escribe nunca. Con PTS monótonos y
      * sin ese solape, el resultado es el de siempre.
      */
-    private fun prepareTrackFragment(track: TrackState, nextPtsUs: Long?): TrackFragment? {
+    private fun prepareTrackFragment(track: TrackState, nextPtsUs: Long?, endAtLastPts: Boolean = false): TrackFragment? {
         val samples = track.pending
         if (samples.isEmpty()) return null
         val n = samples.size
 
         val ptsUs = LongArray(n) { samples[it].ptsUs }
         val audio = track.audio
+        if (track.packetDtsOffsetUs == null) {
+            track.packetDtsOffsetUs = ptsUs.min().coerceAtLeast(0L) - samples[0].dtsUs
+        }
         val timing = FragmentTiming.durations(
             ptsUs,
             lastPacketDurationUs = samples[n - 1].durationUs,
@@ -452,6 +523,8 @@ public class FragmentedMp4Muxer internal constructor(
             defaultIntervalUs = MovieBoxes.defaultSampleDurationUs(track.info),
             timescale = track.timescale,
             reorder = !audio,
+            endAtLastPts = endAtLastPts,
+            lastDecodeEndUs = decodeEndFromPackets(samples, track.packetDtsOffsetUs ?: 0L),
         )
         val durationsUs = timing.durationsUs
         track.typicalIntervalUs = timing.typicalIntervalUs
@@ -486,10 +559,11 @@ public class FragmentedMp4Muxer internal constructor(
         track.decodeCumUs = cumUs
 
         val earliestPtsUs = if (audio) startUs else ptsUs.min()
+        val origin = track.emptyEditMediaTicks
         val fragment = TrackFragment(
-            track, durationsTicks, offsets, flags, sizes, baseDecodeTicks,
-            samples.map { it.data }, firstKeyPtsTicks, firstKeySampleNumber,
-            earliestPtsTicks = if (audio) baseDecodeTicks else track.toTicks(earliestPtsUs),
+            track, durationsTicks, offsets, flags, sizes, baseDecodeTicks - origin,
+            samples.map { it.data }, firstKeyPtsTicks?.minus(origin), firstKeySampleNumber,
+            earliestPtsTicks = (if (audio) baseDecodeTicks else track.toTicks(earliestPtsUs)) - origin,
             spanTicks = dtsTicks - baseDecodeTicks,
             earliestPtsUs = earliestPtsUs,
             spanUs = cumUs - startUs,
@@ -500,18 +574,87 @@ public class FragmentedMp4Muxer internal constructor(
     }
 
     /**
+     * Dónde acaba de decodificarse la última muestra de [samples] según sus propios paquetes —su
+     * DTS más su duración—, o `null` si no se sabe: sin duración, o con unos DTS que no son una
+     * línea de tiempo de decodificación porque retroceden en algún punto del fragmento. Un DTS
+     * posterior a su PTS sí vale: es el de un B-frame con desfase negativo, como los escribe este
+     * muxer con signo. Los de `MediaCodec`, iguales al PTS, retroceden en cuanto hay B-frames, y sin
+     * ellos el final es el de siempre: el mayor PTS más la duración. Lo usa
+     * `FragmentTiming.durations`.
+     *
+     * Ese final se cuenta en la línea de tiempo de decodificación de este muxer, que empieza en el
+     * menor PTS de la pista, y no en la de los paquetes: [offsetUs] es lo que va de una a otra
+     * ([TrackState.packetDtsOffsetUs]). En un fMP4 de esta librería con desfases sin signo, el
+     * demuxer entrega los DTS adelantados lo que mide el desplazamiento de su lista de edición, como
+     * FFmpeg; y uno de FFmpeg con B-frames, los suyos empezando antes de cero. Sin traducirlos, el
+     * remux de una reparación sin signo acababa ese desplazamiento antes que ella, un fotograma.
+     */
+    private fun decodeEndFromPackets(samples: List<PendingSample>, offsetUs: Long): Long? {
+        val last = samples.last()
+        if (last.durationUs <= 0) return null
+        for (i in 1 until samples.size) if (samples[i].dtsUs < samples[i - 1].dtsUs) return null
+        val end = try {
+            Math.addExact(Math.addExact(last.dtsUs, offsetUs), last.durationUs)
+        } catch (_: ArithmeticException) {
+            return null
+        }
+        return end
+    }
+
+    /**
      * Escribe el fragmento en curso.
      *
      * Con [nonNegative], el primero escribe además la cabecera, que hasta ahora no podía: la lista
      * de edición de cada pista compensa el mayor adelanto del tiempo de decodificación sobre el de
      * presentación, y ese adelanto sale de las muestras de este fragmento. Es lo mismo que hace
      * FFmpeg con `-movflags delay_moov`.
+     *
+     * **Un corte forzoso con desfases sin signo** ([forcedUnsigned]) necesita dos cosas más en cada
+     * pista de vídeo con B-frames, porque el desfase negativo que absorbería un solape con el
+     * fragmento siguiente no se puede escribir:
+     *
+     *  - **que el corte caiga delante de un fotograma ancla**. Si el paquete que lo provoca es de
+     *    otra pista o es un B-frame de esta, los B-frames del último ancla pueden estar aún por
+     *    llegar, así que ese ancla y lo que lleve detrás pasan al fragmento siguiente, con sus
+     *    B-frames. Si el paquete es un ancla de esta pista, el corte cae justo delante de él;
+     *  - **que el fragmento acabe en su mayor PTS más un tic** (ver `FragmentTiming.durations`), y
+     *    no en el PTS del ancla que abre el siguiente: los B-frames que vienen detrás de ese ancla
+     *    se presentan antes que él, y el siguiente fragmento tiene que poder decodificarlos donde
+     *    se presentan. Queda un hueco en el tiempo de decodificación entre los dos, que es válido.
+     *
+     * Hasta la 4.1.0 no se hacía ninguna de las dos: el fragmento acababa en el PTS del ancla, el
+     * primer B-frame del siguiente quedaba con un desfase negativo, se escribía como cero, y el
+     * fotograma se mostraba en su tiempo de decodificación, hasta 3 s fuera de su sitio con vídeo de
+     * frecuencia variable, también en FFmpeg. Cortar delante de un ancla no bastaba: en las pruebas
+     * el corte ya caía en uno. Con GOP cerrado y desfases sin signo, cada fotograma se presenta
+     * ahora donde lo haría con signo; el modo con signo y los cortes en keyframe no cambian.
+     *
+     * Si arrastrar dejara el fragmento sin ninguna muestra, no se corta todavía y devuelve `false`:
+     * el corte se repite con el paquete siguiente. Con varias pistas de vídeo con B-frames, solo la
+     * del paquete que provoca el corte puede caer justo delante de su ancla; las demás arrastran el
+     * suyo.
      */
-    private fun flushFragment(nextTrack: TrackState? = null, nextPtsUs: Long = 0) {
-        val fragments = tracks.mapNotNull { prepareTrackFragment(it, if (it === nextTrack) nextPtsUs else null) }
+    private fun flushFragment(nextTrack: TrackState? = null, nextPtsUs: Long = 0, forcedUnsigned: Boolean = false): Boolean {
+        val carried = HashMap<TrackState, List<PendingSample>>()
+        val endAtLastPts = HashSet<TrackState>()
+        if (forcedUnsigned) {
+            for (t in tracks) {
+                if (t.audio || t.pending.isEmpty()) continue
+                val arriving = t === nextTrack
+                if (!t.reordered && !(arriving && nextPtsUs < t.maxPtsUs)) continue
+                endAtLastPts += t
+                if (arriving && nextPtsUs > t.maxPtsUs) continue
+                val lastAnchor = t.pending.indexOfLast { it.anchor }
+                if (lastAnchor >= 0) carried[t] = t.pending.subList(lastAnchor, t.pending.size).toList()
+            }
+            if (tracks.all { it.pending.size == (carried[it]?.size ?: 0) }) return false
+            for ((t, samples) in carried) repeat(samples.size) { t.pending.removeAt(t.pending.lastIndex) }
+        }
+        if (nonNegative && !headerWritten) placeLateTracks()
+        val fragments = tracks.mapNotNull { prepareTrackFragment(it, if (it === nextTrack) nextPtsUs else null, it in endAtLastPts) }
         if (fragments.isEmpty()) {
             fragmentHasSamples = false
-            return
+            return true
         }
         if (!headerWritten) {
             for (fragment in fragments) {
@@ -559,8 +702,41 @@ public class FragmentedMp4Muxer internal constructor(
         sequenceNumber++
         fragmentHasSamples = false
         fragmentBytes = 0
+        for ((t, samples) in carried) {
+            t.pending.addAll(samples)
+            fragmentHasSamples = true
+            fragmentBytes += samples.sumOf { it.data.size.toLong() }
+        }
         onSegment?.let { notify -> runCatching { notify(segment) } }
+        return true
     }
+
+    /**
+     * Con desfases sin signo, antes del primer fragmento —que es cuando se escribe la cabecera—, fija
+     * el tramo vacío de cada pista que arranca después del origen (ver [writeEdts]). El arranque es
+     * el menor PTS que la pista entregó antes de fijarse el origen, o el menor de este fragmento si
+     * no entregó ninguno; el tramo, ese arranque redondeado hacia abajo a un número de milisegundos
+     * que sea también un número exacto de tics de la pista: de 1 ms en vídeo y en audio a 48 kHz, y
+     * de 10 ms a 44,1 kHz. Así ningún tiempo cambia al restarlo de la línea de tiempo del medio y
+     * volver a sumarlo al leer.
+     */
+    private fun placeLateTracks() {
+        for (t in tracks) {
+            val held = t.firstHeldPtsUs
+            val pending = t.pending.minOfOrNull { it.ptsUs }
+            val startUs = when {
+                held != null && pending != null -> minOf(held, pending)
+                else -> held ?: pending ?: continue
+            }
+            val step = MovieBoxes.MOVIE_TIMESCALE / gcd(t.timescale, MovieBoxes.MOVIE_TIMESCALE)
+            val empty = Timestamps.rescaleFloor(startUs, MovieBoxes.MOVIE_TIMESCALE, 1_000_000) / step * step
+            if (empty in 1..UINT32_MAX && t.timescale * empty / MovieBoxes.MOVIE_TIMESCALE <= Int.MAX_VALUE) {
+                t.emptyEditMovieTicks = empty
+            }
+        }
+    }
+
+    private fun gcd(a: Long, b: Long): Long = if (b == 0L) a else gcd(b, a % b)
 
     /**
      * Los `sidx` de un fragmento, uno por pista con muestras en él y en el orden de sus `traf`.
@@ -704,14 +880,15 @@ public class FragmentedMp4Muxer internal constructor(
      */
     private fun patchDurations() {
         val declared = FragmentDurations.declared(
-            LongArray(tracks.size) { tracks[it].decodeCumUs },
+            LongArray(tracks.size) { tracks[it].decodeCumUs - tracks[it].emptyEditMovieTicks * 1_000 },
             LongArray(tracks.size) { tracks[it].primingUs },
+            LongArray(tracks.size) { tracks[it].emptyEditMovieTicks },
         ) { _, us -> MovieBoxes.toMovieTicks(us) }
 
         mehdDuration?.let { patch(it, declared.movie) }
         mvhdDuration?.let { patch(it, declared.movie) }
         for ((i, field) in tkhdDuration.withIndex()) patch(field, declared.tracks[i])
-        for ((i, field) in elstDuration.withIndex()) field?.let { patch(it, declared.tracks[i]) }
+        for ((i, field) in elstDuration.withIndex()) field?.let { patch(it, declared.mediaEdits[i]) }
     }
 
     private fun patch(field: DurationField, value: Long) {
@@ -743,10 +920,10 @@ public class FragmentedMp4Muxer internal constructor(
         tkhdDuration = if (tkhds.size == tracks.size) tkhds.map { field(it, TKHD_DURATION_V0, TKHD_DURATION_V1) } else emptyList()
 
         val elsts = boxPositions(header, listOf("moov", "trak", "edts", "elst"))
-        val hasEdit = tracks.map { editMediaTime(it) > 0 }
+        val hasEdit = tracks.map { hasEdit(it) }
         elstDuration = if (elsts.size == hasEdit.count { it }) {
             var next = 0
-            hasEdit.map { if (it) DurationField(base + elsts[next++] + 16, wide = false) else null }
+            hasEdit.mapIndexed { i, edit -> if (edit) DurationField(base + elsts[next++] + 16 + if (tracks[i].emptyEditMovieTicks > 0) ELST_ENTRY_V0 else 0, wide = false) else null }
         } else {
             List(tracks.size) { null }
         }
@@ -805,6 +982,9 @@ public class FragmentedMp4Muxer internal constructor(
      */
     private fun editMediaTime(t: TrackState): Long = t.primingTicks + t.compositionShiftTicks
 
+    /** Si la pista lleva lista de edición: con algo que saltar al principio o con un tramo vacío. */
+    private fun hasEdit(t: TrackState): Boolean = editMediaTime(t) > 0 || t.emptyEditMovieTicks > 0
+
     /**
      * Lista de edición que compensa el **cebado del codificador**: un códec con solapamiento de
      * ventanas no emite su primer paquete hasta haber consumido más muestras de las que ese
@@ -817,13 +997,40 @@ public class FragmentedMp4Muxer internal constructor(
      * duración de una pista es la suma de sus ediciones (ISO/IEC 14496-12 §8.6.6), así que un lector
      * que hiciera esa suma volvería a ver una pista de duración cero por mucho que el `tkhd` diga
      * otra cosa.
+     *
+     * **Una pista que arranca después del origen** —el vídeo unos cientos de milisegundos detrás
+     * del audio, que es lo normal en una grabación— lleva, con desfases sin signo, un tramo vacío
+     * de lo que tarda en empezar ([TrackState.emptyEditMovieTicks]) y su línea de tiempo del medio
+     * empieza en su propio arranque, como en [Mp4Muxer] y como hace FFmpeg con `delay_moov`: su
+     * `tfdt`, el `sidx` y el `tfra` cuentan desde ahí, y el tramo vacío lo devuelve a su sitio. Los
+     * tiempos de los paquetes no cambian. La edición con medios dura lo de la pista menos el tramo
+     * vacío, y el `tkhd`, que es la suma de las dos, sigue declarando hasta dónde llega desde el
+     * origen, que es lo que necesita el extractor de Android.
+     *
+     * Hasta la 4.1.0 no había tramo vacío y el `tfdt` contaba desde el origen. FFmpeg toma la
+     * duración de una pista fragmentada de su `tfdt` y le suma el inicio de su primer paquete, así
+     * que daba 9,5 s a un archivo de 7,5 con el vídeo desde los 2 s. Un tramo vacío sin mover la
+     * línea de tiempo del medio no lo arreglaba: es la línea de tiempo lo que cuenta.
+     *
+     * Solo con desfases sin signo, que es el modo pensado para FFmpeg y en el que la cabecera se
+     * escribe con el primer fragmento, cuando ya se sabe cuándo arranca cada pista; con signo se
+     * escribe en `start()`, antes de ningún paquete, y el `tfdt` sigue contando desde el origen. Un
+     * lector que ignore una lista de edición de dos entradas en un fMP4 colocaría la pista tardía
+     * en su principio, y para él conviene el modo con signo.
      */
     private fun writeEdts(parent: BoxBuilder, t: TrackState) {
         val mediaTime = editMediaTime(t)
-        if (mediaTime <= 0) return
+        if (!hasEdit(t)) return
         parent.box("edts") {
             fullBox("elst", 0, 0) {
-                u32(1)                               // entry_count
+                if (t.emptyEditMovieTicks > 0) {
+                    u32(2)                           // entry_count
+                    u32(t.emptyEditMovieTicks)       // segment_duration del tramo vacío
+                    u32(-1)                          // media_time: vacío
+                    u16(1); u16(0)                   // media_rate 1.0
+                } else {
+                    u32(1)                           // entry_count
+                }
                 u32(0)                               // segment_duration: desconocida en vivo
                 u32(mediaTime)                       // media_time: lo que hay que saltar
                 u16(1); u16(0)                       // media_rate 1.0

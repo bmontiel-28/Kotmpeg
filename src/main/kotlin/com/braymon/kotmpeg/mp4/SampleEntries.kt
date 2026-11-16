@@ -5,6 +5,7 @@ import com.braymon.kotmpeg.codecconfig.OpusConfig
 import com.braymon.kotmpeg.model.AudioCodec
 import com.braymon.kotmpeg.model.HdrStaticInfo
 import com.braymon.kotmpeg.model.TrackInfo
+import com.braymon.kotmpeg.model.TrackLanguage
 import com.braymon.kotmpeg.model.VideoCodec
 
 /**
@@ -27,11 +28,12 @@ internal object SampleEntries {
     /**
      * Código ISO 639-2/T empaquetado como lo guarda `mdhd`: tres letras minúsculas, cada una
      * menos 0x60, en 5 bits. Lo que no sea exactamente tres letras ASCII sale como `und`: un
-     * código mal formado no puede viajar en ese campo sin corromper los vecinos.
+     * código mal formado no puede viajar en ese campo sin corromper los vecinos. Es la misma regla
+     * de `TrackLanguage.normalize`, con la que `TrackInfo` ya guarda su idioma.
      */
     internal fun packLanguage(code: String): Int {
-        val normalized = code.trim().lowercase()
-        if (normalized.length != 3 || normalized.any { it !in 'a'..'z' }) return LANGUAGE_UNDETERMINED
+        val normalized = TrackLanguage.normalize(code)
+        if (normalized == TrackLanguage.UNDETERMINED) return LANGUAGE_UNDETERMINED
         return ((normalized[0].code - 0x60) shl 10) or
             ((normalized[1].code - 0x60) shl 5) or
             (normalized[2].code - 0x60)

@@ -112,6 +112,12 @@ public class Mp4Muxer internal constructor(
         val timescale: Long = MovieBoxes.mediaTimescale(info)
         val primingUs: Long = MovieBoxes.primingUs(info, timescale)
         val primingTicks: Long = MovieBoxes.primingTicks(info, timescale)
+        val audio: Boolean = info is TrackInfo.Audio
+
+        /** El menor y el mayor PTS recibidos, y el último DTS; los usa [requireTimesFit]. */
+        var minPtsUs = Long.MAX_VALUE
+        var maxPtsUs = Long.MIN_VALUE
+        var lastDtsUs = Long.MIN_VALUE
     }
 
     private val tracks = ArrayList<TrackState>()
@@ -182,10 +188,72 @@ public class Mp4Muxer internal constructor(
         check(!stopped) { "muxer ya detenido" }
         val track = tracks.getOrNull(packet.trackId - 1)
             ?: throw IllegalArgumentException("pista desconocida ${packet.trackId}")
+        requireTimesFit(track, packet)
         val offset = out.position
         out.write(packet.data)
         val key = packet.isKeyFrame || track.info is TrackInfo.Audio
         track.samples.add(offset, packet.data.size, packet.ptsUs, packet.dtsUs, key, packet.durationUs)
+        track.minPtsUs = minOf(track.minPtsUs, packet.ptsUs)
+        track.maxPtsUs = maxOf(track.maxPtsUs, packet.ptsUs)
+        track.lastDtsUs = packet.dtsUs
+    }
+
+    /**
+     * Rechaza con `IllegalArgumentException` un paquete cuyos tiempos no cabrían en el `stts` o el
+     * `ctts`, que solo tienen versión de 32 bits: una pausa de más de unas 13 horas entre dos
+     * fotogramas en la escala de 90 kHz del vídeo, o de unas 24 en audio a 48 kHz. Hasta la 4.1.0
+     * se escribían truncados sin ningún error —50 400 s de pausa se leían como 2 678—, cuando el
+     * README promete un error claro si un desfase de tiempo no cabe en el contenedor, y `MkvMuxer`
+     * ya lo daba.
+     *
+     * Se comprueba aquí y no en [stop] para que lo grabado hasta ese paquete se pueda cerrar: el
+     * paquete rechazado no llega al `mdat` y el muxer sigue admitiendo los siguientes. Lo que se
+     * mira, sin guardar nada por muestra:
+     *
+     *  - **el salto del PTS** fuera del intervalo ya recibido. El DTS sale de la secuencia de PTS
+     *    ordenada (ver [TrackTiming]), así que la mayor duración del `stts` es el mayor hueco entre
+     *    dos PTS consecutivos, y un paquete que cae dentro del intervalo solo lo parte en dos;
+     *  - en vídeo, **cuánto se presenta un fotograma por detrás del más adelantado**: el desfase de
+     *    composición de cualquier muestra no pasa del doble de ese retraso (ver [TrackTiming.of]);
+     *  - si el paquete trae su propio DTS, el salto respecto al anterior y su distancia al PTS, que
+     *    serían la duración y el desfase si se usa tal cual;
+     *  - la duración del paquete, que puede ser la de la última muestra.
+     */
+    private fun requireTimesFit(track: TrackState, packet: MediaPacket) {
+        fun fits(us: Long): Boolean = us >= 0 && Timestamps.rescaleRounded(us, track.timescale, 1_000_000) < UINT32_MAX
+        fun gap(later: Long, earlier: Long): Long = try {
+            Math.subtractExact(later, earlier)
+        } catch (_: ArithmeticException) {
+            Long.MAX_VALUE
+        }
+        val pts = packet.ptsUs
+        val name = "pista ${packet.trackId}"
+        require(fits(packet.durationUs.coerceAtLeast(0L))) {
+            "$name: la duración de ${packet.durationUs} µs no cabe en el stts de MP4 (32 bits)"
+        }
+        if (track.samples.size == 0) return
+        val jump = when {
+            pts > track.maxPtsUs -> gap(pts, track.maxPtsUs)
+            pts < track.minPtsUs -> gap(track.minPtsUs, pts)
+            else -> 0L
+        }
+        require(fits(jump)) {
+            "$name: el pts $pts µs deja un hueco de $jump µs que no cabe en el stts de MP4 (32 bits); " +
+                "MKV y MP4 fragmentado sí lo admiten"
+        }
+        if (track.audio) return
+        val behind = if (pts < track.maxPtsUs) gap(track.maxPtsUs, pts) else 0L
+        require(behind <= Long.MAX_VALUE / 2 && fits(2 * behind)) {
+            "$name: el fotograma de $pts µs se presenta $behind µs por detrás de otro ya decodificado, " +
+                "un desfase de composición que no cabe en el ctts de MP4 (32 bits)"
+        }
+        if (packet.dtsUs != pts) {
+            val dtsJump = if (packet.dtsUs > track.lastDtsUs) gap(packet.dtsUs, track.lastDtsUs) else 0L
+            val lead = if (pts > packet.dtsUs) gap(pts, packet.dtsUs) else 0L
+            require(fits(dtsJump) && fits(lead)) {
+                "$name: el dts ${packet.dtsUs} µs con pts $pts µs no cabe en el stts o el ctts de MP4 (32 bits)"
+            }
+        }
     }
 
     /**
@@ -364,6 +432,17 @@ public class Mp4Muxer internal constructor(
     }
 
     override fun close(): Unit = stop()
+
+    /**
+     * Cierra el archivo sin terminarlo —sin índice ni duraciones—, para borrarlo después. Es lo que
+     * hacen `Kotmpeg.remux` y `Kotmpeg.concat` con una copia cancelada: terminarla con [stop]
+     * dejaba en disco un parcial cerrado y legible que nadie pidió. Después, [stop] no hace nada.
+     */
+    internal fun abort() {
+        if (stopped) return
+        stopped = true
+        out.close()
+    }
 
     /**
      * Lo que [stop] calcula de una pista una sola vez para todas las construcciones del `moov`:

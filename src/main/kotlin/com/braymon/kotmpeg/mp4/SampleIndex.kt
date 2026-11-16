@@ -216,9 +216,15 @@ internal abstract class TrackSamples {
     }
 
     /**
-     * Último keyframe con `pts <= maxPtsUs` entre las muestras `0..limit`, o 0 si no hay ninguno.
-     * Recorre hacia atrás de punto de control en punto de control, que en un vídeo con un keyframe
-     * cada pocos segundos es uno solo.
+     * Último keyframe con `pts <= maxPtsUs` entre las muestras `0..limit`; si no hay ninguno, el
+     * primer keyframe de la pista, y 0 solo si la pista no tiene ninguno. Recorre hacia atrás de
+     * punto de control en punto de control, que en un vídeo con un keyframe cada pocos segundos es
+     * uno solo.
+     *
+     * Hasta la 4.1.0, sin keyframe anterior devolvía la muestra 0, y con un vídeo que no empieza en
+     * keyframe —un recorte, una grabación que arranca a mitad de GOP— `seekTo(0)` entregaba primero
+     * un fotograma que no se puede decodificar, en contra del contrato de `Demuxer.seekTo`. El
+     * demuxer MKV ya iba al primer keyframe.
      */
     fun lastKeyAtOrBefore(limit: Int, maxPtsUs: Long, scan: SampleCursor): Int {
         var end = limit
@@ -242,7 +248,19 @@ internal abstract class TrackSamples {
             if (found >= 0) return found
             end = start - 1
         }
-        return 0
+        return firstKey(scan)
+    }
+
+    /** El primer keyframe de la pista, o 0 si no tiene ninguno. */
+    private fun firstKey(scan: SampleCursor): Int {
+        if (size == 0) return 0
+        scan.moveTo(0)
+        var index = 0
+        while (!scan.key) {
+            if (++index >= size) return 0
+            scan.next()
+        }
+        return index
     }
 
     companion object {
@@ -298,6 +316,35 @@ internal class FileTable(
     private companion object {
         private const val PAGE_ENTRIES = 512
         private val EMPTY = ByteArray(0)
+    }
+}
+
+/**
+ * Las muestras de una pista que no tiene ninguna: la que se registró y nunca recibió un paquete, o
+ * la de un fMP4 cortado antes de su primer fragmento. Es una pista legible con 0 paquetes y
+ * duración 0, como en MKV, y no una que se descarta (ver `Mp4Demuxer.parseFragments`). Su cursor
+ * no se mueve a ninguna parte porque no hay ninguna muestra a la que ir: quien lee mira antes
+ * [size].
+ */
+internal object NoSamples : TrackSamples() {
+    override val size: Int get() = 0
+    override val dtsMonotonic: Boolean get() = true
+    override val checkpointCount: Int get() = 0
+    override fun checkpointIndex(c: Int): Int = 0
+    override fun checkpointDtsUs(c: Int): Long = Long.MAX_VALUE
+    override fun cursor(): SampleCursor = Cursor
+
+    private object Cursor : SampleCursor() {
+        override val index: Int get() = 0
+        override val offset: Long get() = 0
+        override val size: Int get() = 0
+        override val ptsUs: Long get() = 0
+        override val dtsUs: Long get() = 0
+        override val key: Boolean get() = false
+        override val durationUs: Long get() = 0
+        override fun moveTo(target: Int) {
+            throw IndexOutOfBoundsException("la pista no tiene muestras: $target")
+        }
     }
 }
 

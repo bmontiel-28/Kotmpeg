@@ -160,16 +160,21 @@ class LargeFileEdgeCasesTest {
      * Se comprueban las tres cosas que pueden salir mal por separado: que el byte de versión
      * sea realmente 1, que el archivo siga siendo legible, y que la duración vuelva sin
      * truncarse — un round trip que pase pero con la duración recortada sería un falso verde.
+     *
+     * Los fotogramas van cada 12 horas hasta `farOutUs`: un único salto de 57 días no cabe en los
+     * 32 bits del `stts`, y desde la 4.1.1 `Mp4Muxer` lo rechaza en vez de truncarlo (ver
+     * `Mp4WriteValidationTest`).
      */
     @Test
     fun `durations beyond 32 bits are written as version 1 boxes and survive the round trip`() {
         val farOutUs = 5_000_000_000_000L
+        val halfDayUs = 43_200_000_000L
+        val times = generateSequence(0L) { it + halfDayUs }.takeWhile { it < farOutUs }.toList() + farOutUs
         val file = File(dir, "long.mp4")
         Kotmpeg.createMuxer(file, ContainerFormat.MP4).use { muxer ->
             val id = muxer.addTrack(videoTrack())
             muxer.start()
-            muxer.writePacket(MediaPacket(id, payload(0), 0, 0, true, 33_333L))
-            muxer.writePacket(MediaPacket(id, payload(1), farOutUs, farOutUs, true, 33_333L))
+            for ((i, t) in times.withIndex()) muxer.writePacket(MediaPacket(id, payload(i), t, t, true, 33_333L))
         }
 
         val bytes = file.readBytes()
@@ -182,7 +187,7 @@ class LargeFileEdgeCasesTest {
         Kotmpeg.openDemuxer(file).use { demuxer ->
             assertEquals(1, demuxer.tracks.size)
             val packets = generateSequence { demuxer.readPacket() }.toList()
-            assertEquals(2, packets.size)
+            assertEquals(times, packets.map { it.ptsUs })
             assertTrue(
                 demuxer.durationUs >= farOutUs,
                 "la duración de 64 bits se truncó al releer: ${demuxer.durationUs}",

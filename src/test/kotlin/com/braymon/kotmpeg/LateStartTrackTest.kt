@@ -9,6 +9,7 @@ import com.braymon.kotmpeg.model.VideoCodec
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
+import kotlin.math.abs
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -128,6 +129,116 @@ class LateStartTrackTest {
 
     private fun putU32(b: ByteArray, at: Int, value: Long) {
         for (k in 0 until 4) b[at + k] = (value ushr (8 * (3 - k))).toByte()
+    }
+
+    /**
+     * 7,5 s de grabación en la que una pista arranca 2,0123 s después que la otra: el vídeo (a 30
+     * fps, con B-frames) tras el audio o el audio tras el vídeo.
+     */
+    private fun writeLate(file: File, videoLate: Boolean, options: MuxerOptions.() -> Unit) {
+        Kotmpeg.createMuxer(file, options = options).use { m ->
+            val v = m.addTrack(TrackInfo.Video(VideoCodec.H264, 64, 48) { frameRate = 30.0; codecPrivate = avcC })
+            val a = m.addTrack(TrackInfo.Audio(AudioCodec.AAC, 48_000, 2) { codecPrivate = AacConfig.build(48_000, 2); codecDelayUs = 21_333 })
+            m.start()
+            val late = 2_012_300L
+            val videoStart = if (videoLate) late else 0L
+            val audioStart = if (videoLate) 0L else late
+            val frames = ((7_500_000L - videoStart) / 33_333L).toInt()
+            val order = ArrayList<Int>()
+            var k = 0
+            while (k < frames) {
+                if (k % 30 == 0) { order += k++; continue }
+                val p = minOf(k + 2, (k / 30 + 1) * 30 - 1, frames - 1)
+                order += p
+                for (b in k until p) order += b
+                k = p + 1
+            }
+            var audioUs = audioStart
+            var captured = 0L
+            for (frame in order) {
+                captured = maxOf(captured, videoStart + frame * 33_333L)
+                while (audioUs <= captured && audioUs < 7_500_000L) {
+                    m.writePacket(MediaPacket(a, ByteArray(10) { (audioUs / 1000).toByte() }, audioUs, isKeyFrame = true))
+                    audioUs += 21_333
+                }
+                val payload = NalUnits.joinLengthPrefixed(listOf(byteArrayOf(if (frame % 30 == 0) 0x65 else 0x41, frame.toByte())))
+                m.writePacket(MediaPacket(v, payload, videoStart + frame * 33_333L, isKeyFrame = frame % 30 == 0))
+            }
+            while (audioUs < 7_500_000L) {
+                m.writePacket(MediaPacket(a, ByteArray(10) { (audioUs / 1000).toByte() }, audioUs, isKeyFrame = true))
+                audioUs += 21_333
+            }
+        }
+    }
+
+    private fun ptsOf(file: File): Pair<Long, List<String>> = Kotmpeg.openDemuxer(file).use { d ->
+        d.durationUs to generateSequence { d.readPacket() }.map { "${it.trackId} ${it.ptsUs}" }.sorted().toList()
+    }
+
+    /**
+     * Que [actual] tenga la duración y los paquetes de [expected], cada uno a lo sumo a un tic de
+     * 90 kHz. Con desfases sin signo, el desplazamiento de la lista de edición lo fija el primer
+     * fragmento, que con el vídeo tardío es solo de audio, y el primer B-frame de cada grupo queda
+     * un tic tarde (ver `FragmentTiming.capCompositionLead`).
+     */
+    private fun assertSameTimes(label: String, expected: File, actual: File) {
+        val (expectedDuration, expectedPackets) = ptsOf(expected)
+        val (actualDuration, actualPackets) = ptsOf(actual)
+        assertEquals(expectedDuration, actualDuration, "$label: la duración")
+        assertEquals(expectedPackets.size, actualPackets.size, "$label: el número de paquetes")
+        val byTrack = { list: List<String> -> list.map { it.split(" ") }.groupBy({ it[0] }, { it[1].toLong() }).mapValues { it.value.sorted() } }
+        val a = byTrack(expectedPackets)
+        val b = byTrack(actualPackets)
+        for ((track, times) in a) {
+            for ((x, y) in times.zip(b.getValue(track))) assertTrue(abs(x - y) <= 12, "$label: pista $track, paquete de $x µs leído en $y")
+        }
+    }
+
+    /**
+     * Con desfases sin signo, una pista que arranca tarde empieza con un tramo vacío y su línea de
+     * tiempo del medio cuenta desde su arranque, como en MP4 plano y en el fMP4 de FFmpeg con
+     * `delay_moov`. Hasta la 4.1.0 no llevaba tramo vacío y su `tfdt` contaba desde el origen:
+     * FFmpeg, que toma la duración de una pista fragmentada de su `tfdt` y le suma el inicio,
+     * declaraba el archivo 2 s más largo. Lo que no cambia: los tiempos de los paquetes —los mismos
+     * que con signo—, la duración del `tkhd`, que es la suma de las dos ediciones, y que la
+     * reparación de un corte deje las mismas duraciones con el mismo criterio.
+     */
+    @Test
+    fun `a late track in an unsigned fmp4 starts with an empty edit and ffprobe reads its real length`() {
+        for (videoLate in listOf(true, false)) {
+            val label = if (videoLate) "vídeo tardío" else "audio tardío"
+            val lateTrack = if (videoLate) 0 else 1
+            val signed = File(dir, "tardio-firmado-$videoLate.mp4").also { writeLate(it, videoLate) { fragmented = true } }
+            val unsigned = File(dir, "tardio-sin-signo-$videoLate.mp4").also {
+                writeLate(it, videoLate) { fragmented = true; nonNegativeCompositionOffsets = true }
+            }
+            assertSameTimes("$label sin signo", signed, unsigned)
+
+            val bytes = unsigned.readBytes()
+            val edits = SharedMp4Headers.edits(bytes, lateTrack)
+            assertEquals(2, edits.size, "$label: la pista tardía no empieza con un tramo vacío: $edits")
+            assertEquals(-1L, edits[0].mediaTime, "$label: la primera edición no es un tramo vacío")
+            assertEquals(2_012L, edits[0].duration, "$label: el tramo vacío no es lo que tarda en arrancar")
+            assertEquals(edits.sumOf { it.duration }, SharedMp4Headers.tkhdDuration(bytes, lateTrack), "$label: el tkhd no es la suma de sus ediciones")
+            assertTrue(SharedMp4Headers.edits(bytes, 1 - lateTrack).size <= 1, "$label: la pista que arranca en el origen no lleva tramo vacío")
+
+            val cut = File(dir, "tardio-cortado-$videoLate.mp4").also { it.writeBytes(bytes.copyOf(bytes.size * 3 / 5)) }
+            assertTrue(Kotmpeg.repair(cut).repaired, "$label: el corte tenía que repararse")
+            val repaired = cut.readBytes()
+            val repairedEdits = SharedMp4Headers.edits(repaired, lateTrack)
+            assertEquals(edits[0], repairedEdits[0], "$label: la reparación tocó el tramo vacío")
+            assertEquals(repairedEdits.sumOf { it.duration }, SharedMp4Headers.tkhdDuration(repaired, lateTrack), "$label: tkhd reparado")
+            val remuxed = File(dir, "tardio-cortado-remux-$videoLate.mp4")
+            Kotmpeg.remux(cut, remuxed) { fragmented = true; nonNegativeCompositionOffsets = true }
+            assertSameTimes("$label: la reparación frente a su remux", cut, remuxed)
+            assertEquals(SharedMp4Headers.edits(remuxed.readBytes(), lateTrack), repairedEdits, "$label: las ediciones reparadas no son las del remux")
+
+            if (!ffmpegInstalled) continue
+            val (out, code) = runProcess("ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", unsigned.absolutePath)
+            assertEquals(0, code, "$label: ffprobe falló: $out")
+            val seconds = out.trim().lines().first { it.isNotBlank() }.toDouble()
+            assertTrue(abs(seconds - 7.5) < 0.05, "$label: ffprobe da $seconds s a un archivo de 7,5 s")
+        }
     }
 
     /** En cada `traf` de [trackId]: `tfdt` menos [delayTicks] y cada desfase del `trun` más [delayTicks]. */

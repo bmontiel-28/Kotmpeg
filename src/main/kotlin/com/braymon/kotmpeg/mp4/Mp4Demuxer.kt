@@ -117,8 +117,11 @@ public class Mp4Demuxer(
     private val fragmentShells = ArrayList<FragmentShell>()
     private val trexDefaults = HashMap<Int, TrexDefaults>()
 
-    /** `track_ID` de las pistas ya aceptadas, planas o de fragmentos, para descartar los repetidos. */
-    private val acceptedTrackIds = HashSet<Int>()
+    /**
+     * `track_ID` de las pistas ya aceptadas, planas o de fragmentos, en el orden de sus `trak`: para
+     * descartar los repetidos y para devolver [tracks] en el orden del archivo (ver [parse]).
+     */
+    private val acceptedTrackIds = LinkedHashSet<Int>()
 
     /** Pistas usables que no se leen por pasar de [MAX_TRACKS]. */
     private var tracksOverLimit = 0
@@ -155,6 +158,11 @@ public class Mp4Demuxer(
      * Una duración del `mvhd` a cero o «todo unos» (ISO/IEC 14496-12 §8.2.2: desconocida) no es
      * una duración: el valor de 32 bits daba 49 días y el de 64, -1000 µs. Entonces manda el final
      * de las pistas, que en fMP4 ya se tomaba siempre que fuera mayor.
+     *
+     * Las pistas de fragmentos se construyen después que las planas, así que al final se colocan en
+     * el orden de sus `trak`, que es el que promete `Demuxer.tracks`. Solo cambia algo si hay de las
+     * dos: una pista vacía de un MP4 plano —que se lee como una de fragmentos sin ninguno— o un MP4
+     * híbrido. Sin eso, la pista vacía, que hasta la 4.1.0 se descartaba, quedaría la última.
      */
     private fun parse() {
         var moov: Mp4Box? = null
@@ -226,7 +234,11 @@ public class Mp4Demuxer(
             )
         }
 
-        if (fragmentShells.isNotEmpty()) parseFragments(budget)
+        if (fragmentShells.isNotEmpty()) {
+            parseFragments(budget)
+            val fileOrder = acceptedTrackIds.withIndex().associate { (index, id) -> id to index }
+            parsedTracks.sortBy { fileOrder[it.info.id] }
+        }
     }
 
     /** Mapea la parte de rotación de la matriz tkhd de vuelta a 0/90/180/270 grados. */
@@ -606,10 +618,16 @@ public class Mp4Demuxer(
     }
 
     /**
-     * Recorre los fragmentos (ver [FragmentWalker.scan]) y convierte en pistas las candidatas que
-     * tienen muestras. La duración es el mayor final de pista, calculado en tics de cada una y
-     * convertido una sola vez: sumar el DTS y la duración ya redondeados a µs daba 1 µs de
-     * diferencia entre dos archivos que acaban en el mismo tic.
+     * Recorre los fragmentos (ver [FragmentWalker.scan]) y convierte en pistas las candidatas. La
+     * duración es el mayor final de pista, calculado en tics de cada una y convertido una sola vez:
+     * sumar el DTS y la duración ya redondeados a µs daba 1 µs de diferencia entre dos archivos que
+     * acaban en el mismo tic.
+     *
+     * Una candidata sin ninguna muestra —una pista de un MP4 plano que no recibió ni un paquete, o
+     * cualquiera de un fMP4 cortado antes de su primer fragmento— se conserva con 0 paquetes y no
+     * cuenta para la duración ([NoSamples]). Hasta la 4.1.0 se descartaba sin aviso, en contra del
+     * contrato de `Demuxer.tracks`: un archivo con tres pistas se leía con dos —`ffprobe` y el
+     * demuxer MKV las conservan—, `remux` la perdía y ese fMP4 cortado se abría sin pistas.
      *
      * El final de una pista de audio con cebado no lo cuenta ([FragmentShell.primingTicks]), igual
      * que el `mvhd`, el `mehd` y el `tkhd`, que son la suma de sus ediciones, y que `Mp4Muxer` y
@@ -626,7 +644,6 @@ public class Mp4Demuxer(
 
         for ((j, shell) in fragmentShells.withIndex()) {
             val track = scan.stats[j]
-            if (track.count == 0) continue
             val frameRateHint = if (track.firstPositiveDurationUs > 0) 1_000_000.0 / track.firstPositiveDurationUs else 0.0
             val info = try {
                 buildTrackInfo(
@@ -637,6 +654,10 @@ public class Mp4Demuxer(
                 warn("pista ${shell.trackId} (${shell.handlerType}) descartada: ${e.message}")
                 null
             } ?: continue
+            if (track.count == 0) {
+                parsedTracks.add(ParsedTrack(info, NoSamples))
+                continue
+            }
             parsedTracks.add(ParsedTrack(info, FragmentSamples(walker, j, track, scan.checkpoints)))
             val priming = shell.primingTicks
             val end = fragmentTracks[j].timeUs(maxOf(scan.endTicks(j), Long.MIN_VALUE + priming) - priming)
@@ -693,8 +714,9 @@ public class Mp4Demuxer(
 
     /**
      * Busca el último keyframe de la pista ancla —la primera de vídeo, o la primera si no hay
-     * vídeo— con `pts <= destino`, y coloca **todas las demás pistas por tiempo de presentación**
-     * en ese keyframe, que es donde de verdad empieza la imagen:
+     * vídeo, entre las que tienen muestras: una pista vacía no puede anclar nada— con
+     * `pts <= destino`, o el primero si no hay ninguno antes, y coloca **todas las demás pistas por
+     * tiempo de presentación** en ese keyframe, que es donde de verdad empieza la imagen:
      *
      * - otra pista de vídeo, en su propio último keyframe con `pts` no posterior;
      * - una de audio, en el paquete que suena en ese instante, contado en su tiempo de paquete. Con
@@ -714,7 +736,8 @@ public class Mp4Demuxer(
      */
     override fun seekTo(timestampUs: Long): Long {
         check(!closed) { CLOSED }
-        val anchor = parsedTracks.firstOrNull { it.info is TrackInfo.Video } ?: parsedTracks.firstOrNull() ?: return 0
+        val withSamples = parsedTracks.filter { it.samples.size > 0 }
+        val anchor = withSamples.firstOrNull { it.info is TrackInfo.Video } ?: withSamples.firstOrNull() ?: return 0
         val target = keyFrameAtOrBefore(anchor, timestampUs)
         anchor.reader.moveTo(target)
         val targetPts = anchor.reader.ptsUs

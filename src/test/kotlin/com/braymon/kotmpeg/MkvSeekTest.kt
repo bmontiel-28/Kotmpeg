@@ -11,6 +11,7 @@ import com.braymon.kotmpeg.model.VideoCodec
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
+import kotlin.math.abs
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -54,6 +55,71 @@ class MkvSeekTest {
                 }
                 if (!audioAfterVideo) muxer.writePacket(frame)
             }
+        }
+    }
+
+    /**
+     * Cuatro segundos con una primera pista de vídeo **sin ningún paquete** —la cámara no llegó a
+     * entregar fotogramas—, audio y, con [secondVideo], otra pista de vídeo a 25 fps con un keyframe
+     * por segundo. En MKV, clusters de 200 ms; el muxer indexa la primera pista de vídeo declarada,
+     * así que el archivo no lleva ningún `CuePoint` y la búsqueda recorre clusters.
+     */
+    private fun writeWithEmptyVideo(file: File, secondVideo: Boolean) {
+        Kotmpeg.createMuxer(file) { maxClusterDurationMs = 200 }.use { muxer ->
+            muxer.addTrack(video)
+            val v = if (secondVideo) muxer.addTrack(video) else null
+            val a = muxer.addTrack(audio)
+            muxer.start()
+            var audioUs = 0L
+            for (i in 0 until 100) {
+                val pts = i * 40_000L
+                if (v != null) muxer.writePacket(MediaPacket(v, NalUnits.joinLengthPrefixed(listOf(byteArrayOf(0x41, i.toByte()))), pts, isKeyFrame = i % 25 == 0))
+                while (audioUs <= pts) {
+                    muxer.writePacket(MediaPacket(a, ByteArray(8), audioUs, isKeyFrame = true))
+                    audioUs += 21_333
+                }
+            }
+        }
+    }
+
+    /**
+     * Lo que da `seekTo(`[targetUs]`)` sobre [file] y el primer paquete que entrega después de la
+     * pista [trackIndex] (por su posición en `tracks`), o `null` si no entrega ninguno suyo.
+     */
+    private fun seekAndFirstOf(file: File, targetUs: Long, trackIndex: Int): Pair<Long, MediaPacket?> =
+        Kotmpeg.openDemuxer(file).use { demuxer ->
+            val landed = demuxer.seekTo(targetUs)
+            val id = demuxer.tracks[trackIndex].id
+            landed to generateSequence { demuxer.readPacket() }.firstOrNull { it.trackId == id }
+        }
+
+    /**
+     * Una pista de vídeo sin ningún bloque no es el ancla de la búsqueda: lo es la siguiente de
+     * vídeo o, si no hay, el audio, como en MP4. Hasta la 4.1.0, en MKV lo era, y `seekTo`
+     * recorría el archivo entero sin encontrar ningún keyframe suyo, devolvía 0 y la lectura volvía
+     * al principio. Se busca dos veces, porque el ancla se decide en la primera.
+     */
+    @Test
+    fun `an empty first video track does not anchor the seek`() {
+        for (secondVideo in listOf(false, true)) {
+            val mkv = File(dir, "sin-camara-$secondVideo.mkv").also { writeWithEmptyVideo(it, secondVideo) }
+            val mp4 = File(dir, "sin-camara-$secondVideo.mp4").also { writeWithEmptyVideo(it, secondVideo) }
+            val anchorIndex = 1
+            for (target in listOf(2_500_000L, 1_200_000L)) {
+                val label = "segunda pista de vídeo: $secondVideo, destino $target"
+                val (mkvLanded, mkvFirst) = seekAndFirstOf(mkv, target, anchorIndex)
+                val (mp4Landed, _) = seekAndFirstOf(mp4, target, anchorIndex)
+                if (secondVideo) {
+                    assertEquals(target / 1_000_000 * 1_000_000, mkvLanded, "$label: el keyframe del segundo anterior")
+                    assertEquals(mp4Landed, mkvLanded, "$label: MKV y MP4")
+                    assertTrue(mkvFirst != null && mkvFirst.isKeyFrame && mkvFirst.ptsUs == mkvLanded, "$label: el vídeo empieza en $mkvFirst")
+                } else {
+                    assertTrue(mkvLanded in target - 22_000..target, "$label: el audio que suena en el destino, no $mkvLanded")
+                    assertTrue(abs(mkvLanded - mp4Landed) <= 1_000, "$label: MKV $mkvLanded frente a MP4 $mp4Landed (MKV va en ms)")
+                    assertEquals(mkvLanded, mkvFirst?.ptsUs, "$label: el audio empieza donde dice seekTo")
+                }
+            }
+            Kotmpeg.openDemuxer(mkv).use { assertEquals(0, generateSequence { it.readPacket() }.count { p -> p.trackId == it.tracks[0].id }) }
         }
     }
 

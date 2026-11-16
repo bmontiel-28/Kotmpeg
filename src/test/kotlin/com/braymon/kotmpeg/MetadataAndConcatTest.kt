@@ -11,8 +11,11 @@ import com.braymon.kotmpeg.model.VideoCodec
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.abs
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -296,5 +299,59 @@ class MetadataAndConcatTest {
         val demuxer = Kotmpeg.openDemuxer(out)
         assertTrue(demuxer.durationUs > 2_000_000, "joined duration ${demuxer.durationUs}")
         demuxer.close()
+    }
+
+    /**
+     * El HDR10 leído de un MP4 es el mismo `ColorInfo` que el de un MKV con los mismos valores
+     * —múltiplos de las unidades del `mdcv`—, y `concat` los une. Hasta la 4.1.0 esas unidades se
+     * convertían multiplicando por 0,00002 y 0,0001: 0,708 se leía como 0,7080000000000001, y el
+     * `concat` de un MP4 y un MKV iguales fallaba con «color distinto».
+     */
+    @Test
+    fun `hdr10 read from mp4 equals the mkv one and concat joins them`() {
+        val mp4 = File(dir, "hdr.mp4").also { writeOneVideoTrack(it, hdrVideoTrack(0)) }
+        val mkv = File(dir, "hdr.mkv").also { writeOneVideoTrack(it, hdrVideoTrack(0)) }
+        val fromMp4 = Kotmpeg.openDemuxer(mp4).use { (it.tracks.single() as TrackInfo.Video).color }
+        val fromMkv = Kotmpeg.openDemuxer(mkv).use { (it.tracks.single() as TrackInfo.Video).color }
+        assertEquals(hdr, fromMp4?.hdr, "HDR10 leído del MP4")
+        assertEquals(fromMkv, fromMp4, "el color de los dos contenedores")
+        assertEquals(20L, Kotmpeg.concat(listOf(mp4, mkv), File(dir, "hdr-unido.mkv")))
+        assertEquals(20L, Kotmpeg.concat(listOf(mkv, mp4), File(dir, "hdr-unido.mp4")))
+    }
+
+    /**
+     * Cancelar una copia —una `CancellationException` desde `onProgress`, que es lo que lanza una
+     * corrutina cancelada— borra la salida en los tres formatos, también con `fastStart`; cualquier
+     * otro fallo la conserva cerrada y legible hasta el último paquete escrito. Hasta la 4.1.0 las
+     * dos se terminaban con `stop()`, y la cancelada quedaba en disco como si hubiera acabado.
+     */
+    @Test
+    fun `a cancelled remux or concat deletes its output and any other failure keeps it`() {
+        val input = File(dir, "origen.mkv").also { writeOneVideoTrack(it, hdrVideoTrack(0), packets = 30) }
+        val outputs = listOf(
+            "cancelada.mp4" to { _: MuxerOptions -> },
+            "cancelada-rapida.mp4" to { o: MuxerOptions -> o.fastStart = true },
+            "cancelada-frag.mp4" to { o: MuxerOptions -> o.fragmented = true },
+            "cancelada.mkv" to { _: MuxerOptions -> },
+        )
+        for ((name, configure) in outputs) {
+            val output = File(dir, name)
+            var written = 0
+            assertFailsWith<CancellationException>(name) {
+                Kotmpeg.remux(input, output, onProgress = { if (++written == 10) throw CancellationException("cancelada") }, options = { configure(this) })
+            }
+            assertFalse(output.exists(), "$name sigue en disco")
+        }
+        val joined = File(dir, "cancelada-unida.mkv")
+        assertFailsWith<CancellationException> {
+            Kotmpeg.concat(listOf(input, input), joined, onProgress = { if (it > 1_200_000) throw CancellationException("cancelada") })
+        }
+        assertFalse(joined.exists(), "el concat cancelado sigue en disco")
+
+        val failed = File(dir, "fallida.mp4")
+        var written = 0
+        assertFailsWith<IllegalStateException> { Kotmpeg.remux(input, failed, onProgress = { if (++written == 10) error("fallo") }) }
+        assertEquals(10, Kotmpeg.openDemuxer(failed).use { demuxer -> generateSequence { demuxer.readPacket() }.count() })
+        assertFalse(OpenFiles.isOpen(failed), "la salida del remux fallido quedó abierta")
     }
 }

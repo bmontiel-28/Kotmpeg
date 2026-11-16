@@ -1,10 +1,13 @@
 package com.braymon.kotmpeg
 
+import com.braymon.kotmpeg.codecconfig.AacConfig
+import com.braymon.kotmpeg.codecconfig.NalUnits
 import com.braymon.kotmpeg.io.SeekableOutput
 import com.braymon.kotmpeg.mkv.MkvMuxer
 import com.braymon.kotmpeg.model.AudioCodec
 import com.braymon.kotmpeg.model.ColorInfo
 import com.braymon.kotmpeg.model.ContainerFormat
+import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.TrackInfo
 import com.braymon.kotmpeg.model.VideoCodec
 import com.braymon.kotmpeg.mp4.FragmentedMp4Muxer
@@ -15,6 +18,7 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -124,5 +128,38 @@ class ModelAndOptionsTest {
             Kotmpeg.createMuxer(SeekableOutput(raf), ContainerFormat.MKV) { maxClusterDurationMs = -5 }
         }
         assertFalse(raf.channel.isOpen, "el destino quedó abierto")
+    }
+
+    /**
+     * Sin fecha de creación, dos ejecuciones sobre la misma entrada dan el mismo archivo byte a byte
+     * en los tres formatos. En MKV el `SegmentUID` y los `TrackUID` salen entonces de la cabecera;
+     * hasta la 4.1.0 salían siempre de un `Random` sin semilla, y dos MKV de la misma entrada
+     * diferían en 32 bytes. Con fecha siguen siendo aleatorios, y cambiar una pista cambia los UID.
+     */
+    @Test
+    fun `without a creation time the same input gives the same bytes in every format`() {
+        val avcC = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x1F, 0x11)), listOf(byteArrayOf(0x68, 0x22)))
+        fun write(name: String, date: Long?, language: String = "spa"): ByteArray {
+            val file = File(dir, name)
+            Kotmpeg.createMuxer(file) { creationTimeMillis = date; fragmented = name.endsWith("-frag.mp4") }.use { muxer ->
+                val v = muxer.addTrack(TrackInfo.Video(VideoCodec.H264, 320, 240) { codecPrivate = avcC })
+                val a = muxer.addTrack(TrackInfo.Audio(AudioCodec.AAC, 48_000, 2) { codecPrivate = AacConfig.build(48_000, 2); this.language = language })
+                muxer.start()
+                for (i in 0 until 10) {
+                    muxer.writePacket(MediaPacket(v, NalUnits.joinLengthPrefixed(listOf(byteArrayOf(0x65, i.toByte()))), i * 33_333L, isKeyFrame = i == 0))
+                    muxer.writePacket(MediaPacket(a, ByteArray(8) { i.toByte() }, i * 21_333L, isKeyFrame = true))
+                }
+            }
+            return file.readBytes().also { file.delete() }
+        }
+        for (name in listOf("igual.mkv", "igual.mp4", "igual-frag.mp4")) {
+            assertContentEquals(write(name, date = null), write(name, date = null), name)
+        }
+        val dated = 1_700_000_000_000L
+        assertFalse(write("fecha.mkv", dated).contentEquals(write("fecha.mkv", dated)), "con fecha, los UID de MKV son aleatorios")
+        val spanish = write("idioma.mkv", date = null)
+        val english = write("idioma.mkv", date = null, language = "eng")
+        assertEquals(spanish.size, english.size)
+        assertTrue(spanish.indices.count { spanish[it] != english[it] } > 3, "otra pista, otros UID, no solo el idioma")
     }
 }

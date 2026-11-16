@@ -63,6 +63,8 @@ internal class FragmentedMp4Repair(private val target: RepairTarget) {
         val tkhdDuration: Field?,
         val elstDuration: Field?,
         val elstMediaTime: Long,
+        /** El tramo vacío con el que empieza su lista de edición, en la escala del `mvhd`; 0 si no lo hay. */
+        val emptyEditMovieTicks: Long,
     ) {
         var defaultDuration = 0L
         var defaultSize = 0L
@@ -183,12 +185,13 @@ internal class FragmentedMp4Repair(private val target: RepairTarget) {
         val declared = FragmentDurations.declared(
             LongArray(tracks.size) { tracks[it].endTicks },
             LongArray(tracks.size) { if (tracks[it].audio) tracks[it].elstMediaTime else 0L },
+            LongArray(tracks.size) { tracks[it].emptyEditMovieTicks },
         ) { i, ticks -> Timestamps.rescaleRounded(ticks, movieTimescale, tracks[i].timescale) }
         mvhdDuration?.let { writes.add(it.position to FragmentDurations.durationBytes(declared.movie, it.wide)) }
         mehdDuration?.let { writes.add(it.position to FragmentDurations.durationBytes(declared.movie, it.wide)) }
         for ((i, track) in tracks.withIndex()) {
             track.tkhdDuration?.let { writes.add(it.position to FragmentDurations.durationBytes(declared.tracks[i], it.wide)) }
-            track.elstDuration?.let { writes.add(it.position to FragmentDurations.durationBytes(declared.tracks[i], it.wide)) }
+            track.elstDuration?.let { writes.add(it.position to FragmentDurations.durationBytes(declared.mediaEdits[i], it.wide)) }
         }
         for ((at, bytes) in writes) {
             if (at < 0 || at + bytes.size > keepEnd) reject("un parche en $at cae fuera de lo que se conserva, que acaba en $keepEnd")
@@ -251,11 +254,18 @@ internal class FragmentedMp4Repair(private val target: RepairTarget) {
         }
     }
 
+    /**
+     * Lo que la reparación necesita de un `trak`. De la lista de edición entiende las dos formas
+     * que escribe el muxer: una sola edición con medios, o un tramo vacío seguido de ella, que es
+     * como empieza una pista que arranca tarde con desfases sin signo (ver
+     * `FragmentedMp4Muxer.writeEdts`). Con otra forma, la lista no se toca.
+     */
     private fun parseTrak(base: Long, bytes: ByteArray, trak: Child): Track {
         var id = -1L
         var tkhd: Field? = null
         var elst: Field? = null
         var mediaTime = 0L
+        var empty = 0L
         var timescale = 0L
         var handler = ""
         for (child in children(bytes, trak.dataStart, trak.end)) {
@@ -267,11 +277,22 @@ internal class FragmentedMp4Repair(private val target: RepairTarget) {
                     tkhd = Field(base + idAt + 8, wide)
                 }
                 "edts" -> for (edit in children(bytes, child.dataStart, child.end)) {
-                    if (edit.type != "elst" || u32(bytes, edit.dataStart + 4) != 1L) continue
+                    if (edit.type != "elst") continue
                     val wide = u8(bytes, edit.dataStart) == 1
-                    elst = Field(base + edit.dataStart + 8, wide)
-                    mediaTime = (if (wide) u64(bytes, edit.dataStart + 16) else u32(bytes, edit.dataStart + 12).toInt().toLong())
-                        .coerceAtLeast(0L)
+                    val entrySize = if (wide) 20 else 12
+                    fun durationAt(entry: Int): Long = if (wide) u64(bytes, entry) else u32(bytes, entry)
+                    fun mediaTimeAt(entry: Int): Long = if (wide) u64(bytes, entry + 8) else u32(bytes, entry + 4).toInt().toLong()
+                    val first = edit.dataStart + 8
+                    val count = u32(bytes, edit.dataStart + 4)
+                    if (first + count * entrySize > edit.end) continue
+                    val media = when {
+                        count == 1L -> first
+                        count == 2L && mediaTimeAt(first) == -1L -> first + entrySize
+                        else -> continue
+                    }
+                    empty = if (media == first) 0L else durationAt(first)
+                    elst = Field(base + media, wide)
+                    mediaTime = mediaTimeAt(media).coerceAtLeast(0L)
                 }
                 "mdia" -> for (media in children(bytes, child.dataStart, child.end)) {
                     when (media.type) {
@@ -282,7 +303,7 @@ internal class FragmentedMp4Repair(private val target: RepairTarget) {
             }
         }
         if (id < 0 || timescale <= 0) reject("pista sin tkhd o sin escala de tiempo")
-        return Track(id, timescale, handler == "soun", handler == "vide", tkhd, elst, mediaTime)
+        return Track(id, timescale, handler == "soun", handler == "vide", tkhd, elst, mediaTime, empty)
     }
 
     /**

@@ -138,4 +138,80 @@ class CompositionOffsetsTest {
         assertTrue(sizes.getValue(false) > 0, "el modo firmado escribe la cabecera en start()")
         assertEquals(0L, sizes.getValue(true))
     }
+
+    /**
+     * GOP cerrado con B-frames (`I P B B P B B …`, un keyframe cada 90 fotogramas) a 30 fps, con
+     * una pausa de 2,5 s —una captura de pantalla que deja de emitir mientras nada cambia— cada 40
+     * fotogramas, dentro de un grupo `P B B`: el B-frame se retiene hasta que llega su ancla. Los
+     * fragmentos se cortan a mitad de GOP por [cut], con o sin una pista de audio, que también
+     * provoca cortes.
+     *
+     * Con desfases sin signo, tras un corte forzoso el primer B-frame del fragmento siguiente se
+     * presentaba antes de donde empezaba a decodificarse ese fragmento; su desfase negativo se
+     * escribía como cero y el fotograma salía en su tiempo de decodificación, hasta 3 s fuera de su
+     * sitio. Ahora cada fotograma se presenta donde lo haría con signo, y ningún desfase es negativo.
+     */
+    private fun writeForcedCuts(file: File, nonNegative: Boolean, withAudio: Boolean, cut: MuxerOptions.() -> Unit) {
+        FragmentedMp4Muxer(file) {
+            nonNegativeCompositionOffsets = nonNegative
+            creationTimeMillis = null
+            cut()
+        }.use { muxer ->
+            val v = muxer.addTrack(video)
+            val a = if (withAudio) muxer.addTrack(audio) else -1
+            muxer.start()
+            val count = 450
+            fun shown(k: Int): Long = k * 33_333L + 2_500_000L * ((k + 29) / 40)
+            val order = ArrayList<Int>()
+            var k = 0
+            while (k < count) {
+                if (k % 90 == 0) {
+                    order += k++
+                    continue
+                }
+                val p = minOf(k + 2, (k / 90 + 1) * 90 - 1, count - 1)
+                order += p
+                for (b in k until p) order += b
+                k = p + 1
+            }
+            var audioUs = 0L
+            var capturedUs = 0L
+            for (frame in order) {
+                capturedUs = maxOf(capturedUs, shown(frame))
+                while (withAudio && audioUs <= capturedUs) {
+                    muxer.writePacket(MediaPacket(a, ByteArray(6) { (audioUs / 1000).toByte() }, audioUs, isKeyFrame = true))
+                    audioUs += 21_333
+                }
+                val payload = NalUnits.joinLengthPrefixed(listOf(ByteArray(40) { if (it == 0) (if (frame % 90 == 0) 0x65 else 0x41).toByte() else frame.toByte() }))
+                muxer.writePacket(MediaPacket(v, payload, shown(frame), isKeyFrame = frame % 90 == 0))
+            }
+        }
+    }
+
+    @Test
+    fun `unsigned offsets present every frame in place after forced cuts mid gop`() {
+        val cuts = listOf<Pair<String, MuxerOptions.() -> Unit>>(
+            "duracion" to { maxFragmentDurationUs = 700_000 },
+            "bytes" to { maxFragmentBytes = 300 },
+        )
+        for ((name, cut) in cuts) {
+            for (withAudio in listOf(false, true)) {
+                val label = "corte por $name${if (withAudio) " con audio" else ""}"
+                val signed = File(dir, "forzoso-firmado-$name-$withAudio.mp4").also { writeForcedCuts(it, nonNegative = false, withAudio, cut) }
+                val unsigned = File(dir, "forzoso-sin-signo-$name-$withAudio.mp4").also { writeForcedCuts(it, nonNegative = true, withAudio, cut) }
+
+                assertTrue(truns(unsigned).size > 20, "$label: la prueba necesita muchos fragmentos")
+                assertTrue(truns(unsigned).all { (version, offsets) -> version == 0 && offsets.all { it >= 0 } }, "$label: quedó algún desfase negativo")
+                assertEquals(read(signed).sorted(), read(unsigned).sorted(), "$label: algún fotograma se presenta en otro sitio")
+                Kotmpeg.openDemuxer(unsigned).use { demuxer ->
+                    var previousDts = Long.MIN_VALUE
+                    generateSequence { demuxer.readPacket() }.filter { it.trackId == 1 }.forEach {
+                        assertTrue(it.dtsUs > previousDts, "$label: el DTS no avanza en el fotograma de ${it.ptsUs} µs")
+                        assertTrue(it.dtsUs <= it.ptsUs, "$label: dts ${it.dtsUs} > pts ${it.ptsUs}")
+                        previousDts = it.dtsUs
+                    }
+                }
+            }
+        }
+    }
 }

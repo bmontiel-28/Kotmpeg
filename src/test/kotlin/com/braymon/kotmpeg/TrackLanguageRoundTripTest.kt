@@ -93,4 +93,37 @@ class TrackLanguageRoundTripTest {
         }
         assertEquals("und", SampleEntries.unpackLanguage(0), "un código de idioma Macintosh no es ISO")
     }
+
+    /**
+     * El idioma se normaliza al crear la pista, igual en los tres muxers: minúsculas si es un código
+     * de tres letras, y `und` si no. Hasta la 4.1.0 MKV escribía `es` o `es-MX` tal cual en su
+     * elemento `Language`, que es el de los códigos ISO 639-2, MP4 los escribía como `und`, y un
+     * remux de MKV a MP4 los perdía sin aviso.
+     */
+    @Test
+    fun `a language that is not a three letter code is und in every container`() {
+        val cases = listOf("es" to "und", "es-MX" to "und", "" to "und", "zz9" to "und", "SPA" to "spa", " eng " to "eng")
+        for ((given, normalized) in cases) {
+            val track = TrackInfo.Audio(codec = AudioCodec.AAC, sampleRate = 48000, channelCount = 2) {
+                codecPrivate = AacConfig.build(48000, 2)
+                language = given
+            }
+            assertEquals(normalized, track.language, "«$given» en el TrackInfo")
+            assertEquals(normalized, track.copy { }.language, "«$given» tras copy")
+            val outputs = listOf(
+                File(dir, "idioma.mkv").let { it to MkvMuxer(it) },
+                File(dir, "idioma.mp4").let { it to Mp4Muxer(it) },
+                File(dir, "idioma-frag.mp4").let { it to FragmentedMp4Muxer(it) },
+            )
+            for ((file, muxer) in outputs) {
+                muxer.use { m ->
+                    val id = m.addTrack(track)
+                    m.start()
+                    m.writePacket(MediaPacket(id, ByteArray(16), ptsUs = 0, isKeyFrame = true))
+                }
+                val read = Kotmpeg.openDemuxer(file).use { it.tracks.single().language }
+                assertEquals(normalized, read, "«$given» en ${file.name}")
+            }
+        }
+    }
 }

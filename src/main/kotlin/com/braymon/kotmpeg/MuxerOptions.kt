@@ -30,6 +30,11 @@ public class MuxerOptions {
      * Fecha de creación en milisegundos desde la época de Unix: `mvhd`, `tkhd` y `mdhd` en MP4 y
      * `DateUTC` en Matroska. `null` no la escribe —en MP4, deja los campos a cero—, y es lo que
      * conviene para que dos ejecuciones sobre la misma entrada den el mismo archivo byte a byte.
+     *
+     * En Matroska, `null` también hace deterministas el `SegmentUID` y los `TrackUID`: salen de la
+     * cabecera —la aplicación y las pistas— en vez de generarse al azar, así que dos archivos con
+     * las mismas pistas comparten esos identificadores. Con fecha siguen siendo aleatorios. Hasta la
+     * 4.1.0 eran aleatorios siempre, y dos MKV de la misma entrada no salían iguales.
      */
     public var creationTimeMillis: Long? = System.currentTimeMillis()
 
@@ -87,6 +92,10 @@ public class MuxerOptions {
      * MP4 fragmentado: se llama con cada fragmento ya escrito y volcado al archivo, con su
      * posición, su tamaño y su duración, para empaquetar en vivo sin releer el archivo. Si lanza,
      * la excepción se ignora: un fallo al anotar un segmento no puede dejar la grabación a medias.
+     *
+     * Se ejecuta **dentro** del `writePacket` cuyo paquete cierra el fragmento —o de `stop()`, con
+     * el último—, en el mismo hilo, y con `Kotmpeg.synchronizedMuxer`, dentro de su cerrojo: lo que
+     * tarde lo tarda la escritura, y los demás productores esperan.
      */
     public var onSegment: ((Mp4Segment) -> Unit)? = null
 
@@ -103,10 +112,28 @@ public class MuxerOptions {
      * a `start()` sino con el primer fragmento, que es cuando se conoce el desfase que hay que
      * compensar.
      *
-     * Eso vale con GOP cerrado, que es lo que da `MediaCodec`. Con GOP abierto —reempaquetar un
-     * x265 con sus opciones por defecto—, el desfase que fija el primer fragmento no alcanza para
-     * las imágenes iniciales de los siguientes, que quedan recortadas y fuera de orden: con esas
-     * fuentes conviene el valor por defecto (ver el KDoc de `FragmentedMp4Muxer`).
+     * Eso vale con GOP cerrado, que es lo que da `MediaCodec`, también cuando un fragmento se corta
+     * a mitad de GOP por [maxFragmentDurationUs] o [maxFragmentBytes]: el corte cae delante de un
+     * fotograma ancla, y el fragmento acaba donde los B-frames que vienen detrás de él todavía se
+     * pueden decodificar a tiempo. Hasta la 4.1.0 no se hacía, y tras uno de esos cortes un B-frame
+     * se mostraba en su tiempo de decodificación, hasta 3 s fuera de su sitio con vídeo de
+     * frecuencia variable. Con GOP abierto —reempaquetar un x265 con sus opciones por defecto—, el
+     * desfase que fija el primer fragmento no alcanza para las imágenes iniciales de los
+     * siguientes, que quedan recortadas y fuera de orden: con esas fuentes conviene el valor por
+     * defecto (ver el KDoc de `FragmentedMp4Muxer`).
+     *
+     * Una pista que arranca después que las demás —el vídeo unos cientos de milisegundos detrás del
+     * audio— lleva en este modo una lista de edición de dos entradas, un tramo vacío y la edición
+     * con medios, como el MP4 plano y como FFmpeg con `-movflags delay_moov`: es lo que hace que
+     * FFmpeg le dé su duración real. Un lector que ignore esa forma de la lista en un fMP4
+     * colocaría la pista en el principio; para él conviene el valor por defecto.
+     *
+     * **Con el valor por defecto, esa pista no lleva tramo vacío**: la cabecera se escribe en
+     * `start()`, antes de ningún paquete, cuando aún no se sabe qué pista arrancará tarde, y su
+     * `tfdt` cuenta desde el origen. Los tiempos de los paquetes son los correctos y este demuxer
+     * lee bien el archivo, pero FFmpeg, y lo que se apoya en él, lo muestran más largo de lo que es:
+     * 9,5 s en uno de 7,5 con el vídeo desde los 2 s. Si el archivo va a pasar por FFmpeg y una pista
+     * puede arrancar tarde, conviene esta opción.
      */
     public var nonNegativeCompositionOffsets: Boolean = false
 

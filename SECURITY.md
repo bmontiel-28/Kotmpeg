@@ -65,6 +65,12 @@ propia reparación en cada operación y la relanzan. Un archivo que se leía ant
 después, que `repair` rechace después de haberlo tocado, o que una reparación interrumpida deje sin
 arreglo, es un reporte útil.
 
+Esa política vale para archivos que **ya nadie escribe**. `repair` no se coordina con un muxer que
+siga grabando en el mismo archivo: lo da por terminado mientras el muxer añade datos detrás, y si
+el proceso muere después, un MKV así no deja leer ni un paquete y otro `repair` lo da por cerrado.
+No es un fallo de la política sino un uso que el contrato excluye; repara al arrancar, con las
+grabaciones que quedaron a medias de la ejecución anterior.
+
 Si encuentras un archivo que la incumpla, puedes comprobarlo antes de reportar con una campaña
 local (los detalles, en el [README](README.md#fuzzing)); el archivo que deja en `build/fuzz-findings/`
 es justo lo que conviene adjuntar al reporte privado.

@@ -1,15 +1,18 @@
 package com.braymon.kotmpeg
 
 import com.braymon.kotmpeg.codecconfig.AacConfig
+import com.braymon.kotmpeg.codecconfig.NalUnits
 import com.braymon.kotmpeg.model.AudioCodec
 import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.TrackInfo
+import com.braymon.kotmpeg.model.VideoCodec
 import com.braymon.kotmpeg.mp4.Mp4Muxer
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 /**
  * **Una pista que el MP4 no puede describir se rechaza al registrarla, no al cerrar.**
@@ -59,5 +62,33 @@ class Mp4WriteValidationTest {
         }
         val track = Kotmpeg.openDemuxer(file).use { it.tracks.single() as TrackInfo.Audio }
         assertEquals(AudioCodec.OPUS to 2, track.codec to track.channelCount)
+    }
+
+    /**
+     * Un hueco entre dos fotogramas que no cabe en los 32 bits del `stts` —14 h en la escala de
+     * 90 kHz— se rechaza en `writePacket`, el muxer sigue admitiendo paquetes, y lo grabado se
+     * cierra como siempre. Hasta la 4.1.0 se escribía truncado y sin error: 50 400 s se leían como
+     * 2 678 s.
+     */
+    @Test
+    fun `a gap that does not fit the 32 bit stts is rejected and the rest still closes`() {
+        val avcC = NalUnits.buildAvcC(listOf(byteArrayOf(0x67, 0x64, 0, 0x1F, 0x11)), listOf(byteArrayOf(0x68, 0x22)))
+        fun frame(i: Int) = NalUnits.joinLengthPrefixed(listOf(byteArrayOf(0x65, i.toByte())))
+        val file = File(dir, "hueco.mp4")
+        Mp4Muxer(file).use { muxer ->
+            val id = muxer.addTrack(TrackInfo.Video(VideoCodec.H264, 320, 240) { codecPrivate = avcC })
+            muxer.start()
+            for (i in 0 until 3) muxer.writePacket(MediaPacket(id, frame(i), i * 40_000L, isKeyFrame = i == 0))
+            val gap = assertFailsWith<IllegalArgumentException> {
+                muxer.writePacket(MediaPacket(id, frame(3), 50_400_000_000L, isKeyFrame = true))
+            }
+            assertTrue("stts" in gap.message.orEmpty(), "el error dice qué no cabe: ${gap.message}")
+            assertFailsWith<IllegalArgumentException> {
+                muxer.writePacket(MediaPacket(id, frame(3), 120_000L, isKeyFrame = false, durationUs = 50_400_000_000L))
+            }
+            muxer.writePacket(MediaPacket(id, frame(3), 120_000L, isKeyFrame = false))
+        }
+        val pts = Kotmpeg.openDemuxer(file).use { d -> generateSequence { d.readPacket() }.map { it.ptsUs }.toList() }
+        assertEquals(listOf(0L, 40_000L, 80_000L, 120_000L), pts)
     }
 }

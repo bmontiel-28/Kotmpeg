@@ -5,6 +5,7 @@ import com.braymon.kotmpeg.audio.PcmResampler
 import com.braymon.kotmpeg.audio.PcmStreamMixer
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import kotlin.math.abs
 import kotlin.random.Random
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -167,6 +168,101 @@ class PcmStreamMixerTest {
                 throw AssertionError("frame $k: ${mixed[k]} en vez de $expected (el sistema se desincronizó)")
             }
         }
+    }
+
+    /**
+     * El sistema deja de entregar audio [pauseMs] y vuelve **sin ráfaga**: lo de la pausa no llega
+     * nunca —como una app que silencia una fuente dejando de llamar a `write`— y lo nuevo llega a
+     * ritmo normal. Lo que se exige es lo mismo que con ráfaga: el hueco en silencio, contado en
+     * `lostFrames`, y el sistema **en su sitio** el resto de la grabación. Hasta la 4.1.0, con una
+     * pausa menor que `maxLatencyMs` quedaba desfasado lo que durara la pausa y, con una mayor,
+     * mudo hasta el final: cada trozo nuevo pagaba la deuda del audio que no llegó.
+     */
+    private fun pauseWithoutBurst(pauseMs: Int) {
+        val rate = 48_000
+        val chunk = 480
+        val steps = 400
+        val system = ShortArray(steps * chunk) { ((it % 20_000) + 1).toShort() }
+        val mixer = PcmStreamMixer(outputRate = rate, outputChannels = 1, maxLatencyMs = 500)
+        val micId = mixer.addSource(rate, 1)
+        val systemId = mixer.addSource(rate, 1)
+        val pause = 100 until 100 + pauseMs / 10
+        val out = ArrayList<ShortArray>()
+        for (step in 0 until steps) {
+            mixer.write(micId, ShortArray(chunk))
+            if (step !in pause) mixer.write(systemId, system.copyOfRange(step * chunk, (step + 1) * chunk))
+            out += mixer.read()
+        }
+        out += mixer.flush()
+        val mixed = concat(out)
+
+        val gap = pause.first * chunk until (pause.last + 1) * chunk
+        assertEquals(gap.count().toLong(), mixer.lostFrames(systemId), "frames perdidos del sistema con una pausa de $pauseMs ms")
+        assertEquals(0L, mixer.lostFrames(micId))
+        assertEquals(system.size, mixed.size)
+        for (k in mixed.indices) {
+            val expected = if (k in gap) 0 else system[k].toInt()
+            if (mixed[k].toInt() != expected) {
+                throw AssertionError("pausa de $pauseMs ms, frame $k: ${mixed[k]} en vez de $expected (el sistema se desincronizó)")
+            }
+        }
+    }
+
+    @Test
+    fun `a source paused for less than the wait without a burst stays in sync afterwards`() = pauseWithoutBurst(300)
+
+    @Test
+    fun `a source paused for longer than the wait without a burst is not muted afterwards`() = pauseWithoutBurst(1_500)
+
+    /**
+     * Deriva sostenida: el sistema declara 8 kHz pero entrega un 0,5 % menos, como un dispositivo
+     * cuyo reloj va algo más despacio (la deriva real ronda las decenas de partes por millón; aquí se
+     * exagera para que en 150 s pase lo que pasaría en horas). Hasta la 4.1.0 el desfase crecía
+     * hasta `maxLatencyMs` y desde ahí el sistema quedaba mudo. Ahora, cada vez que el desfase pasa
+     * de la tolerancia —una décima parte de la espera—, el sistema pierde ese tramo y vuelve a su
+     * sitio: suena hasta el final, nunca va más desfasado que esa tolerancia, y lo perdido es lo que
+     * no entregó, salvo lo que le faltaba al acabar, que `flush` completa con silencio sin contarlo.
+     */
+    @Test
+    fun `a source whose clock drifts keeps sounding and stays within the tolerance`() {
+        val rate = 8_000
+        val chunk = 80
+        val steps = 15_000
+        val drift = 0.005
+        val tolerance = rate * 500L / 1000 / 10
+        val mixer = PcmStreamMixer(outputRate = rate, outputChannels = 1, maxLatencyMs = 500)
+        val micId = mixer.addSource(rate, 1)
+        val systemId = mixer.addSource(rate, 1)
+        val out = ArrayList<ShortArray>()
+        var delivered = 0
+        for (step in 0 until steps) {
+            mixer.write(micId, ShortArray(chunk))
+            val due = ((step + 1) * chunk * (1 - drift)).toInt()
+            mixer.write(systemId, ShortArray(due - delivered) { (((delivered + it) % 30_000) + 1).toShort() })
+            delivered = due
+            out += mixer.read()
+        }
+        out += mixer.flush()
+        val mixed = concat(out)
+
+        var worst = 0.0
+        var sounding = 0
+        val tail = mixed.size - 10 * rate
+        for (k in mixed.indices) {
+            val value = mixed[k].toInt()
+            if (value == 0) continue
+            if (k >= tail) sounding++
+            val wrapped = value - 1
+            val expectedFrame = k * (1 - drift)
+            val frame = wrapped + 30_000 * Math.round((expectedFrame - wrapped) / 30_000)
+            worst = maxOf(worst, abs(k - frame / (1 - drift)))
+        }
+        assertTrue(sounding >= 9 * rate, "el sistema quedó mudo al final: suenan $sounding de ${10 * rate} frames")
+        assertTrue(worst <= tolerance + 2 * chunk, "el sistema llegó a ir $worst frames desfasado (tolerancia $tolerance)")
+        val undelivered = mixed.size - delivered.toLong()
+        val lost = mixer.lostFrames(systemId)
+        assertTrue(lost <= undelivered && undelivered - lost <= tolerance + 2 * chunk, "perdidos $lost, sin entregar $undelivered")
+        assertEquals(0L, mixer.lostFrames(micId))
     }
 
     /** Una fuente que nunca entrega nada no detiene la mezcla ni hace crecer la memoria. */

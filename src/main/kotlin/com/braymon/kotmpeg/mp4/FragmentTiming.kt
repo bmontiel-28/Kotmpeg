@@ -51,6 +51,23 @@ internal object FragmentTiming {
      * estima con el último hueco del fragmento, con [typicalIntervalUs] o, en la primera muestra de
      * la pista, con [defaultIntervalUs].
      *
+     * Ese hueco empieza en el DTS del paquete, y si los paquetes traen un DTS válido —el de un
+     * remux, que no retrocede—, el muxer da su final ya calculado y llevado a su propia línea de
+     * tiempo de decodificación ([lastDecodeEndUs]), y el fragmento acaba justo ahí. Hasta la 4.1.0 la duración se contaba
+     * desde el DTS que le asignaba este muxer, que no tiene por qué ser el de origen: en un fMP4 sin
+     * signo cuyo vídeo arranca tarde, el último B-frame se decodifica antes de lo que diría la
+     * secuencia de PTS (ver [capCompositionLead]), y reempaquetar ese archivo, o el que deja
+     * `Kotmpeg.repair` al cerrar un corte, lo alargaba un fotograma: la duración de la reparación y
+     * la de su remux no coincidían.
+     *
+     * Si ese final no pasa del mayor PTS, el último fotograma no llegaría a verse: el archivo de
+     * origen se cortó después de un ancla y antes de sus B-frames. Entonces el último fotograma
+     * dura lo que el paquete, contado desde el mayor PTS, como lo cierra `Kotmpeg.repair`. La
+     * comparación deja medio tic de margen: los tiempos llegan redondeados a µs, y un final que en
+     * tics coincide con el mayor PTS podía quedar 1 µs por encima y mostrar el ancla 1 µs. Hasta la
+     * 4.1.0 el fragmento acababa en el final de ese paquete, contado desde el DTS que le asignaba
+     * este muxer.
+     *
      * Sin [reorder] —en audio— no se acota nada: el DTS de cada muestra es el PTS que le toca en la
      * secuencia ordenada, como en `Mp4Muxer`, y el muxer iguala a él su PTS. AAC y Opus se
      * decodifican en el orden en que se presentan, así que un PTS que retrocede es jitter de la
@@ -60,6 +77,12 @@ internal object FragmentTiming {
      * este —un corte por tamaño o por duración que cae en un B-frame—, el fragmento siguiente
      * empezará a presentarse antes de donde acabe este, y todo lo que este se alargue lo tendrá que
      * recuperar aquel (ver [absorbOverlap]). Así que la última duración es la mínima, un tic.
+     *
+     * Con [endAtLastPts] también, aunque el paquete siguiente se presente después: es el corte
+     * forzoso a mitad de GOP con desfases sin signo (ver `FragmentedMp4Muxer.flushFragment`). Ese
+     * paquete es un fotograma ancla, y detrás de él llegan los B-frames que se presentan antes que
+     * él; el fragmento siguiente tiene que poder decodificarlos donde se presentan, porque el
+     * desfase negativo que necesitarían no se puede escribir sin signo.
      *
      * El fragmento empieza a decodificarse en su primer PTS, salvo que el anterior de la pista
      * ([previousEndUs], `null` en el primero) acabe después, porque el tiempo de decodificación no
@@ -76,6 +99,8 @@ internal object FragmentTiming {
         defaultIntervalUs: Long,
         timescale: Long,
         reorder: Boolean,
+        endAtLastPts: Boolean = false,
+        lastDecodeEndUs: Long? = null,
     ): Durations {
         val n = ptsUs.size
         val sorted = ptsUs.copyOf().also { it.sort() }
@@ -88,13 +113,16 @@ internal object FragmentTiming {
             typicalIntervalUs > 0 -> typicalIntervalUs
             else -> null
         }
+        val knownEnd = lastDecodeEndUs?.takeIf { !endAtLastPts && nextPtsUs == null }
         val minStepUs = minStepUs(timescale)
         durationsUs[n - 1] = when {
+            endAtLastPts -> minStepUs
             nextDelta != null -> nextDelta
             nextPtsUs != null -> minStepUs
+            knownEnd != null && knownEnd - sorted[n - 1] > minStepUs / 2 -> knownEnd - sorted[n - 1]
             else -> estimate ?: defaultIntervalUs
         }
-        val lastFromPacket = nextPtsUs == null && lastPacketDurationUs > 0
+        val lastFromPacket = knownEnd == null && !endAtLastPts && nextPtsUs == null && lastPacketDurationUs > 0
         if (reorder) boundReorderOffsets(ptsUs, sorted, durationsUs, minStepUs, lastFromPacket)
 
         val decodeStartUs = if (previousEndUs == null) sorted[0].coerceAtLeast(0L) else maxOf(previousEndUs, sorted[0])

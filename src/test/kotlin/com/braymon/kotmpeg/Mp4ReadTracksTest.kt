@@ -6,6 +6,7 @@ import com.braymon.kotmpeg.Mp4ReadFixtures.box
 import com.braymon.kotmpeg.Mp4ReadFixtures.children
 import com.braymon.kotmpeg.Mp4ReadFixtures.fragmentedHeader
 import com.braymon.kotmpeg.Mp4ReadFixtures.indexOf
+import com.braymon.kotmpeg.Mp4ReadFixtures.nal
 import com.braymon.kotmpeg.Mp4ReadFixtures.open
 import com.braymon.kotmpeg.Mp4ReadFixtures.putU16
 import com.braymon.kotmpeg.Mp4ReadFixtures.putU32
@@ -16,6 +17,7 @@ import com.braymon.kotmpeg.Mp4ReadFixtures.video
 import com.braymon.kotmpeg.Mp4ReadFixtures.within
 import com.braymon.kotmpeg.Mp4ReadFixtures.write
 import com.braymon.kotmpeg.codecconfig.AacConfig
+import com.braymon.kotmpeg.model.MediaPacket
 import com.braymon.kotmpeg.model.TrackInfo
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
@@ -182,5 +184,69 @@ class Mp4ReadTracksTest {
         val packets = readAll(hybrid, warnings)
         assertTrue(packets.isNotEmpty(), "las muestras del moov se leen")
         assertTrue(warnings.any { "híbrido" in it }, "se avisa de lo que no se lee: $warnings")
+    }
+
+    /**
+     * Una pista sin ninguna muestra se conserva, con 0 paquetes, como en MKV: en un MP4 plano, en
+     * un fMP4 y en un fMP4 cortado justo tras la cabecera. `seekTo` no la usa de ancla aunque sea
+     * la primera, y `remux` la copia. Hasta la 4.1.0 se descartaba sin aviso: un archivo con tres
+     * pistas se leía con dos, y el fMP4 cortado, con ninguna.
+     */
+    @Test
+    fun `a track without samples is kept with no packets`() {
+        for (fragmented in listOf(false, true)) {
+            val written = File(dir, if (fragmented) "vacia-frag.mp4" else "vacia.mp4")
+            Kotmpeg.createMuxer(written) { this.fragmented = fragmented }.use { muxer ->
+                muxer.addTrack(audio())
+                val v = muxer.addTrack(video())
+                val a = muxer.addTrack(audio())
+                muxer.start()
+                for (i in 0 until 30) {
+                    muxer.writePacket(MediaPacket(v, nal(i), i * 33_333L, isKeyFrame = i % 10 == 0))
+                    muxer.writePacket(MediaPacket(a, ByteArray(12) { i.toByte() }, i * 21_333L, isKeyFrame = true))
+                }
+            }
+            val warnings = ArrayList<String>()
+            open(written, warnings).use { demuxer ->
+                assertEquals(3, demuxer.tracks.size, written.name)
+                val silent = demuxer.tracks[0].id
+                assertTrue(generateSequence { demuxer.readPacket() }.none { it.trackId == silent }, "la pista vacía entregó paquetes")
+                val target = demuxer.seekTo(400_000)
+                assertTrue(target in 300_000..400_000, "el ancla tiene que ser el vídeo: $target")
+            }
+            assertTrue(warnings.isEmpty(), "una pista vacía no es un fallo: $warnings")
+            val copy = File(dir, "copia-${written.name}")
+            Kotmpeg.remux(written, copy)
+            assertEquals(3, open(copy).use { it.tracks.size }, "el remux de ${written.name}")
+        }
+        val header = file("solo-cabecera.mp4", fragmentedHeader(dir, video(), audio()))
+        open(header).use { demuxer ->
+            assertEquals(2, demuxer.tracks.size, "un fMP4 cortado tras la cabecera")
+            assertEquals(null, demuxer.readPacket())
+            assertEquals(0L, demuxer.seekTo(1_000_000))
+        }
+    }
+
+    /**
+     * Un vídeo que no empieza en keyframe —un recorte, o un codificador que arranca con P— busca
+     * antes de su primer keyframe en ese keyframe, que es lo primero que entrega, como en MKV.
+     * Hasta la 4.1.0 caía en la muestra 0, que no se puede decodificar.
+     */
+    @Test
+    fun `seeking before the first keyframe lands on it`() {
+        for (fragmented in listOf(false, true)) {
+            val written = File(dir, if (fragmented) "sin-key-frag.mp4" else "sin-key.mp4")
+            Kotmpeg.createMuxer(written) { this.fragmented = fragmented }.use { muxer ->
+                val v = muxer.addTrack(video())
+                muxer.start()
+                for (i in 0 until 30) muxer.writePacket(MediaPacket(v, nal(i), i * 33_333L, isKeyFrame = i % 10 == 5))
+            }
+            open(written).use { demuxer ->
+                val firstKey = generateSequence { demuxer.readPacket() }.first { it.isKeyFrame }.ptsUs
+                assertEquals(firstKey, demuxer.seekTo(0), written.name)
+                val next = demuxer.readPacket()
+                assertTrue(next != null && next.isKeyFrame && next.ptsUs == firstKey, "${written.name}: tras seekTo(0) llegó $next")
+            }
+        }
     }
 }

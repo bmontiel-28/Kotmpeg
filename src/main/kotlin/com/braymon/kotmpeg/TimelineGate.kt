@@ -38,6 +38,12 @@ internal class TimelineGate(
     val earliestPtsUs: Long? get() = if (minPtsUs == Long.MAX_VALUE) null else minPtsUs
 
     /**
+     * Menor PTS retenido de la pista de índice [trackIndex], o `null` si no entregó nada antes de
+     * fijar el origen. Hay que pedirlo antes de [release], que vacía la retención.
+     */
+    fun earliestPtsUs(trackIndex: Int): Long? = queues[trackIndex].minOfOrNull { it.ptsUs }
+
+    /**
      * Retiene una copia de [packet], que pertenece a la pista de índice [trackIndex] (base 0).
      * Devuelve `true` cuando ya se puede fijar el origen: todas las pistas han entregado algo o se
      * ha llegado a uno de los topes.

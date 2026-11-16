@@ -206,6 +206,105 @@ class Fmp4RepairTest {
         assertTrue(compared > 50, "solo $compared cortes comparados")
     }
 
+    /**
+     * Seis segundos de una captura de pantalla con B-frames: vídeo a 30 fps, I P B B en orden de
+     * decodificación con un keyframe cada 30 fotogramas, que cada 20 se para 1,3 s mientras nada
+     * cambia, y AAC a 48 kHz. Los paquetes llegan como de `MediaCodec`, con el DTS igual al PTS, y
+     * cada fotograma en cuanto se puede codificar: un ancla tras la pausa, y sus B-frames detrás.
+     */
+    private fun pausedScreenCapture(): List<MediaPacket> {
+        val random = Random(7)
+        val shown = ArrayList<Long>()
+        var t = 0L
+        while (t < 6_000_000) {
+            shown += t
+            t += 33_333
+            if (shown.size % 20 == 19) t += 1_300_000
+        }
+        val order = ArrayList<Int>()
+        var k = 0
+        while (k < shown.size) {
+            if (k % 30 == 0) {
+                order += k++
+                continue
+            }
+            val p = minOf(k + 2, (k / 30 + 1) * 30 - 1, shown.size - 1)
+            order += p
+            for (b in k until p) order += b
+            k = p + 1
+        }
+        val timed = ArrayList<Pair<Long, MediaPacket>>()
+        var captured = 0L
+        for (frame in order) {
+            captured = maxOf(captured, shown[frame])
+            val data = ByteArray(200 + random.nextInt(2800)).also { random.nextBytes(it) }
+            timed += captured to MediaPacket(1, data, shown[frame], isKeyFrame = frame % 30 == 0)
+        }
+        var audioUs = 0L
+        while (audioUs < 6_000_000) {
+            val data = ByteArray(150 + random.nextInt(250)).also { random.nextBytes(it) }
+            timed += audioUs to MediaPacket(2, data, audioUs, isKeyFrame = true)
+            audioUs += 21_333
+        }
+        return timed.sortedBy { it.first }.map { it.second }
+    }
+
+    /**
+     * La reparación promete la misma duración que reempaquetar con `remux`, y no la daba cuando el
+     * último fotograma que quedaba se decodifica en un instante que no sale de la secuencia de PTS:
+     * un ancla cuyos B-frames se llevó el corte —la reparación alarga su duración para que se vea— o
+     * un B-frame que se decodifica antes de su turno. El remux volvía a sacar el DTS de los PTS y
+     * contaba la duración del paquete desde ahí, así que acababa hasta un fotograma más tarde, o la
+     * pausa entera más tarde: de 901 cortes al azar en grabaciones así, 41 no cuadraban. Ahora el
+     * muxer acaba el último fragmento en el DTS del paquete más su duración, cuando sus DTS valen,
+     * y si ese final no pasa del mayor PTS, un fotograma después de él, como la reparación.
+     *
+     * Con desfases sin signo la duración se compara al milisegundo: si la pista más larga es la de
+     * vídeo y solo uno de los dos archivos empieza con B-frames —un corte que deja un único
+     * fotograma—, el demuxer toma la de ese archivo del `mvhd`, que va en milisegundos (ver el KDoc
+     * de `Kotmpeg.repair`).
+     */
+    @Test
+    fun `a repaired fmp4 lasts what its remux lasts when its last frame decodes out of order`() {
+        val modes = listOf<Pair<MuxerOptions.() -> Unit, Long>>(
+            { _: MuxerOptions -> } to 0L,
+            { o: MuxerOptions -> o.segmentIndex = true } to 0L,
+            { o: MuxerOptions -> o.nonNegativeCompositionOffsets = true } to 999L,
+        )
+        for ((options, tolerance) in modes) {
+            val channel = RecordingFileChannel()
+            var startWrites = 0
+            FragmentedMp4Muxer(SeekableOutput(channel)) { creationTimeMillis = null; options() }.use { muxer ->
+                muxer.addTrack(video)
+                muxer.addTrack(audio)
+                muxer.start()
+                startWrites = channel.writes.size
+                for (packet in pausedScreenCapture()) muxer.writePacket(packet)
+            }
+            val recording = Recording(channel, startWrites)
+            val first = if (startWrites > 0) channel.boundaries()[startWrites - 1] else 0L
+            var compared = 0
+            for (cut in first..channel.totalBytes step (channel.totalBytes - first) / 400) {
+                val bytes = recording.channel.cutAfter(cut)
+                val label = "corte en $cut"
+                if (!repairable(bytes)) continue
+                val (packets, duration) = repairAndRead(label, bytes)
+                if (packets.isEmpty()) continue
+                val remuxed = File(dir, "remux.mp4")
+                Kotmpeg.remux(file("cortado.mp4", bytes), remuxed) { fragmented = true; creationTimeMillis = null; options() }
+                val (expected, expectedDuration) = read(remuxed.readBytes())
+                assertEquals(expected, packets, "$label: los paquetes no son los del remux")
+                if (tolerance == 0L) {
+                    assertEquals(expectedDuration, duration, "$label: la duración no es la del remux")
+                } else {
+                    assertTrue(abs(expectedDuration - duration) <= tolerance, "$label: $duration µs frente a $expectedDuration del remux")
+                }
+                compared++
+            }
+            assertTrue(compared > 50, "solo $compared cortes comparados")
+        }
+    }
+
     /** El archivo completo de [recording] sin el `mfra` del final: todos sus fragmentos enteros, como si se cortara justo antes de cerrarlo. */
     private fun withoutMfra(recording: Recording): ByteArray {
         val bytes = recording.channel.bytes()

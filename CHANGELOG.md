@@ -67,6 +67,137 @@ nada.
 
 ---
 
+## [4.1.1] — 2026-11-17
+
+Corrige lo que encontró una revisión de la 4.1.0. Es un parche: la API pública no cambia y **no hay
+que tocar nada** para actualizar. Cada corrección lleva un test que construye su entrada y fallaba
+antes del arreglo.
+
+### Corregido
+
+- **Una fuente de `PcmStreamMixer` que dejaba de entregar audio quedaba desfasada o muda el resto
+  de la grabación.** Su parte se mezclaba como silencio y lo que faltaba se apuntaba como deuda, que
+  se cobraba descartando lo siguiente que llegara. Si el audio atrasado no llegaba nunca —una
+  fuente a la que se deja de escribir para silenciarla—, lo descartado era audio nuevo: con una
+  pausa menor que `maxLatencyMs` la fuente quedaba desfasada esa duración, con una mayor quedaba
+  muda, y con 45 partes por millón de diferencia de reloj la fuente lenta se desfasaba unos 160 ms
+  por hora y enmudecía pasadas las tres horas. Ahora se distingue el audio que vuelve en ráfaga, que
+  se descarta como antes, del que vuelve a ritmo normal: lo que no se recupera en `maxLatencyMs` se
+  da por perdido, y el desfase queda acotado a una décima parte de `maxLatencyMs`. Mientras ninguna
+  fuente pierde audio, la salida es la de siempre, muestra a muestra.
+- **fMP4 con `nonNegativeCompositionOffsets`: tras un corte forzoso a mitad de GOP —por
+  `maxFragmentDurationUs` o `maxFragmentBytes`—, un B-frame del fragmento siguiente se mostraba en
+  su tiempo de decodificación**, hasta 3 s fuera de su sitio con vídeo de frecuencia variable,
+  también en FFmpeg: necesitaba un desfase negativo, que en ese modo no se puede escribir. Ahora el
+  corte cae delante de un fotograma ancla —si hace falta, el último ancla y lo que lleva detrás
+  pasan al fragmento siguiente— y el fragmento acaba en su mayor PTS, donde los B-frames que vienen
+  detrás todavía se decodifican a tiempo. Con signo, y en los cortes en keyframe, nada cambia.
+- **fMP4 con `nonNegativeCompositionOffsets`: una pista que arranca tarde se leía en FFmpeg más
+  larga de lo que es**, 9,5 s en un archivo de 7,5 con el vídeo desde los 2 s, porque su `tfdt`
+  contaba desde el origen. Ahora su lista de edición empieza con un tramo vacío, como en el MP4
+  plano y como `-movflags delay_moov`, y su línea de tiempo del medio empieza en su arranque. El
+  `tkhd` sigue declarando hasta dónde llega desde el origen, que es lo que necesita el extractor de
+  Android, y los tiempos de los paquetes no cambian. `repair` lee y pone al día esa lista de dos
+  entradas.
+- **`repair` de un fMP4 no siempre dejaba la duración de su `remux`.** Cuando el último fotograma
+  que quedaba se decodifica en un instante que no sale de la secuencia de PTS —un ancla cuyos
+  B-frames se llevó el corte, un B-frame retenido en una pausa—, el remux acababa hasta un
+  fotograma más tarde, o la pausa entera más tarde: pasaba en 41 de 901 grabaciones cortadas al
+  azar. El muxer fMP4 acaba ahora el último fragmento donde acaba de decodificarse su último
+  paquete, si sus DTS valen, llevados a su propia línea de tiempo: con desfases sin signo el
+  demuxer los entrega adelantados lo que mide el desplazamiento de la lista de edición. Con
+  desfases sin signo el remux puede mover aún algún fotograma un tic (unos 11 µs a 90 kHz), y la
+  duración leída menos de un milisegundo, porque recalcula ese desplazamiento con sus propios
+  fragmentos; lo dice el KDoc de `repair`.
+- **Una pista de MP4 o fMP4 sin ninguna muestra se descartaba al abrir, sin aviso**, en contra del
+  contrato de `Demuxer.tracks`: un archivo con tres pistas se leía con dos —MKV las conserva—,
+  `remux` la perdía, y un fMP4 cortado justo tras la cabecera se abría sin pistas. Ahora se
+  conserva, en su sitio del orden del archivo y sin paquetes, y `seekTo` no la usa de ancla.
+- **`seekTo` de MP4 y fMP4 con un destino anterior al primer keyframe caía en la muestra 0**, aunque
+  no fuera un keyframe. Ahora cae en el primer keyframe, como en MKV y como dice `Demuxer.seekTo`.
+- **El HDR10 leído de un MP4 traía ruido de coma flotante** —0,708 se leía como
+  0,7080000000000001—: no era igual al de un MKV con los mismos valores, y el `concat` de un MP4 y un
+  MKV iguales fallaba con «color distinto». Las unidades del `mdcv` se dividen ahora en vez de
+  multiplicarse.
+- **Con `creationTimeMillis = null`, dos MKV de la misma entrada no salían iguales byte a byte**,
+  como promete la opción: el `SegmentUID` y los `TrackUID` eran siempre aleatorios. Sin fecha salen
+  ahora de la cabecera —la aplicación y las pistas—; con fecha siguen siendo aleatorios. MP4 y fMP4
+  ya eran idénticos.
+- **`seekTo` de un MKV cuya primera pista de vídeo no tiene ningún bloque volvía al principio.** Es
+  el caso de una grabación en la que la cámara no llegó a entregar fotogramas: el ancla de la
+  búsqueda era esa pista, no se encontraba ningún keyframe suyo tras recorrer el archivo entero,
+  `seekTo` devolvía 0 y la lectura empezaba otra vez desde el principio, también si había otra pista
+  de vídeo con fotogramas. Ahora el ancla es la primera pista de vídeo que tenga algún keyframe, o
+  si ninguna lo tiene, la primera de las demás: el mismo criterio que `Mp4Demuxer`, que conserva las
+  pistas vacías sin usarlas de ancla. Se decide en la primera búsqueda; si la primera pista de vídeo
+  tiene fotogramas, el ancla es la de siempre. Los índices que escriben los muxers no cambian.
+
+### Cambiado
+
+- **`Mp4Muxer.writePacket` rechaza con `IllegalArgumentException` un tiempo que no cabe en el `stts`
+  o el `ctts`**, de 32 bits: una pausa de más de unas 13 horas entre dos fotogramas a 90 kHz. Se
+  escribía truncado sin ningún error —50 400 s se leían como 2 678 s—. El paquete rechazado no llega
+  al archivo, y lo grabado hasta ahí se cierra como siempre. MKV y fMP4 ya lo admitían.
+- **`PcmMixer.toShortArray` rechaza un buffer con un número impar de bytes**, como `PcmResampler`
+  rechaza un frame incompleto: el byte suelto se perdía en silencio.
+- **El idioma de una pista se normaliza al crearla, igual para todos los contenedores**: en
+  minúsculas si es un código de tres letras, y `"und"` si no. MKV escribía `"es"` o `"es-MX"` tal
+  cual en su elemento `Language`, que es el de los códigos ISO 639-2, MP4 los escribía como
+  `"und"`, y un remux de MKV a MP4 los perdía sin aviso. No se rechaza ninguno.
+- **Cancelar un `remux` o un `concat` borra la salida.** Una `CancellationException` lanzada desde
+  `onProgress` —lo que hace una corrutina cancelada— cierra el muxer sin terminarlo y borra el
+  archivo. Antes se terminaba como si la copia hubiera acabado, y con `fastStart` se reescribía
+  entero antes de volver. Cualquier otro fallo sigue conservando lo escrito, cerrado y legible.
+
+### Documentación
+
+- `PcmStreamMixer`, `PcmResampler` y el README ya no prometen sincronía sin condiciones: describen
+  qué pasa con una fuente que se retrasa o deja de entregar, que para silenciarla hay que escribirle
+  ceros, que no se corrige la deriva de reloj y qué cuenta exacta de frames da el remuestreador. El
+  ejemplo del mezclador explica qué es `inicioUs`.
+- `onProgress`, en el README y en el KDoc de `remux`, `concat` y `Remuxer.remux`: qué recibe, que
+  con B-frames no siempre crece y qué pasa si lanza.
+- Errores: una tabla con cada tipo de excepción y cuándo sale, y que el archivo solo queda cerrado
+  si el fallo es al abrir; si es al leer o al escribir, hay que cerrar el demuxer o el muxer.
+- Ciclo de vida de un muxer: `onSegment` se ejecuta dentro de `writePacket` (con
+  `synchronizedMuxer`, dentro del cerrojo), tras `stop()` `writePacket` lanza
+  `IllegalStateException`, y no hay que interrumpir el hilo que escribe: el MP4 plano se queda sin
+  `moov`.
+- `repair`: solo para archivos que ya nadie escribe; un MKV cerrado bien y truncado después se
+  rechaza, y un fMP4 en el mismo caso se repara.
+- `nonNegativeCompositionOffsets` describe los cortes forzosos y la lista de edición de dos entradas
+  de una pista tardía, y qué pasa con esa pista en el modo por defecto: no lleva tramo vacío, y
+  FFmpeg muestra el archivo más largo de lo que es (9,5 s en uno de 7,5 con el vídeo desde los 2 s).
+  `creationTimeMillis` describe los UID de MKV.
+- El contrato de `Demuxer.seekTo` dice que una pista sin paquetes no es el ancla de la búsqueda.
+- En Android, `kotlin { compilerOptions { jvmTarget… } }` en vez de `kotlinOptions`, que con
+  Kotlin 2.2 o superior no compila, y ni código nativo ni reglas de R8.
+- `remux` y `concat` no conservan el recorte de una lista de edición que oculta los primeros
+  fotogramas, como el de `ffmpeg -ss … -c copy`: en el README, «Lo que no está implementado», y en
+  su KDoc. Descartar esos paquetes tampoco da un recorte exacto: en vídeo, los fotogramas visibles
+  hasta el keyframe siguiente se decodifican a partir del keyframe oculto, y un recorte exacto exige
+  recodificar.
+- `MediaPacket.durationUs` negativo se trata como desconocido, igual que 0, y `TrackInfo.language`
+  dice qué pasa con un código que no es ISO 639-2.
+- La «Estructura» del README incluye `Mp4Segment`, `FragmentFlags`, `Timestamps` y
+  `DefaultCodecPrivate`, y la descripción de los tests ya no lleva cifras, que caducan con cada test
+  nuevo.
+
+### Desarrollo
+
+- Tests nuevos para cada corrección: pausas sin ráfaga y deriva de reloj en `PcmStreamMixer`, cortes
+  forzosos sin signo, la pista tardía comparada con `ffprobe`, la duración de `repair` frente a la de
+  `remux` en grabaciones con pausas y en los tres modos de fMP4, pistas vacías, el primer keyframe de
+  `seekTo`, HDR10 entre contenedores, un hueco que no cabe en el `stts`, MKV idénticos sin fecha,
+  idiomas, cancelación de copias, buffers PCM impares y la búsqueda en un MKV con la primera pista
+  de vídeo vacía, con y sin otra pista de vídeo, comparada con el mismo contenido en MP4.
+- Los dos tests de duraciones de más de 32 bits en MP4 plano (`LargeFileEdgeCasesTest`,
+  `Mp4FieldWidthTest`) escribían un único salto de 57 días entre dos fotogramas, que el `stts`
+  truncaba; llegan ahora a la misma duración en saltos de 12 horas, y uno compara además los tiempos
+  de los paquetes.
+
+---
+
 ## [4.1.0] — 2026-10-29
 
 Una grabación cortada —el proceso muere antes de `stop()`— sigue sirviendo: el MKV y el MP4
