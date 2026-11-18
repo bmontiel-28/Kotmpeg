@@ -123,6 +123,102 @@ class MkvSeekTest {
         }
     }
 
+    /**
+     * Cuatro segundos con una pista de vídeo cuyos 100 fotogramas **no son keyframes** —una app que
+     * nunca marca `isKeyFrame`, o un vídeo cuyo primer IDR se perdió— y audio; con [emptyFirst], una
+     * pista de vídeo vacía delante. [options] elige, además del contenedor, si el MP4 es fragmentado.
+     */
+    private fun writeWithoutKeyFrames(file: File, emptyFirst: Boolean, options: MuxerOptions.() -> Unit) {
+        Kotmpeg.createMuxer(file) { maxClusterDurationMs = 200; options() }.use { muxer ->
+            if (emptyFirst) muxer.addTrack(video)
+            val v = muxer.addTrack(video)
+            val a = muxer.addTrack(audio)
+            muxer.start()
+            var audioUs = 0L
+            for (i in 0 until 100) {
+                val pts = i * 40_000L
+                muxer.writePacket(MediaPacket(v, NalUnits.joinLengthPrefixed(listOf(byteArrayOf(0x41, i.toByte()))), pts, isKeyFrame = false))
+                while (audioUs <= pts) {
+                    muxer.writePacket(MediaPacket(a, ByteArray(8), audioUs, isKeyFrame = true))
+                    audioUs += 21_333
+                }
+            }
+        }
+    }
+
+    /**
+     * Una pista de vídeo sin ningún keyframe no es el ancla de la búsqueda, en ningún contenedor: lo
+     * es el audio, `seekTo` devuelve el instante del paquete que suena en el destino, que es lo
+     * primero que se entrega, y de ese vídeo no sale nada, porque nada suyo se puede decodificar.
+     * Igual con una pista de vídeo vacía delante. Hasta la 4.1.1, en MP4 y fMP4 el ancla era esa
+     * pista: `seekTo` devolvía 0 y entregaba primero un fotograma suyo que no es keyframe. MKV ya
+     * buscaba en el audio. Se busca dos veces, porque el ancla se decide en la primera.
+     */
+    @Test
+    fun `a video track without keyframes does not anchor the seek in any container`() {
+        val formats = listOf<Pair<String, MuxerOptions.() -> Unit>>(
+            "mkv" to {},
+            "mp4" to {},
+            "frag.mp4" to { fragmented = true },
+        )
+        for (emptyFirst in listOf(false, true)) for ((name, options) in formats) {
+            val file = File(dir, "sin-keyframes-$emptyFirst.$name").also { writeWithoutKeyFrames(it, emptyFirst, options) }
+            Kotmpeg.openDemuxer(file).use { demuxer ->
+                val audioId = demuxer.tracks.last().id
+                for (target in listOf(2_500_000L, 1_200_000L)) {
+                    val label = "${file.name}, destino $target"
+                    val landed = demuxer.seekTo(target)
+                    val after = generateSequence { demuxer.readPacket() }.toList()
+                    assertTrue(landed in target - 22_000..target, "$label: el audio que suena en el destino, no $landed")
+                    assertEquals(audioId to landed, after.firstOrNull()?.let { it.trackId to it.ptsUs }, "$label: lo primero que se entrega")
+                    assertTrue(after.all { it.trackId == audioId }, "$label: salió vídeo que no se puede decodificar")
+                }
+            }
+        }
+    }
+
+    /**
+     * Cuatro segundos **solo de vídeo**, [videoTracks] pistas cuyos 100 fotogramas no son
+     * keyframes: ninguna pista tiene ninguno. [options] elige si el MP4 es fragmentado.
+     */
+    private fun writeVideoOnlyWithoutKeyFrames(file: File, videoTracks: Int, options: MuxerOptions.() -> Unit) {
+        Kotmpeg.createMuxer(file) { maxClusterDurationMs = 200; options() }.use { muxer ->
+            val ids = List(videoTracks) { muxer.addTrack(video) }
+            muxer.start()
+            for (i in 0 until 100) {
+                for (v in ids) muxer.writePacket(MediaPacket(v, NalUnits.joinLengthPrefixed(listOf(byteArrayOf(0x41, i.toByte(), v.toByte()))), i * 40_000L, isKeyFrame = false))
+            }
+        }
+    }
+
+    /**
+     * Si ninguna pista tiene keyframes, no hay dónde caer: `seekTo` devuelve 0 y la lectura vuelve
+     * al principio y lo entrega todo, lo mismo que al abrir el archivo, en los tres contenedores y
+     * también con dos pistas de vídeo. Hasta la 4.1.1, en MKV la búsqueda dejaba el filtro esperando
+     * un keyframe que no llega y después no se leía ni un paquete, tampoco con `seekTo(0)`.
+     */
+    @Test
+    fun `a file where no track has keyframes rewinds to the start in every container`() {
+        val formats = listOf<Pair<String, MuxerOptions.() -> Unit>>(
+            "mkv" to {},
+            "mp4" to {},
+            "frag.mp4" to { fragmented = true },
+        )
+        for (videoTracks in listOf(1, 2)) for ((name, options) in formats) {
+            val file = File(dir, "solo-video-$videoTracks.$name").also { writeVideoOnlyWithoutKeyFrames(it, videoTracks, options) }
+            Kotmpeg.openDemuxer(file).use { demuxer ->
+                fun readAll() = generateSequence { demuxer.readPacket() }.map { "${it.trackId}/${it.ptsUs}/${it.data.contentHashCode()}" }.toList()
+                val unseeked = readAll()
+                assertEquals(100 * videoTracks, unseeked.size, "${file.name}: lo que se lee sin buscar")
+                for (target in listOf(0L, 2_500_000L, 0L)) {
+                    val label = "${file.name}, destino $target"
+                    assertEquals(0L, demuxer.seekTo(target), "$label: lo que devuelve seekTo")
+                    assertEquals(unseeked, readAll(), "$label: tras buscar se lee lo mismo que al abrir")
+                }
+            }
+        }
+    }
+
     /** El mismo archivo con el índice `Cues` inutilizado ([withoutCuesIndex]), para forzar la búsqueda recorriendo clusters. */
     private fun withoutIndex(file: File): File =
         File(dir, "sin-indice.mkv").also { it.writeBytes(withoutCuesIndex(file.readBytes())) }

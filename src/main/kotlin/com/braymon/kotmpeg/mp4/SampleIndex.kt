@@ -251,13 +251,22 @@ internal abstract class TrackSamples {
         return firstKey(scan)
     }
 
+    /**
+     * Si la pista tiene algún keyframe. Recorre con [scan] desde la primera muestra hasta el primer
+     * keyframe, que casi siempre es ella; en una pista sin ninguno, todas.
+     */
+    fun hasKeyFrame(scan: SampleCursor): Boolean = firstKeyIndex(scan) >= 0
+
     /** El primer keyframe de la pista, o 0 si no tiene ninguno. */
-    private fun firstKey(scan: SampleCursor): Int {
-        if (size == 0) return 0
+    private fun firstKey(scan: SampleCursor): Int = firstKeyIndex(scan).coerceAtLeast(0)
+
+    /** El primer keyframe de la pista, o -1 si no tiene ninguno. */
+    private fun firstKeyIndex(scan: SampleCursor): Int {
+        if (size == 0) return -1
         scan.moveTo(0)
         var index = 0
         while (!scan.key) {
-            if (++index >= size) return 0
+            if (++index >= size) return -1
             scan.next()
         }
         return index

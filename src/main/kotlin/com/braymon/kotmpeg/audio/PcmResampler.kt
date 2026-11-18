@@ -13,6 +13,10 @@ package com.braymon.kotmpeg.audio
  * puede llevar un frame más que ese redondeo: lo emitido antes del último frame recibido ya puede
  * pasarse de él.
  *
+ * **Con frecuencias iguales no hay cuenta que hacer**: [resample] devuelve cada trozo tal cual
+ * ([isPassthrough]), así que tras N frames de entrada ha emitido los N, uno más que la fórmula
+ * anterior, y [flush] no añade nada.
+ *
  * **No corrige relojes distintos.** Las frecuencias se toman por su valor nominal: si un
  * dispositivo entrega algo más despacio de lo que declara, la salida dura lo que de verdad entregó,
  * no lo que debería haber durado.

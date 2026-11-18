@@ -5,9 +5,11 @@ import com.braymon.kotmpeg.audio.PcmResampler
 import com.braymon.kotmpeg.audio.PcmStreamMixer
 import org.junit.jupiter.api.Test
 import java.nio.ByteBuffer
+import kotlin.random.Random
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 /**
  * Las utilidades de PCM ante entradas al límite: trozos que no traen ningún frame, frames
@@ -107,5 +109,38 @@ class ApiPcmTest {
         assertEquals(0, buffer.position(), "leerlo tampoco")
         buffer.position(1)
         assertFailsWith<IllegalArgumentException> { PcmMixer.toShortArray(buffer) }
+    }
+
+    /**
+     * La cuenta de frames que documenta `PcmResampler`, comprobada tras cada trozo de una entrada
+     * troceada al azar: con frecuencias distintas, `ceil((N - 1) · salida / entrada)` tras N frames, y
+     * con `flush` el redondeo de `N · salida / entrada`, o uno más al reducir a menos de la mitad;
+     * con frecuencias iguales, los N, sin nada en `flush`. Hasta la 4.1.1 la clase no exceptuaba ese
+     * último caso, en el que la fórmula se queda un frame corta.
+     */
+    @Test
+    fun `the resampler emits the frame count its documentation gives`() {
+        val random = Random(7)
+        val pairs = listOf(44_100 to 48_000, 48_000 to 44_100, 48_000 to 16_000, 8_000 to 48_000, 96_000 to 44_100, 48_000 to 48_000)
+        for ((input, output) in pairs) {
+            val resampler = PcmResampler(input, output, channels = 1)
+            var consumed = 0L
+            var emitted = 0L
+            repeat(200) {
+                val chunk = 1 + random.nextInt(2_000)
+                emitted += resampler.resample(ShortArray(chunk)).size
+                consumed += chunk
+                val expected = if (input == output) consumed else ((consumed - 1) * output + input - 1) / input
+                assertEquals(expected, emitted, "$input -> $output tras $consumed frames")
+            }
+            val total = emitted + resampler.flush().size
+            if (input == output) {
+                assertEquals(consumed, total, "$input -> $output: flush no añade nada")
+            } else {
+                val rounded = Math.round(consumed.toDouble() * output / input)
+                val oneMore = output * 2 < input && total == rounded + 1
+                assertTrue(total == rounded || oneMore, "$input -> $output: $total frames para $consumed, no $rounded")
+            }
+        }
     }
 }

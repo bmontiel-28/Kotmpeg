@@ -71,6 +71,13 @@ public class Mp4Demuxer(
          * desfase de composición. Se calcula la primera vez que se busca, con un cursor aparte.
          */
         val presentationLeadUs: Long by lazy { samples.cursor().let { it.ptsUs - it.dtsUs } }
+
+        /**
+         * Si la pista tiene algún keyframe (ver [TrackSamples.hasKeyFrame]). Se calcula la primera
+         * vez que se busca, con el cursor de lectura, que `seekTo` recoloca después: no reserva
+         * nada por búsqueda.
+         */
+        val hasKeyFrame: Boolean by lazy { samples.hasKeyFrame(reader) }
     }
 
     /** Metadatos de la pista que no dependen del códec: los del `tkhd`, `mdhd` y `udta`. */
@@ -713,12 +720,12 @@ public class Mp4Demuxer(
     }
 
     /**
-     * Busca el último keyframe de la pista ancla —la primera de vídeo, o la primera si no hay
-     * vídeo, entre las que tienen muestras: una pista vacía no puede anclar nada— con
-     * `pts <= destino`, o el primero si no hay ninguno antes, y coloca **todas las demás pistas por
-     * tiempo de presentación** en ese keyframe, que es donde de verdad empieza la imagen:
+     * Busca el último keyframe de la pista ancla ([seekAnchor]) con `pts <= destino`, o el primero
+     * si no hay ninguno antes, y coloca **todas las demás pistas por tiempo de presentación** en
+     * ese keyframe, que es donde de verdad empieza la imagen:
      *
-     * - otra pista de vídeo, en su propio último keyframe con `pts` no posterior;
+     * - otra pista de vídeo, en su propio último keyframe con `pts` no posterior. Una sin ninguno
+     *   no entrega nada, como en `MkvDemuxer`: todo lo suyo es indecodificable;
      * - una de audio, en el paquete que suena en ese instante, contado en su tiempo de paquete. Con
      *   cebado eso deja delante justo el margen que el decodificador necesita para arrancar (ver
      *   `TrackInfo.Audio.codecDelayUs`);
@@ -736,8 +743,8 @@ public class Mp4Demuxer(
      */
     override fun seekTo(timestampUs: Long): Long {
         check(!closed) { CLOSED }
-        val withSamples = parsedTracks.filter { it.samples.size > 0 }
-        val anchor = withSamples.firstOrNull { it.info is TrackInfo.Video } ?: withSamples.firstOrNull() ?: return 0
+        val anchor = seekAnchor ?: return 0
+        if (!anchor.hasKeyFrame) return rewind()
         val target = keyFrameAtOrBefore(anchor, timestampUs)
         anchor.reader.moveTo(target)
         val targetPts = anchor.reader.ptsUs
@@ -746,6 +753,43 @@ public class Mp4Demuxer(
             if (t.nextIndex < t.samples.size) t.reader.moveTo(t.nextIndex)
         }
         return targetPts
+    }
+
+    /**
+     * Lo que hace [seekTo] cuando ninguna pista tiene keyframes —el ancla no tiene ninguno, así que
+     * ninguna lo tiene—: volver al principio, con todas las pistas desde su primera muestra, como al
+     * abrir, y devolver 0, igual que `MkvDemuxer`. No hay ningún keyframe en el que caer.
+     *
+     * Sin esta salida, la regla de [startAfterSeek] —una pista de vídeo sin keyframes no entrega
+     * nada tras buscar— dejaría agotadas las demás pistas de vídeo, que tampoco tienen ninguno, y
+     * con dos solo se leería una.
+     */
+    private fun rewind(): Long {
+        for (t in parsedTracks) {
+            t.nextIndex = 0
+            if (t.samples.size > 0) t.reader.moveTo(0)
+        }
+        return 0L
+    }
+
+    /**
+     * La pista ancla de [seekTo]: la primera de vídeo que tenga algún keyframe; si ninguna lo tiene,
+     * la primera de las demás que lo tenga; y si tampoco, la primera de vídeo con muestras, o la
+     * primera con muestras. Una pista vacía nunca lo es. Es el criterio de `MkvDemuxer`, y se decide
+     * en la primera búsqueda para todas.
+     *
+     * Hasta la 4.1.1 era la primera pista de vídeo con muestras aunque ninguna fuera keyframe —una
+     * app que nunca marca `isKeyFrame`, o un vídeo cuyo primer IDR se perdió—: `seekTo` devolvía 0 y
+     * entregaba primero un fotograma de esa pista que no se puede decodificar, mientras que MKV ya
+     * buscaba en el audio. Comprobarlo recorre las muestras de cada candidata hasta su primer
+     * keyframe, que casi siempre es la primera; una sin ninguno las recorre todas, una sola vez. Si
+     * la primera pista de vídeo tiene keyframes, el ancla es la de siempre. Si no tiene ninguno ni
+     * siquiera el ancla, no lo tiene ninguna pista, y [seekTo] vuelve al principio ([rewind]).
+     */
+    private val seekAnchor: ParsedTrack? by lazy {
+        val withSamples = parsedTracks.filter { it.samples.size > 0 }
+        val candidates = withSamples.filter { it.info is TrackInfo.Video } + withSamples.filter { it.info !is TrackInfo.Video }
+        candidates.firstOrNull { it.hasKeyFrame } ?: candidates.firstOrNull()
     }
 
     /**
@@ -758,6 +802,12 @@ public class Mp4Demuxer(
      *
      * Saber si ha terminado solo cuesta algo cuando la búsqueda ya llegó a su última muestra; si
      * no, alguna se decodifica —y se presenta— después, y la pista sigue.
+     *
+     * Una pista de vídeo sin ningún keyframe también queda agotada, como en `MkvDemuxer`, que
+     * descarta lo de otra pista de vídeo hasta su keyframe; si no tiene ninguno ninguna pista, ni
+     * siquiera se llega aquí ([rewind]). Hasta la 4.1.1 empezaba en su muestra 0
+     * —la de [TrackSamples.lastKeyAtOrBefore] cuando no hay ninguno—, y lo primero que entregaba la
+     * búsqueda era un fotograma suyo del principio, que no se puede decodificar.
      */
     private fun startAfterSeek(track: ParsedTrack, timestampUs: Long): Int {
         val samples = track.samples
@@ -765,6 +815,7 @@ public class Mp4Demuxer(
         val start: Int
         val reached: Int
         if (track.info is TrackInfo.Video) {
+            if (!track.hasKeyFrame) return samples.size
             reached = decodeLimit(track, timestampUs)
             start = samples.lastKeyAtOrBefore(reached, timestampUs, track.reader)
         } else {

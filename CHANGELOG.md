@@ -67,6 +67,49 @@ nada.
 
 ---
 
+## [4.1.2] — sin publicar
+
+Corrige lo que encontró una revisión de la 4.1.1. Es un parche: la API pública no cambia y **no hay
+que tocar nada** para actualizar.
+
+### Corregido
+
+- **`seekTo` de un MP4 o un fMP4 con una pista de vídeo sin ningún keyframe volvía al principio.**
+  Es el caso de una app que nunca marca `isKeyFrame`, o de un vídeo cuyo primer IDR se perdió: el
+  ancla de la búsqueda era esa pista, `seekTo` devolvía 0 y lo primero que se entregaba era un
+  fotograma suyo que no se puede decodificar. Ahora el ancla es la primera pista de vídeo que tenga
+  algún keyframe, o si ninguna lo tiene, la primera de las demás —el criterio que `MkvDemuxer` usa
+  desde la 4.1.1—, y se decide en la primera búsqueda. Una pista de vídeo sin keyframes que no es el
+  ancla ya no entrega nada tras buscar, como en MKV: antes empezaba en su primera muestra. Igual con
+  una pista de vídeo vacía delante. Si la primera pista de vídeo tiene keyframes, nada cambia.
+- **Tras `seekTo` de un MKV en el que ninguna pista tiene keyframes no se leía nada**, ni siquiera
+  con `seekTo(0)`: un archivo solo de vídeo en el que nunca se marcó `isKeyFrame`. La búsqueda caía
+  en el primer cluster con el filtro de búsqueda puesto, que descartaba los paquetes del ancla
+  esperando su keyframe y, al dejar de esperar, dejaba todas las pistas de vídeo a la espera de
+  otro. Ahora, si ninguna pista tiene keyframes, `seekTo` devuelve 0 y la lectura vuelve al
+  principio y lo entrega todo, como si no se hubiera buscado: lo que ya hacían MP4 y fMP4, que lo
+  siguen haciendo también con varias pistas de vídeo. Leer sin buscar, `remux`, `concat` y
+  `repair` no buscan y no cambian.
+
+### Documentación
+
+- El contrato de `Demuxer.seekTo` dice que el ancla es la pista que tiene keyframes, no la que
+  tiene paquetes, que una pista de vídeo sin ninguno no entrega nada tras la búsqueda y que, si
+  ninguna pista tiene keyframes, `seekTo` devuelve 0 y la lectura vuelve al principio.
+- `PcmResampler` exceptúa de su cuenta de frames el caso de frecuencias iguales: `resample`
+  devuelve cada trozo tal cual, así que tras N frames ha emitido los N, uno más que la fórmula.
+
+### Desarrollo
+
+- Tests nuevos: la búsqueda con una pista de vídeo sin keyframes, con y sin una pista de vídeo
+  vacía delante, en MKV, MP4 y fMP4 (con el código de la 4.1.1 falla en MP4: `seekTo` devuelve 0);
+  la búsqueda en un archivo solo de vídeo sin ningún keyframe, con una y con dos pistas, en los
+  tres contenedores, que tras `seekTo` tiene que leerse igual que al abrirlo (con el código de la
+  4.1.1 falla en MKV: no se lee nada); y la cuenta de frames de `PcmResampler` tras cada trozo,
+  con frecuencias distintas e iguales.
+
+---
+
 ## [4.1.1] — 2026-11-17
 
 Corrige lo que encontró una revisión de la 4.1.0. Es un parche: la API pública no cambia y **no hay

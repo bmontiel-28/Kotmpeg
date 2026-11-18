@@ -83,9 +83,12 @@ public interface Demuxer : Closeable {
     /**
      * Reposiciona el stream en el último keyframe con `pts <= `[timestampUs] de la pista ancla
      * —la primera de vídeo, o la primera si no hay vídeo— y devuelve su `pts`, en
-     * microsegundos. Si no hay ninguno antes, en el primero. Una pista sin ningún paquete no es
-     * ancla: si la primera de vídeo está vacía —la cámara no llegó a entregar fotogramas—, lo es
-     * la siguiente de vídeo, y si no hay otra, la primera de las demás que tenga paquetes.
+     * microsegundos. Si no hay ninguno antes, en el primero. Una pista sin ningún keyframe no es
+     * ancla —una vacía, porque la cámara no llegó a entregar fotogramas, o una cuyos paquetes no lo
+     * son—: lo es la siguiente de vídeo que tenga keyframes, y si no hay ninguna, la primera de las
+     * demás que los tenga. Si **ninguna pista** tiene keyframes —un archivo solo de vídeo en el que
+     * nunca se marcó `isKeyFrame`—, no hay dónde caer: devuelve 0 y la lectura vuelve al principio y
+     * lo entrega todo, como si no se hubiera buscado, en MKV igual que en MP4.
      *
      * Lo siguiente que entrega [readPacket] de esa pista es ese keyframe. Las demás siguen desde
      * el mismo instante **de presentación**, para que un recorte que empiece en el valor devuelto
@@ -96,7 +99,8 @@ public interface Demuxer : Closeable {
      * - otra pista de vídeo, en su propio último keyframe no posterior. En Matroska, que intercala
      *   todas las pistas en los mismos clusters, la lectura empieza un cluster antes que el del
      *   keyframe; si el de esa otra pista queda más atrás, empieza en el siguiente suyo, porque lo
-     *   que hay entre medias no se puede decodificar;
+     *   que hay entre medias no se puede decodificar. Una pista de vídeo sin ningún keyframe no
+     *   entrega nada;
      * - una pista que ya ha terminado en ese instante —nada suyo se presenta en él ni después— no
      *   entrega nada. En Matroska, donde un fotograma se muestra hasta el siguiente diga lo que
      *   diga su duración, de una pista de vídeo eso solo se sabe cerca del final del archivo; antes,

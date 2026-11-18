@@ -526,40 +526,56 @@ public class MkvDemuxer(
             return 0L
         }
         awaitingKeyFrame.clear()
+        if (!anchor.hasKeyFrame) {
+            input.position = firstCluster
+            return 0L
+        }
         val index = lastCueIndexAtOrBefore(anchorCues, timestampUs)
         val known = anchorCues.getOrNull(index)?.let { KeyFrameAt(header.segmentDataStart + it.clusterPosition, ticksToUs(it.timeTicks)) }
         val from = anchorCues.getOrNull(index - 1)?.let { header.segmentDataStart + it.clusterPosition } ?: firstCluster
-        val landing = scanForKeyFrame(from, timestampUs, anchor, known) ?: KeyFrameAt(firstCluster, 0L)
+        val landing = scanForKeyFrame(from, timestampUs, anchor.track, known) ?: KeyFrameAt(firstCluster, 0L)
         input.position = landing.readFrom
-        seekFilter = MkvSeekFilter(anchor, landing.ptsUs, header.tracks)
+        seekFilter = MkvSeekFilter(anchor.track, landing.ptsUs, header.tracks)
         return landing.ptsUs
     }
+
+    /** La pista ancla de [seekTo] ([track]) y si tiene algún keyframe ([hasKeyFrame]). */
+    private class SeekAnchor(val track: Int, val hasKeyFrame: Boolean)
 
     /**
      * La pista ancla de [seekTo]: la primera de vídeo que tenga algún keyframe, o si ninguna lo
      * tiene, la primera de las demás que lo tenga. Si no lo tiene ninguna, la primera de vídeo, o la
      * primera si no hay vídeo. Se decide en la primera búsqueda y vale para todas.
      *
+     * Si ninguna pista tiene keyframes —un archivo solo de vídeo en el que nunca se marcó
+     * `isKeyFrame`—, no hay dónde caer, y [seekTo] vuelve al principio sin [MkvSeekFilter] ni pistas a
+     * la espera de keyframe: devuelve 0 y la lectura lo entrega todo desde el primer cluster, como
+     * `Mp4Demuxer`. Hasta la 4.1.1 caía en el primer cluster con el filtro puesto: descartaba los
+     * paquetes del ancla esperando un keyframe que no llega y, al dejar de esperar, dejaba todas las
+     * pistas de vídeo a la espera de otro, así que tras buscar no se leía nada, ni con `seekTo(0)`.
+     * Saber que no tiene ninguno evita además recorrer el archivo entero en cada búsqueda.
+     *
      * Hasta la 4.1.0 era siempre la primera de vídeo, aunque no tuviera ni un bloque —una grabación
      * en la que la cámara no llegó a entregar fotogramas—: la búsqueda recorría el archivo entero sin
      * encontrar un keyframe suyo, devolvía 0 y volvía al principio, también con una segunda pista de
-     * vídeo que sí los tenía. `Mp4Demuxer` elige entre las pistas con muestras, pero en Matroska no
-     * se sabe al abrir qué pistas tienen bloques. Comprobarlo cuesta recorrer las cabeceras de los
+     * vídeo que sí los tenía. `Mp4Demuxer` usa el mismo criterio; en Matroska, además, no se sabe
+     * al abrir qué pistas tienen bloques. Comprobarlo cuesta recorrer las cabeceras de los
      * bloques hasta el primer keyframe de la pista ([scanForKeyFrame] con un destino anterior a
      * todo), casi siempre en el primer cluster; una pista sin ninguno cuesta, una sola vez, las de
      * todo el archivo. Si la primera de vídeo tiene keyframes, el ancla es la de siempre.
      */
-    private val seekAnchor: Int? by lazy {
+    private val seekAnchor: SeekAnchor? by lazy {
         val candidates = tracks.filter { it is TrackInfo.Video } + tracks.filter { it !is TrackInfo.Video }
         val firstCluster = header.firstClusterPosition
         val withKeyFrame = firstCluster?.let { from ->
             candidates.firstOrNull { scanForKeyFrame(from, Long.MIN_VALUE, it.id, known = null) != null }
         }
-        (withKeyFrame ?: candidates.firstOrNull())?.id
+        if (withKeyFrame != null) SeekAnchor(withKeyFrame.id, hasKeyFrame = true)
+        else candidates.firstOrNull()?.let { SeekAnchor(it.id, hasKeyFrame = false) }
     }
 
     /** Los cues de [seekAnchor], ya ordenados; todos si ninguno declara esa pista. */
-    private val anchorCues: List<MkvCue> by lazy { header.cues.filter { it.track == seekAnchor }.ifEmpty { header.cues } }
+    private val anchorCues: List<MkvCue> by lazy { header.cues.filter { it.track == seekAnchor?.track }.ifEmpty { header.cues } }
 
     /** Índice del último cue de [sorted] en o antes de [timestampUs], o -1 si no hay ninguno. */
     private fun lastCueIndexAtOrBefore(sorted: List<MkvCue>, timestampUs: Long): Int {
