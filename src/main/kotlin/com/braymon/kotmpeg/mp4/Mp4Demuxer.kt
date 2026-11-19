@@ -292,6 +292,7 @@ public class Mp4Demuxer(
         var sampleDescription: SampleDescription? = null
         var language = "und"
         var name: String? = null
+        var nameBytesCut = 0L
         var enabled = true
 
         boxes.scanChildren(trak.dataStart, trak.dataEnd) { box ->
@@ -335,7 +336,11 @@ public class Mp4Demuxer(
                     }
                 }
                 "udta" -> boxes.scanChildren(box.dataStart, box.dataEnd) { child ->
-                    if (child.type == "name") name = readTrackName(child)
+                    if (child.type == "name") {
+                        val read = readTrackName(child)
+                        name = read.text
+                        nameBytesCut = read.cutFromBytes
+                    }
                 }
             }
         }
@@ -349,6 +354,12 @@ public class Mp4Demuxer(
         if (handlerType != "vide" && handlerType != "soun") {
             warn("pista $trackId ('$handlerType') descartada: solo se leen pistas de audio y vídeo")
             return null
+        }
+        if (nameBytesCut > 0) {
+            warn(
+                "pista $trackId: su nombre ocupa $nameBytesCut bytes, más de los $MAX_TRACK_NAME_BYTES que se " +
+                    "leen; se recorta",
+            )
         }
         val stbl = stblBox ?: run {
             warn("pista $trackId ($handlerType) descartada: no tiene tabla de muestras (stbl)")
@@ -547,16 +558,51 @@ public class Mp4Demuxer(
         }
 
     /**
+     * El nombre leído de `udta`/`name` ([text], `null` si no hay ninguno) y, si se recortó, cuántos
+     * bytes ocupaba ([cutFromBytes]; 0 si no).
+     */
+    private class TrackName(val text: String?, val cutFromBytes: Long)
+
+    /**
      * Texto de `udta`/`name`. Puede venir con un terminador nulo (QuickTime) o sin él (lo que
      * escriben los muxers de aquí); se corta en el primero y se ignora si queda vacío.
+     *
+     * Se leen como mucho [MAX_TRACK_NAME_BYTES] bytes, que protegen de una caja manipulada, y si el
+     * nombre ocupa más, se recorta en el último carácter UTF-8 completo y `parseTrak` lo avisa. Hasta
+     * la 4.1.2 un nombre así se descartaba entero y sin aviso, aunque lo hubiera escrito `Mp4Muxer`, y
+     * un `remux` de MKV a MP4 lo perdía.
      */
-    private fun readTrackName(box: Mp4Box): String? {
+    private fun readTrackName(box: Mp4Box): TrackName {
         val length = box.dataEnd - box.dataStart
-        if (length <= 0 || length > MAX_TRACK_NAME_BYTES) return null
+        if (length <= 0) return TrackName(null, 0L)
         input.position = box.dataStart
-        val raw = input.readBytes(length.toInt())
-        val end = raw.indexOf(0.toByte()).let { if (it < 0) raw.size else it }
-        return String(raw, 0, end, Charsets.UTF_8).takeIf { it.isNotBlank() }
+        val raw = input.readBytes(minOf(length, MAX_TRACK_NAME_BYTES).toInt())
+        val nul = raw.indexOf(0.toByte())
+        val cut = nul < 0 && length > MAX_TRACK_NAME_BYTES
+        val end = when {
+            nul >= 0 -> nul
+            cut -> completeUtf8Length(raw)
+            else -> raw.size
+        }
+        return TrackName(String(raw, 0, end, Charsets.UTF_8).takeIf { it.isNotBlank() }, if (cut) length else 0L)
+    }
+
+    /**
+     * Cuántos bytes de [bytes] hay hasta el final de su último carácter UTF-8 completo: todos, o
+     * hasta el byte inicial de un carácter que se quedó a medias al recortar.
+     */
+    private fun completeUtf8Length(bytes: ByteArray): Int {
+        var lead = bytes.size - 1
+        while (lead >= 0 && bytes.size - lead < 4 && (bytes[lead].toInt() and 0xC0) == 0x80) lead--
+        if (lead < 0) return bytes.size
+        val first = bytes[lead].toInt() and 0xFF
+        val charLength = when {
+            first >= 0xF0 -> 4
+            first >= 0xE0 -> 3
+            first >= 0xC0 -> 2
+            else -> 1
+        }
+        return if (lead + charLength <= bytes.size) bytes.size else lead
     }
 
     /**
@@ -903,7 +949,11 @@ public class Mp4Demuxer(
         /** Bit `track_enabled` de los flags del `tkhd`. */
         private const val TKHD_TRACK_ENABLED = 0x1L
 
-        /** Un nombre de pista no necesita más; algo mayor es un archivo dañado o manipulado. */
+        /**
+         * Lo más que se lee de un nombre de pista: un nombre normal ocupa unos pocos bytes, y una caja
+         * `name` de megas es un archivo dañado o manipulado. Lo que pase de aquí se recorta con aviso
+         * (ver [readTrackName]).
+         */
         private const val MAX_TRACK_NAME_BYTES = 4096L
 
         /**

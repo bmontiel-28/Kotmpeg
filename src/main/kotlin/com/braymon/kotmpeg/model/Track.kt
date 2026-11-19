@@ -54,7 +54,16 @@ public sealed class TrackInfo {
      */
     public abstract val language: String
 
-    /** Nombre legible de la pista, opcional. */
+    /**
+     * Nombre legible de la pista, opcional.
+     *
+     * Matroska lo conserva salvo los espacios y caracteres nulos del final, que quita al leerlo. En
+     * MP4 y fMP4 se escribe entero, pero al leerlo hay tres casos que no vuelven igual: se lee
+     * hasta su primer carácter nulo (`"a\u0000b"` vuelve como `"a"`), un nombre vacío o solo de
+     * espacios vuelve como `null`, y de uno de más de 4096 bytes se leen los primeros, cortados en
+     * un carácter UTF-8 completo, con aviso por `onWarning`. Lo mismo pasa al convertir de MKV a
+     * MP4.
+     */
     public abstract val name: String?
 
     /** Duración por defecto de fotograma/paquete en microsegundos, 0 si es variable/desconocida. */

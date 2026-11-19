@@ -1,7 +1,9 @@
 # Registro de cambios
 
 Cambios relevantes de Kotmpeg Core para quien lo usa: funcionalidades añadidas y errores
-corregidos, en orden inverso por fecha. El versionado sigue [SemVer](https://semver.org/lang/es/).
+corregidos, de la versión más nueva a la más antigua. El versionado sigue
+[SemVer](https://semver.org/lang/es/). Desde la 4.1.2 las entradas no llevan fecha: la de cada
+versión es la de su tag en el repositorio. Las anteriores conservan la suya.
 
 Desde la 1.0.0 la API pública es estable: **romperla exige subir la versión mayor**, y el cambio va
 declarado como `Cambios incompatibles` en su entrada. No depende de que nadie se acuerde —
@@ -67,7 +69,42 @@ nada.
 
 ---
 
-## [4.1.2] — sin publicar
+## [4.1.3]
+
+Corrige lo que encontró una revisión de la 4.1.2. Es un parche: la API pública no cambia y **no hay
+que tocar nada** para actualizar.
+
+### Corregido
+
+- **En MP4 y fMP4, un nombre de pista de más de 4096 bytes se perdía al leer, sin aviso.** El muxer
+  lo escribía entero, pero el demuxer descartaba el que pasaba de 4096 bytes y la pista salía sin
+  nombre; un `remux` de MKV a MP4 lo perdía igual. Ahora se leen los primeros 4096 bytes, cortados
+  en el último carácter UTF-8 completo, y `onWarning` dice de qué pista es y cuánto ocupaba el
+  nombre. Los de 4096 bytes o menos se leen como antes, y MKV no cambia.
+
+### Documentación
+
+- El KDoc de `TrackInfo.name` y el README dicen qué nombres no vuelven igual de MP4 y fMP4: se leen
+  hasta su primer carácter nulo y como mucho 4096 bytes, y uno vacío o en blanco vuelve como
+  `null`. También que MKV quita los espacios y nulos del final. El README decía que el nombre
+  sobrevivía siempre en los tres contenedores.
+- Las entradas de este registro ya no llevan fecha ni la marca «sin publicar», y la cabecera del
+  README no lleva la de «en preparación»: la fecha de cada versión es la de su tag, y así el texto
+  es el mismo antes y después de publicar. La 4.1.2 se etiquetó con su entrada todavía marcada
+  «sin publicar» y el README diciendo que no tenía tag; su entrada queda sin fecha, como las que
+  vienen detrás, y el tag no se mueve. `CONTRIBUTING.md` recoge la regla nueva.
+
+### Desarrollo
+
+- Tests nuevos: nombres de 4096 y de 4097 bytes, y con un carácter de dos o de cuatro bytes partido
+  en el límite, en MKV, MP4 y fMP4, con su aviso (con el código de la 4.1.2 fallan en MP4: el
+  nombre sale `null` y no hay aviso); un nombre de 5000 bytes a través de un `remux` de MKV a MP4;
+  y los demás nombres que no vuelven igual —con un nulo dentro, vacío, en blanco o con espacios al
+  final— en los tres contenedores.
+
+---
+
+## [4.1.2]
 
 Corrige lo que encontró una revisión de la 4.1.1. Es un parche: la API pública no cambia y **no hay
 que tocar nada** para actualizar.

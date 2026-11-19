@@ -11,8 +11,11 @@ pantalla, audio del sistema y micrófono —mezclados en una pista o cada uno en
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10. Sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
 
-**Versión: 4.1.2** (en preparación: todavía sin tag)
+**Versión: 4.1.3**
 
+- **La `4.1.3` lee en MP4 y fMP4 los nombres de pista de más de 4096 bytes**, que se perdían sin
+  aviso, también al convertir de MKV a MP4: ahora se leen recortados y con aviso por `onWarning`.
+  El detalle, en el [CHANGELOG](CHANGELOG.md).
 - **La `4.1.2` corrige la búsqueda en un MP4 o fMP4 con una pista de vídeo sin ningún keyframe**,
   que volvía al principio y entregaba un fotograma que no se puede decodificar: ahora busca en la
   siguiente pista que tenga keyframes, como en MKV. Y si ninguna pista tiene keyframes, la búsqueda
@@ -255,7 +258,10 @@ val sistema = muxer.addTrack(TrackInfo.Audio(AudioCodec.AAC, 48_000, 2) { codecP
 Con `default = true` en otra pista, esa pasa a ser la predeterminada y la primera deja de serlo.
 
 El nombre, el idioma y la pista predeterminada sobreviven en MKV, MP4 y fMP4, y al convertir entre
-ellos. Cada pista puede empezar en su propio instante: el desfase entre pistas se conserva.
+ellos. Del nombre, en MP4 y fMP4 se lee hasta su primer carácter nulo y como mucho 4096 bytes
+(recortado en un carácter completo, con aviso por `onWarning`), y uno vacío vuelve como sin nombre;
+MKV lo conserva salvo los espacios y nulos del final. Cada pista puede empezar en su propio instante:
+el desfase entre pistas se conserva.
 
 > La captura del audio del sistema en Android es `AudioPlaybackCapture` (Android 10+) y la decide
 > la app; la librería recibe el PCM o los paquetes AAC resultantes igual que los del micrófono.
@@ -356,7 +362,7 @@ dependencyResolutionManagement {
 
 // build.gradle.kts — qué bajar
 dependencies {
-    implementation("com.github.bmontiel-28:Kotmpeg:4.1.2")
+    implementation("com.github.bmontiel-28:Kotmpeg:4.1.3")
 }
 ```
 
@@ -382,7 +388,7 @@ aquí sale uno. Escribirla con punto antes de `Kotmpeg` da un `Could not find`.
 // settings.gradle.kts
 dependencyResolutionManagement { repositories { mavenLocal(); mavenCentral() } }
 // build.gradle.kts
-dependencies { implementation("com.braymon:kotmpeg-core:4.1.2") }
+dependencies { implementation("com.braymon:kotmpeg-core:4.1.3") }
 ```
 
 Las dos opciones publican el jar y un jar de fuentes, así que el IDE deja navegar el código y leer
@@ -869,7 +875,7 @@ Kotlin 1.9 no funciona con Gradle 9; se lanza desde su carpeta:
 ```bash
 ./gradlew publishToMavenLocal
 cd compat/kotlin-1.9
-sh gradlew run -PkotmpegVersion=4.1.2
+sh gradlew run -PkotmpegVersion=4.1.3
 ```
 
 En Windows, el último paso es el mismo con `.\gradlew.bat` en lugar de `sh gradlew`.

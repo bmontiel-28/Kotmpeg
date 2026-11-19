@@ -200,7 +200,7 @@ no se puede arreglar sin publicar de nuevo.
 | Archivo | Qué hay que cambiar |
 |---|---|
 | `build.gradle.kts` | `version = "..."` — la fuente de verdad |
-| `CHANGELOG.md` | La entrada nueva, con su fecha |
+| `CHANGELOG.md` | La entrada nueva, `## [x.y.z]`, sin fecha |
 | `README.md` | La cabecera «Versión: …», las dos coordenadas de ejemplo y el `-PkotmpegVersion=` del comando de `compat/kotlin-1.9` |
 
 `SECURITY.md` lleva la serie soportada (`4.x`), no una versión exacta, así que solo se toca al
@@ -214,20 +214,21 @@ Si los dos no coinciden, el artefacto se publica con el número del tag y el POM
 
 Una versión sin tag **no está publicada**, así que sigue en preparación y todo lo nuevo va dentro de
 ella, sean dos correcciones o veinte. Subir el número por cada tanda dejaría un rastro de versiones
-que nadie puede descargar. La entrada del CHANGELOG se encabeza mientras tanto con
-`— sin publicar`, y la fecha se escribe en el commit que crea el tag, que es cuando pasa a ser
-cierta.
+que nadie puede descargar.
 
-Lo mismo vale para las marcas de «en preparación» que se pongan mientras tanto en el resto de la
-documentación. En el commit del tag, además de fechar el CHANGELOG:
+### Fechas: las pone el tag
 
-| Archivo | Qué se quita |
-|---|---|
-| `README.md` | El paréntesis «(en preparación: …)» de la cabecera «Versión: …» |
-| `SECURITY.md` | Si se sube la mayor, la fila de la serie anterior («`2.x` … hasta que se publique…») |
+Ni la entrada del CHANGELOG ni la cabecera del README llevan fecha ni marca de estado: la entrada
+se encabeza `## [x.y.z]` y la cabecera dice `**Versión: x.y.z**`, igual mientras se prepara que
+después del tag. La fecha de una versión es la de su tag, que la guarda git y nadie copia a mano.
+Así el texto no cambia al publicar y no puede quedar desfasado del tag: ni una fecha escrita a mano
+que no coincide con la suya, ni una marca de «sin publicar» que sigue ahí en una versión ya
+publicada. A quien lee un README cuya versión todavía no tiene tag, la nota de JitPack del README
+le dice qué usar mientras tanto.
 
-Se olvidan con facilidad porque nada falla si siguen ahí, y el resultado es una versión publicada
-cuya portada dice que todavía no lo está.
+Hasta la 4.1.1 las entradas llevaban fecha y la conservan. La 4.1.2 se etiquetó con su entrada
+todavía marcada «sin publicar» y el README diciendo que no tenía tag; se corrigió en la 4.1.3, con
+esta regla, sin mover el tag.
 
 ### Cuánto subir: lo decide `public-api.txt`
 
@@ -287,5 +288,6 @@ Antes de crear uno:
 - Comprueba que `./gradlew publishToMavenLocal` deja el jar, el jar de fuentes y el POM, y que desde
   `compat/kotlin-1.9`, con su propio wrapper, `sh gradlew run -PkotmpegVersion=<versión>`
   (`.\gradlew.bat` en Windows) compila y termina con `OK`.
-- Fecha la entrada del CHANGELOG **en el mismo commit que crea el tag**, no antes, y quita en ese
-  mismo commit las marcas de «en preparación» del README y de `SECURITY.md`.
+- No hay nada que fechar: el CHANGELOG y el README no llevan fecha ni marca que quitar (ver
+  [Fechas: las pone el tag](#fechas-las-pone-el-tag)). Si se sube la mayor, quita de `SECURITY.md`
+  la fila de la serie anterior («`2.x` … hasta que se publique…») en el commit que se etiqueta.
