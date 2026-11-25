@@ -69,6 +69,38 @@ nada.
 
 ---
 
+## [4.1.4]
+
+Corrige el fallo por el que la campaña semanal de fuzzing estaba en rojo desde la 4.1.0. Es un
+parche: la API pública no cambia y **no hay que tocar nada** para actualizar.
+
+### Corregido
+
+- **Un MKV con un solo tamaño alterado en la cabecera de una pista podía no abrir, o abrirse sin
+  ningún paquete, y `repair` podía dejar ilegible uno que se leía.** Lo encontró la campaña semanal
+  de fuzzing, que fallaba por esto desde la 4.1.0. Al terminar de leer `Info`, `SeekHead`, `Tracks`,
+  cada `TrackEntry` y, dentro de este, `Video`, `Audio`, `ContentEncodings` y sus hijos, el demuxer
+  seguía donde acababa el último hijo y no en el final declarado del elemento. Si ese hijo se salía
+  de su padre —en los cuatro hallazgos, el `Channels` del audio con tamaño 2 en vez de 1—, todo lo
+  que venía detrás se leía desplazado. Con el audio delante del vídeo el archivo no abría
+  (`EbmlException`), y con el audio detrás la lectura caía dentro de la reserva del índice y no
+  encontraba ningún cluster. `repair`, que sí sigue en el final declarado, al reescribir esa reserva
+  cambiaba justo el byte que el demuxer leía de más, y el archivo reparado dejaba de abrir. Ahora el
+  demuxer sigue en el final declarado de cada elemento, como `repair`: el dato dañado solo estropea
+  su pista, que se descarta con aviso si sale imposible, y el resto se lee igual antes y después de
+  reparar. Los archivos sanos se leen igual que antes y con los mismos avisos.
+
+### Desarrollo
+
+- Tests nuevos que construyen la entrada de los hallazgos. Un MKV de Kotmpeg con el audio delante
+  del vídeo y el tamaño de su `Channels` alargado en un byte abre, descarta el audio con un aviso y
+  entrega todo el vídeo; con el código de la 4.1.3 no abría. El mismo cambio en una grabación
+  cortada con el audio detrás da, antes y después de `repair`, el mismo vídeo que el corte sin
+  dañar; con el código de la 4.1.3 no entregaba el vídeo. Las cuatro semillas con las que fallaba la
+  campaña semanal pasan.
+
+---
+
 ## [4.1.3]
 
 Corrige lo que encontró una revisión de la 4.1.2. Es un parche: la API pública no cambia y **no hay

@@ -47,6 +47,17 @@ internal class MkvHeader(
  * Aquí la política ante datos imposibles es la de las cabeceras: un elemento que no se puede
  * recorrer lanza, porque sin estructura no hay nada que reproducir, pero un dato imposible de
  * **una pista** o del índice solo descarta eso, con aviso, y el resto del archivo se abre.
+ *
+ * Tras recorrer un elemento con tamaño —`Info`, `SeekHead` y cada `Seek`, `Tracks` y cada
+ * `TrackEntry`, y dentro de este `Video`, `Colour`, `MasteringMetadata`, `Projection`, `Audio`,
+ * `ContentEncodings`, cada `ContentEncoding` y `ContentCompression`— la lectura sigue en su final
+ * declarado, aunque su último hijo se salga de él. Es el criterio de `MkvRepair`, así que los dos
+ * ven la misma estructura. Hasta la 4.1.3 seguía donde acababa ese hijo, y un solo tamaño alterado
+ * desplazaba todo lo que venía detrás. Un `Channels` de 2 bytes en vez de 1, el último hijo del
+ * `Audio`, bastaba para que el archivo entero dejara de abrir con el audio delante del vídeo. Con el
+ * audio detrás, la lectura caía dentro de la reserva del índice y no encontraba ningún cluster.
+ * Ahora ese dato solo estropea su pista, que se descarta con aviso si sale imposible. `Cues` ya
+ * seguía en su final: un índice que no se puede recorrer se descarta entero (ver [readCuesOrWarn]).
  */
 internal class MkvHeaderParser(
     private val input: SeekableInput,
@@ -251,6 +262,7 @@ internal class MkvHeaderParser(
                 else -> reader.skip(el)
             }
         }
+        input.position = info.dataEnd
         durationUs = declaredDurationUs(durationTicks, timestampScaleNs)
     }
 
@@ -270,8 +282,10 @@ internal class MkvHeaderParser(
                     else -> reader.skip(el)
                 }
             }
+            input.position = seek.dataEnd
             if (targetId == MatroskaIds.CUES && position >= 0) cuesPosFromSeekHead = position
         }
+        input.position = seekHead.dataEnd
     }
 
     /**
@@ -292,7 +306,9 @@ internal class MkvHeaderParser(
             }
             trackEntries++
             parseTrackEntry(requireSized(entry))
+            input.position = entry.dataEnd
         }
+        input.position = tracksEl.dataEnd
     }
 
     /** Avisa de que la pista [number] se descarta, y la recuerda para que sus bloques no repitan el aviso. */
@@ -415,6 +431,7 @@ internal class MkvHeaderParser(
                 else -> reader.skip(v)
             }
         }
+        input.position = video.dataEnd
     }
 
     private fun parseAudio(audio: EbmlElement, f: TrackFields) {
@@ -428,6 +445,7 @@ internal class MkvHeaderParser(
                 else -> reader.skip(a)
             }
         }
+        input.position = audio.dataEnd
     }
 
     /**
@@ -466,23 +484,28 @@ internal class MkvHeaderParser(
                     MatroskaIds.CONTENT_ENCODING_ORDER -> order = reader.readUInt(el)
                     MatroskaIds.CONTENT_ENCODING_SCOPE -> scope = reader.readUInt(el)
                     MatroskaIds.CONTENT_ENCODING_TYPE -> type = reader.readUInt(el)
-                    MatroskaIds.CONTENT_COMPRESSION -> while (input.position < requireSized(el).dataEnd) {
-                        val c = reader.readElement()
-                        when (c.id) {
-                            MatroskaIds.CONTENT_COMP_ALGO -> algorithm = reader.readUInt(c)
-                            MatroskaIds.CONTENT_COMP_SETTINGS -> if (c.size > ContentEncoding.MAX_HEADER_STRIPPING_BYTES) {
-                                oversizedSettings = c.size
-                                reader.skip(c)
-                            } else {
-                                settings = reader.readBinary(c)
+                    MatroskaIds.CONTENT_COMPRESSION -> {
+                        val compression = requireSized(el)
+                        while (input.position < compression.dataEnd) {
+                            val c = reader.readElement()
+                            when (c.id) {
+                                MatroskaIds.CONTENT_COMP_ALGO -> algorithm = reader.readUInt(c)
+                                MatroskaIds.CONTENT_COMP_SETTINGS -> if (c.size > ContentEncoding.MAX_HEADER_STRIPPING_BYTES) {
+                                    oversizedSettings = c.size
+                                    reader.skip(c)
+                                } else {
+                                    settings = reader.readBinary(c)
+                                }
+                                else -> reader.skip(c)
                             }
-                            else -> reader.skip(c)
                         }
+                        input.position = compression.dataEnd
                     }
                     MatroskaIds.CONTENT_ENCRYPTION -> { type = ContentEncoding.TYPE_ENCRYPTION; reader.skip(el) }
                     else -> reader.skip(el)
                 }
             }
+            input.position = encodingEl.dataEnd
             val known = type == ContentEncoding.TYPE_COMPRESSION &&
                 (algorithm == ContentEncoding.ALGO_ZLIB || algorithm == ContentEncoding.ALGO_HEADER_STRIPPING)
             if (!known) {
@@ -493,6 +516,7 @@ internal class MkvHeaderParser(
             }
             result.add(ContentEncoding(order, scope, algorithm, settings))
         }
+        input.position = container.dataEnd
         if (unsupported != null) return ParsedEncodings(emptyList(), unsupported)
         result.sortByDescending { it.order }
         return ParsedEncodings(result, null)
@@ -551,15 +575,18 @@ internal class MkvHeaderParser(
                 MatroskaIds.MAX_FALL -> result.maxFall = readIntField(el)
                 MatroskaIds.MASTERING_METADATA -> {
                     val values = result.mastering ?: DoubleArray(MASTERING_FIELDS.size).also { result.mastering = it }
-                    while (input.position < requireSized(el).dataEnd) {
+                    val mastering = requireSized(el)
+                    while (input.position < mastering.dataEnd) {
                         val m = reader.readElement()
                         val field = MASTERING_FIELDS.indexOf(m.id)
                         if (field >= 0) values[field] = reader.readFloat(m) else reader.skip(m)
                     }
+                    input.position = mastering.dataEnd
                 }
                 else -> reader.skip(el)
             }
         }
+        input.position = colour.dataEnd
         return result
     }
 
@@ -608,6 +635,7 @@ internal class MkvHeaderParser(
                 else -> reader.skip(el)
             }
         }
+        input.position = projection.dataEnd
         val normalized = ((-roll).mod(360.0))
         return when {
             Math.abs(normalized - 90) < 45 -> 90

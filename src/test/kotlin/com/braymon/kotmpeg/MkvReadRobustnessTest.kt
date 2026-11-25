@@ -422,4 +422,36 @@ class MkvReadRobustnessTest {
         assertEquals(listOf(0L, 40_000L, 80_000L), packets.map { it.ptsUs })
         assertEquals(listOf(true, false, false), packets.map { it.isKeyFrame })
     }
+
+    /**
+     * Un hijo que se sale de su padre en la cabecera solo cuesta su propia pista: la lectura sigue en
+     * el final declarado del padre. Es el hallazgo de la campaña semanal de fuzzing. El `Channels`
+     * del audio con tamaño 2 en vez de 1 se comía el primer byte del `TrackEntry` siguiente, todo lo
+     * que venía detrás se leía desplazado y, con el audio delante del vídeo, el archivo entero dejaba
+     * de abrir. Ahora el audio se descarta con un aviso, porque el número de canales que sale es
+     * imposible, y el vídeo se lee entero.
+     */
+    @Test
+    fun `a header child that overruns its parent costs only its own track`() {
+        val file = File(dir, "canales.mkv")
+        MkvMuxer(file).use { muxer ->
+            val audioId = muxer.addTrack(aac)
+            val videoId = muxer.addTrack(h264)
+            muxer.start()
+            for (i in 0 until 60) {
+                muxer.writePacket(MediaPacket(videoId, frame(i), ptsUs = i * 40_000L, isKeyFrame = i % 25 == 0))
+                muxer.writePacket(MediaPacket(audioId, ByteArray(6) { k -> (i + k).toByte() }, ptsUs = i * 40_000L, isKeyFrame = true))
+            }
+        }
+        val healthy = file.readBytes()
+        val video = readAll(healthy).filter { it.trackId == 2 }.map { it.ptsUs to it.data.toList() }
+        assertEquals(60, video.size)
+        val warnings = ArrayList<String>()
+        open(withLongerAudioChannels(healthy), warnings).use { demuxer ->
+            assertEquals(listOf(2), demuxer.tracks.map { it.id })
+            assertEquals(video, generateSequence { demuxer.readPacket() }.map { it.ptsUs to it.data.toList() }.toList())
+        }
+        assertEquals(1, warnings.size, "avisos: $warnings")
+        assertTrue("pista 1 descartada" in warnings.single(), warnings.single())
+    }
 }

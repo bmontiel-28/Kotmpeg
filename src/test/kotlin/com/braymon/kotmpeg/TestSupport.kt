@@ -73,6 +73,23 @@ internal fun withoutCuesIndex(bytes: ByteArray): ByteArray {
 }
 
 /**
+ * Una copia de [bytes], un MKV de Kotmpeg con una pista de audio a 48 kHz y estéreo, con el tamaño
+ * del `Channels` de esa pista alargado de 1 a 2 bytes. Es el último hijo del `Audio`, así que su dato
+ * se come el primer byte de lo que viene detrás. Es el byte cambiado de los cuatro hallazgos de la
+ * campaña semanal de fuzzing que fallaron de la 4.1.0 a la 4.1.3. Se busca detrás del
+ * `SamplingFrequency`, que el muxer escribe justo delante: los dos seguidos no aparecen en ningún otro
+ * sitio del archivo.
+ */
+internal fun withLongerAudioChannels(bytes: ByteArray): ByteArray {
+    val rate = 48_000.0.toRawBits()
+    val pattern = byteArrayOf(0xB5.toByte(), 0x88.toByte()) +
+        ByteArray(8) { (rate shr (56 - 8 * it)).toByte() } +
+        byteArrayOf(0x9F.toByte(), 0x81.toByte(), 0x02)
+    val at = (0..bytes.size - pattern.size).single { start -> pattern.indices.all { bytes[start + it] == pattern[it] } }
+    return bytes.copyOf().also { it[at + pattern.size - 2] = 0x82.toByte() }
+}
+
+/**
  * Lo que reserva el hilo actual mientras corre [block], en bytes. Omite el test si el JDK no lo mide.
  *
  * Mide reservas, no el heap, así que no depende del recolector. Conviene medir una segunda pasada:

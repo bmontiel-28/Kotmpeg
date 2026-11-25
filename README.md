@@ -11,8 +11,11 @@ pantalla, audio del sistema y micrófono —mezclados en una pista o cada uno en
 recodificar, sincronización de tiempos entre pistas y metadata de rotación, color y HDR10. Sin
 dependencias, sin binarios nativos y sin una sola API de plataforma.**
 
-**Versión: 4.1.3**
+**Versión: 4.1.4**
 
+- **La `4.1.4` corrige la lectura de un MKV con un solo tamaño alterado en la cabecera de una
+  pista**, que podía no abrir o abrirse sin paquetes, y que `repair` podía dejar ilegible: ahora solo
+  se pierde esa pista, con aviso. El detalle, en el [CHANGELOG](CHANGELOG.md).
 - **La `4.1.3` lee en MP4 y fMP4 los nombres de pista de más de 4096 bytes**, que se perdían sin
   aviso, también al convertir de MKV a MP4: ahora se leen recortados y con aviso por `onWarning`.
   El detalle, en el [CHANGELOG](CHANGELOG.md).
@@ -362,7 +365,7 @@ dependencyResolutionManagement {
 
 // build.gradle.kts — qué bajar
 dependencies {
-    implementation("com.github.bmontiel-28:Kotmpeg:4.1.3")
+    implementation("com.github.bmontiel-28:Kotmpeg:4.1.4")
 }
 ```
 
@@ -388,7 +391,7 @@ aquí sale uno. Escribirla con punto antes de `Kotmpeg` da un `Could not find`.
 // settings.gradle.kts
 dependencyResolutionManagement { repositories { mavenLocal(); mavenCentral() } }
 // build.gradle.kts
-dependencies { implementation("com.braymon:kotmpeg-core:4.1.3") }
+dependencies { implementation("com.braymon:kotmpeg-core:4.1.4") }
 ```
 
 Las dos opciones publican el jar y un jar de fuentes, así que el IDE deja navegar el código y leer
@@ -875,7 +878,7 @@ Kotlin 1.9 no funciona con Gradle 9; se lanza desde su carpeta:
 ```bash
 ./gradlew publishToMavenLocal
 cd compat/kotlin-1.9
-sh gradlew run -PkotmpegVersion=4.1.3
+sh gradlew run -PkotmpegVersion=4.1.4
 ```
 
 En Windows, el último paso es el mismo con `.\gradlew.bat` en lugar de `sh gradlew`.

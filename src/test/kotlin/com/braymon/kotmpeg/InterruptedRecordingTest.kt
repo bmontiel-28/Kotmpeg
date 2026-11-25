@@ -449,6 +449,36 @@ class InterruptedRecordingTest {
         repairMatchesRemux(fragmented = false) { cuesReserveBytes = 0 }
     }
 
+    /**
+     * El hallazgo de la campaña semanal de fuzzing, con el audio como última pista y la grabación
+     * cortada. El `Channels` del audio con tamaño 2 en vez de 1 se comía el primer byte de la reserva
+     * del índice, la lectura seguía dentro de ella y no encontraba ningún cluster. `repair`, que sí
+     * sigue en el final declarado de cada elemento, al reescribir la reserva cambiaba justo ese byte,
+     * y el archivo reparado ya no abría. Ahora el audio se descarta con su aviso, antes y después de
+     * reparar, y se lee el mismo vídeo que en el corte sin dañar.
+     */
+    @Test
+    fun `a cut mkv with a header child that overruns its parent reads the same before and after repair`() {
+        val full = record(syntheticPackets(), listOf(video, audio), fragmented = false)
+        val cut = full.channel.cutAfter(full.channel.totalBytes / 2)
+        val damaged = withLongerAudioChannels(cut)
+        val expected = read(cut).first.filter { it.startsWith("1/") }
+        assertTrue(expected.isNotEmpty())
+
+        val warningsBefore = ArrayList<String>()
+        assertEquals(expected, read(damaged, warningsBefore).first)
+        assertTrue(warningsBefore.any { "pista 2 descartada" in it }, "avisos: $warningsBefore")
+
+        val (result, channel) = RecordingFileChannel.repairRecorded(damaged)
+        assertTrue(result.repaired, "no se reparó: $result")
+        val warningsAfter = ArrayList<String>()
+        val (after, duration) = read(channel.bytes(), warningsAfter)
+        assertEquals(expected, after)
+        assertEquals(1, warningsAfter.size, "avisos: $warningsAfter")
+        assertTrue("pista 2 descartada" in warningsAfter.single(), warningsAfter.single())
+        assertTrue(abs(result.durationUs - duration) < 1_000, "el resultado dice ${result.durationUs} µs y el archivo $duration")
+    }
+
     @Test
     fun `a cut fragmented mp4 repaired in place has the packets and duration of its remux`() {
         repairMatchesRemux(fragmented = true)
